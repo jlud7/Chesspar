@@ -8,14 +8,21 @@ Initial scaffold for the Chesspar web app (Stage 1: Openings Coach).
 - Tailwind CSS
 - GitHub Pages deployment via GitHub Actions
 
-## Deploy to GitHub Pages (no local npm required)
+## Run locally
+
+```bash
+npm install
+npm run dev
+```
+
+## Deploy to GitHub Pages
 
 1. In GitHub, go to **Settings → Pages**.
 2. Under **Build and deployment**, choose **Source: GitHub Actions**.
-3. Push to `main`.
-4. The workflow `.github/workflows/deploy-pages.yml` installs dependencies, builds, and publishes automatically.
+3. Push this branch to `main`.
+4. The workflow `.github/workflows/deploy-pages.yml` will build and publish `out/` automatically.
 
-> The app uses static export (`output: "export"`) so it runs on Pages without a Node server.
+> The app uses static export (`output: "export"`) so it can run on Pages without a Node server.
 
 ## Current scope
 
