@@ -160,15 +160,18 @@ export function ChessGame() {
     [game]
   );
 
+  const engineRef = useRef(engine);
+  engineRef.current = engine;
+
   useEffect(() => {
     if (mode !== "vs-computer") return;
     if (game.isGameOver()) return;
     if (isHumanTurn()) return;
-    if (engine.status !== "ready" || engine.thinking) return;
+    if (engine.status !== "ready") return;
 
     let cancelled = false;
     (async () => {
-      const move = await engine.findBestMove(game.fen(), {
+      const move = await engineRef.current.findBestMove(game.fen(), {
         skill,
         movetimeMs: ENGINE_MOVETIME_MS,
       });
@@ -187,7 +190,7 @@ export function ChessGame() {
     return () => {
       cancelled = true;
     };
-  }, [fen, mode, engine, isHumanTurn, skill, game, sync]);
+  }, [fen, mode, engine.status, isHumanTurn, skill, game, sync]);
 
   function newGame(opts: { mode?: Mode; side?: Side } = {}) {
     game.reset();
