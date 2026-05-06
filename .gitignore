@@ -22,5 +22,8 @@ yarn-error.log*
 # env files
 .env*.local
 
+# stockfish engine (copied from node_modules at install/build time)
+/public/stockfish/
+
 # typescript
 *.tsbuildinfo
