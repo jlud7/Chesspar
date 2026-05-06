@@ -63,6 +63,7 @@ export function ChessGame() {
 
   const engine = useChessEngine(mode === "vs-computer");
 
+
   const sync = useCallback(() => {
     setFen(game.fen());
     setHistory(game.history({ verbose: true }) as Move[]);
@@ -371,20 +372,23 @@ export function ChessGame() {
           label={topSide === playerSide ? "You" : "Opponent"}
           showLabel={mode === "vs-computer"}
         />
-        <Chessboard
-          options={{
-            id: "chesspar-board",
-            position: fen,
-            boardOrientation: orientation,
-            onPieceDrop,
-            onSquareClick,
-            squareStyles,
-            darkSquareStyle: { backgroundColor: DARK_SQ },
-            lightSquareStyle: { backgroundColor: LIGHT_SQ },
-            animationDurationInMs: 200,
-            allowDrawingArrows: true,
-          }}
-        />
+        <div className="aspect-square w-full max-w-[640px]">
+          <Chessboard
+            options={{
+              id: "chesspar-board",
+              position: fen,
+              boardOrientation: orientation,
+              onPieceDrop,
+              onSquareClick,
+              squareStyles,
+              boardStyle: { width: "100%", height: "100%" },
+              darkSquareStyle: { backgroundColor: DARK_SQ },
+              lightSquareStyle: { backgroundColor: LIGHT_SQ },
+              animationDurationInMs: 200,
+              allowDrawingArrows: true,
+            }}
+          />
+        </div>
         <CapturedStrip
           pieces={bottomCaps}
           piecesColor={bottomCapsAreOf}
