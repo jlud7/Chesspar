@@ -1,3 +1,4 @@
+import Link from "next/link";
 import { StageCard } from "@/components/stage-card";
 import { productStages } from "@/lib/stages";
 
@@ -9,10 +10,16 @@ export default function HomePage() {
           Stage 1 MVP foundation
         </p>
         <h1 className="mb-4 text-4xl font-bold tracking-tight md:text-5xl">Chesspar</h1>
-        <p className="max-w-3xl text-zinc-300">
+        <p className="mb-6 max-w-3xl text-zinc-300">
           Personalized chess training built around how you actually play. This first build initializes the product shell,
           ships the stage roadmap, and sets up a clean architecture for the openings coach MVP.
         </p>
+        <Link
+          href="/play"
+          className="inline-flex items-center gap-2 rounded-md border border-emerald-500/40 bg-emerald-500/15 px-4 py-2 text-sm font-medium text-emerald-200 hover:bg-emerald-500/25"
+        >
+          Play a game →
+        </Link>
       </header>
 
       <section className="mb-10 grid gap-4 md:grid-cols-3">
