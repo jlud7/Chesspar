@@ -229,7 +229,7 @@ export function ChessGame() {
     return (game.moves({ square: selected, verbose: true }) as Move[]).map(
       (m) => m.to
     );
-  }, [selected, fen, game]);
+  }, [selected, game]);
 
   const onPieceDrop = ({
     sourceSquare,
@@ -313,7 +313,7 @@ export function ChessGame() {
       }
     }
     return styles;
-  }, [selected, legalTargets, history, fen, game]);
+  }, [selected, legalTargets, history, game]);
 
   const captured = useMemo(() => {
     const byWhite: PieceSymbol[] = [];
@@ -349,7 +349,7 @@ export function ChessGame() {
     if (game.inCheck())
       return { tone: "check", text: `${turn} to move — check!` };
     return { tone: "normal", text: `${turn} to move` };
-  }, [fen, game]);
+  }, [game]);
 
   const topSide: Side = orientation === "white" ? "black" : "white";
   const topCaps = topSide === "white" ? captured.byWhite : captured.byBlack;
@@ -399,6 +399,7 @@ export function ChessGame() {
       </div>
 
       <aside className="flex flex-col gap-4">
+        <QuickTips mode={mode} />
         <StatusBanner status={status} />
         {mode === "vs-computer" && <EnginePill engine={engine} />}
         <Controls
@@ -664,10 +665,10 @@ function MoveHistory({ moves }: { moves: Move[] }) {
     pairs.push({ num: i / 2 + 1, white: moves[i], black: moves[i + 1] });
   }
   return (
-    <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 p-4">
-      <div className="mb-2 text-xs uppercase tracking-wider text-zinc-400">
+    <details className="rounded-xl border border-zinc-800 bg-zinc-900/60 p-4" open>
+      <summary className="mb-2 cursor-pointer list-none text-xs uppercase tracking-wider text-zinc-400">
         Moves
-      </div>
+      </summary>
       {pairs.length === 0 ? (
         <div className="text-sm text-zinc-500">No moves yet.</div>
       ) : (
@@ -684,6 +685,19 @@ function MoveHistory({ moves }: { moves: Move[] }) {
           ))}
         </ol>
       )}
+    </details>
+  );
+}
+
+function QuickTips({ mode }: { mode: Mode }) {
+  return (
+    <div className="rounded-lg border border-zinc-800 bg-zinc-900/60 px-4 py-3 text-xs text-zinc-300">
+      <div className="mb-1 font-medium uppercase tracking-wider text-zinc-400">Quick tips</div>
+      <ul className="list-disc space-y-1 pl-4">
+        <li>Select a piece to see legal targets, then click destination or drag.</li>
+        <li>Use Undo to review mistakes; in vs-computer it rewinds both moves.</li>
+        {mode === "vs-computer" && <li>Adjust engine strength anytime to ramp difficulty.</li>}
+      </ul>
     </div>
   );
 }
