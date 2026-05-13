@@ -33,181 +33,41 @@ export interface VlmVerifier {
   verify(input: VlmVerifyInput): Promise<VlmVerifyResult>;
 }
 
-/**
- * Result of reading a chess position directly from a photo into a FEN
- * piece-placement string. Used by the test-mode pipeline that bypasses
- * CV entirely and just asks the VLM "what position is this?".
- */
-export type FenReadResult =
-  | { kind: "fen"; fen: string; raw: string }
-  | { kind: "unreadable"; raw: string }
-  | { kind: "error"; reason: string };
-
-const FEN_READ_PROMPT = `You are reading a chess position from a photograph of a real chessboard.
-
-Reply with ONLY the FEN piece-placement field — just the board layout, nothing else. Example for the standard starting position:
-rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR
-
-Conventions:
-- Read with white at the bottom of the photo, black at the top.
-- Write rank 8 first (top of the image), rank 1 last (bottom).
-- Within each rank: a-file leftmost, h-file rightmost (from white's view).
-- Pieces: K Q R B N P (white, uppercase) and k q r b n p (black, lowercase).
-- Empty squares: digits 1-8 for consecutive empty squares within a rank.
-- Ranks separated by /.
-
-No explanation, no quotes, no markdown, no surrounding text — just the eight ranks separated by slashes.
-
-If you cannot identify the position with high confidence (occluded pieces, blurry, ambiguous angle), reply with the single word UNREADABLE.`;
-
-function isValidFenPlacement(s: string): boolean {
-  const ranks = s.split("/");
-  if (ranks.length !== 8) return false;
-  for (const rank of ranks) {
-    let count = 0;
-    for (const ch of rank) {
-      if (ch >= "1" && ch <= "8") count += Number(ch);
-      else if ("KQRBNPkqrbnp".includes(ch)) count += 1;
-      else return false;
-    }
-    if (count !== 8) return false;
-  }
-  return true;
-}
-
-function parseFenResponse(raw: string): FenReadResult {
-  const trimmed = raw.trim();
-  if (!trimmed) return { kind: "error", reason: "empty response" };
-  if (/\bUNREADABLE\b/i.test(trimmed)) return { kind: "unreadable", raw };
-  const cleaned = trimmed
-    .replace(/```[a-z]*\n?|\n?```/gi, "")
-    .replace(/^["'`]+|["'`.,!?]+$/g, "")
-    .trim()
-    .split(/\s+/)[0];
-  if (!isValidFenPlacement(cleaned)) {
-    return {
-      kind: "error",
-      reason: `not a valid FEN placement: ${cleaned.slice(0, 80)}`,
-    };
-  }
-  return { kind: "fen", fen: cleaned, raw };
-}
-
-type AnthropicFenCallArgs = {
-  url: string;
-  extraHeaders: Record<string, string>;
-  image: HTMLCanvasElement;
-  model: string;
-};
-
-async function callAnthropicForFen(
-  args: AnthropicFenCallArgs,
-): Promise<FenReadResult> {
-  try {
-    const b64 = canvasToBase64(args.image);
-    const response = await fetch(args.url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", ...args.extraHeaders },
-      body: JSON.stringify({
-        model: args.model,
-        max_tokens: 80,
-        temperature: 0.05,
-        messages: [
-          {
-            role: "user",
-            content: [
-              {
-                type: "image",
-                source: {
-                  type: "base64",
-                  media_type: "image/jpeg",
-                  data: b64,
-                },
-              },
-              { type: "text", text: FEN_READ_PROMPT },
-            ],
-          },
-        ],
-      }),
-    });
-    if (!response.ok) {
-      const text = await response.text().catch(() => "");
-      return {
-        kind: "error",
-        reason: `HTTP ${response.status}: ${text.slice(0, 160)}`,
-      };
-    }
-    const data = (await response.json()) as {
-      content?: { type: string; text?: string }[];
-    };
-    const raw = data.content?.find((c) => c.type === "text")?.text ?? "";
-    return parseFenResponse(raw);
-  } catch (e) {
-    return {
-      kind: "error",
-      reason: e instanceof Error ? e.message : String(e),
-    };
-  }
-}
-
-export async function readFenViaProxy(
-  proxyUrl: string,
-  image: HTMLCanvasElement,
-  model = "claude-sonnet-4-6",
-): Promise<FenReadResult> {
-  const url = proxyUrl.replace(/\/$/, "") + "/verify";
-  return callAnthropicForFen({ url, extraHeaders: {}, image, model });
-}
-
-export async function readFenViaAnthropic(
-  apiKey: string,
-  image: HTMLCanvasElement,
-  model = "claude-sonnet-4-6",
-): Promise<FenReadResult> {
-  return callAnthropicForFen({
-    url: "https://api.anthropic.com/v1/messages",
-    extraHeaders: {
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
-      "anthropic-dangerous-direct-browser-access": "true",
-    },
-    image,
-    model,
-  });
-}
-
 const SINGLE_FRAME_PROMPT = (
   prevFen: string,
   legalMovesSan: string[],
 ): string => `You are identifying a chess move from a photo.
 
-PREVIOUS POSITION FEN:
-${prevFen}
+PREVIOUS POSITION FEN (piece placement only): ${prevFen}
 
 LEGAL MOVES (the move that happened is exactly one of these):
 ${legalMovesSan.join(", ")}
 
-The attached image is the rectified top-down view of the board AFTER the move was played. a8 is top-left, h1 is bottom-right (White's pieces are at the bottom).
+The photo may be taken from any angle and the board may be rotated 0°, 90°, 180°, or 270° in the frame. Use the rank/file labels printed on the board edges, or the location of the white vs black pieces, to orient yourself.
 
-Reply with ONLY the SAN notation of the move that just happened, exactly as it appears in the legal-moves list above (e.g. "e4", "Nxf3", "O-O", "Qxh7#"). No explanation, no quotes.`;
+Reply with ONLY the SAN notation of the move that happened, exactly as it appears in the legal-moves list above (e.g. "e4", "Nxf3", "O-O"). No explanation, no preamble, no markdown, no quotes — just the SAN on the last line.`;
 
 const TWO_FRAME_PROMPT = (
   prevFen: string,
   legalMovesSan: string[],
-): string => `You are identifying which chess move was just played by comparing two photos.
+): string => `You are identifying which chess move was just played by comparing two photographs of the same physical chessboard.
 
-IMAGE 1: the board BEFORE the move (top-down rectified view, a8 top-left, h1 bottom-right, White at bottom).
-IMAGE 2: the board AFTER the move (same orientation).
+IMAGE 1: the board BEFORE the move.
+IMAGE 2: the board AFTER the move.
 
-PREVIOUS POSITION FEN:
-${prevFen}
+Both photos may be taken from any angle / any orientation — the board could be rotated 0°, 90°, 180°, or 270° in the frame, and the camera angle may vary. Use the rank/file labels printed on the board edges, or the location of the white vs black pieces, to orient yourself. The board orientation between the two photos is the same (same camera position).
+
+PREVIOUS POSITION FEN (piece placement only): ${prevFen}
 
 LEGAL MOVES — exactly one of these was played:
 ${legalMovesSan.join(", ")}
 
-Compare the two images. Find the cells that changed. Pick the unique legal move whose result explains the change.
+Procedure:
+1. Identify which square(s) changed between IMAGE 1 and IMAGE 2 (a piece appeared, disappeared, or was replaced by a different color).
+2. Pick the unique legal move from the list above whose result explains exactly those changes.
+3. Reply with ONLY that move's SAN, exactly as written in the list (e.g. "e4", "Nxf3", "O-O").
 
-Reply with ONLY the SAN notation of the move that happened, exactly as it appears in the legal-moves list above (e.g. "e4", "Nxf3", "O-O", "Qxh7#"). No explanation, no quotes.`;
+No explanation, no preamble, no markdown — just the SAN of the move on the last line.`;
 
 export function makeGeminiVerifier(
   apiKey: string,
@@ -264,10 +124,32 @@ export function makeGeminiVerifier(
   };
 }
 
-export function makeOpenAiVerifier(
-  apiKey: string,
-  model = "gpt-4o",
-): VlmVerifier {
+type OpenAiCallArgs = {
+  url: string;
+  headers: Record<string, string>;
+  model: string;
+};
+
+function buildOpenAiBody(
+  model: string,
+  content: unknown[],
+): Record<string, unknown> {
+  // GPT-5 uses the new "reasoning" parameters and rejects temperature/max_tokens.
+  const isGpt5 = model.startsWith("gpt-5");
+  const body: Record<string, unknown> = {
+    model,
+    messages: [{ role: "user", content }],
+  };
+  if (isGpt5) {
+    body.max_completion_tokens = 4000;
+  } else {
+    body.max_tokens = 64;
+    body.temperature = 0;
+  }
+  return body;
+}
+
+function makeOpenAiVerifierFromCall(args: OpenAiCallArgs): VlmVerifier {
   return {
     provider: "openai",
     async verify({ previousFen, legalMovesSan, boardImage, previousBoardImage }) {
@@ -290,22 +172,14 @@ export function makeOpenAiVerifier(
           type: "image_url",
           image_url: { url: `data:image/jpeg;base64,${afterB64}` },
         });
-        const response = await fetch(
-          "https://api.openai.com/v1/chat/completions",
-          {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: `Bearer ${apiKey}`,
-            },
-            body: JSON.stringify({
-              model,
-              max_tokens: 32,
-              temperature: 0.05,
-              messages: [{ role: "user", content }],
-            }),
+        const response = await fetch(args.url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ...args.headers,
           },
-        );
+          body: JSON.stringify(buildOpenAiBody(args.model, content)),
+        });
         if (!response.ok) {
           const text = await response.text().catch(() => "");
           return {
@@ -328,9 +202,35 @@ export function makeOpenAiVerifier(
   };
 }
 
+export function makeOpenAiVerifier(
+  apiKey: string,
+  model = "gpt-5",
+): VlmVerifier {
+  return makeOpenAiVerifierFromCall({
+    url: "https://api.openai.com/v1/chat/completions",
+    headers: { Authorization: `Bearer ${apiKey}` },
+    model,
+  });
+}
+
+/**
+ * OpenAI verifier that goes through the Cloudflare Worker /openai endpoint.
+ * The worker holds OPENAI_API_KEY as a secret; the browser never sees it.
+ */
+export function makeOpenAiProxyVerifier(
+  proxyUrl: string,
+  model = "gpt-5",
+): VlmVerifier {
+  return makeOpenAiVerifierFromCall({
+    url: proxyUrl.replace(/\/$/, "") + "/openai",
+    headers: {},
+    model,
+  });
+}
+
 export function makeAnthropicVerifier(
   apiKey: string,
-  model = "claude-sonnet-4-6",
+  model = "claude-opus-4-7",
 ): VlmVerifier {
   return {
     provider: "anthropic",
@@ -371,12 +271,9 @@ export function makeAnthropicVerifier(
             "anthropic-version": "2023-06-01",
             "anthropic-dangerous-direct-browser-access": "true",
           },
-          body: JSON.stringify({
-            model,
-            max_tokens: 32,
-            temperature: 0.05,
-            messages: [{ role: "user", content }],
-          }),
+          body: JSON.stringify(
+            buildAnthropicBody(model, content),
+          ),
         });
         if (!response.ok) {
           const text = await response.text().catch(() => "");
@@ -401,6 +298,25 @@ export function makeAnthropicVerifier(
 }
 
 /**
+ * Build the Anthropic /v1/messages body. Opus 4.7 does its own chain-of-
+ * thought, so it needs many more tokens than Sonnet to reach a final
+ * answer — and doesn't accept `temperature` at all.
+ */
+function buildAnthropicBody(
+  model: string,
+  content: unknown[],
+): Record<string, unknown> {
+  const isOpus = model.includes("opus");
+  const body: Record<string, unknown> = {
+    model,
+    max_tokens: isOpus ? 4000 : 64,
+    messages: [{ role: "user", content }],
+  };
+  if (!isOpus) body.temperature = 0.05;
+  return body;
+}
+
+/**
  * Anthropic verifier that goes through a Cloudflare Worker (or any compatible
  * proxy) instead of api.anthropic.com directly. The proxy holds the API key
  * server-side; the browser never sees it.
@@ -411,7 +327,7 @@ export function makeAnthropicVerifier(
  */
 export function makeAnthropicProxyVerifier(
   proxyUrl: string,
-  model = "claude-sonnet-4-6",
+  model = "claude-opus-4-7",
 ): VlmVerifier {
   const endpoint = proxyUrl.replace(/\/$/, "") + "/verify";
   return {
@@ -448,12 +364,7 @@ export function makeAnthropicProxyVerifier(
         const response = await fetch(endpoint, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            model,
-            max_tokens: 32,
-            temperature: 0.05,
-            messages: [{ role: "user", content }],
-          }),
+          body: JSON.stringify(buildAnthropicBody(model, content)),
         });
         if (!response.ok) {
           const text = await response.text().catch(() => "");
@@ -498,7 +409,24 @@ function resolveSan(raw: string, legalMovesSan: string[]): VlmVerifyResult {
   if (legalMovesSan.includes(cleaned)) {
     return { kind: "matched", san: cleaned, raw };
   }
-  for (const candidate of legalMovesSan) {
+  // For chain-of-thought responses (Opus), the final SAN usually sits on
+  // the last non-empty line. Search there first, preferring the *longest*
+  // legal-move match (so "Nxf3" beats "f3" if both appear).
+  const lines = trimmed
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  const lastLine = lines[lines.length - 1] ?? "";
+  const candidates = [...legalMovesSan].sort((a, b) => b.length - a.length);
+  for (const candidate of candidates) {
+    const re = new RegExp(
+      `(^|[^A-Za-z0-9])${escapeRegExp(candidate)}([^A-Za-z0-9]|$)`,
+    );
+    if (re.test(lastLine)) {
+      return { kind: "matched", san: candidate, raw };
+    }
+  }
+  for (const candidate of candidates) {
     const re = new RegExp(
       `(^|[^A-Za-z0-9])${escapeRegExp(candidate)}([^A-Za-z0-9]|$)`,
     );

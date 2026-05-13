@@ -22,21 +22,32 @@ import {
 } from "@/lib/occupancy";
 import {
   makeAnthropicProxyVerifier,
+  makeOpenAiProxyVerifier,
   makeVerifier,
-  readFenViaAnthropic,
-  readFenViaProxy,
   type VlmProvider,
+  type VlmVerifier,
   type VlmVerifyResult,
 } from "@/lib/vlm";
 
 /**
- * If a VLM proxy URL is baked in at build time (Cloudflare Worker holding the
- * Anthropic key), VLM identification is "always on" and the user doesn't need
+ * If a VLM proxy URL is baked in at build time (Cloudflare Worker holding
+ * the API key), VLM identification is "always on" and the user doesn't need
  * to paste a key. The pasted-key flow remains for users running their own
- * build or hitting Gemini/OpenAI directly.
+ * build or wanting a different provider.
  */
 const VLM_PROXY_URL = process.env.NEXT_PUBLIC_VLM_PROXY_URL || "";
-import { inferMoveFuzzy, moveFromObservedBoard } from "@/lib/move-inference";
+const VLM_PROXY_PROVIDER = (
+  process.env.NEXT_PUBLIC_VLM_PROXY_PROVIDER || "anthropic"
+).toLowerCase() as "anthropic" | "openai";
+
+function makeProxyVerifier(): VlmVerifier | null {
+  if (!VLM_PROXY_URL) return null;
+  if (VLM_PROXY_PROVIDER === "openai") {
+    return makeOpenAiProxyVerifier(VLM_PROXY_URL);
+  }
+  return makeAnthropicProxyVerifier(VLM_PROXY_URL);
+}
+import { inferMoveFuzzy } from "@/lib/move-inference";
 import {
   autoDetectBoardCorners,
   refineCornersForFrame,
@@ -138,6 +149,8 @@ export function CaptureGame() {
   const testFramesRef = useRef<HTMLImageElement[]>([]);
   const testFrameIdxRef = useRef(0);
   const testFrameUrlsRef = useRef<string[]>([]);
+  /** Resized "before" photo canvas for the photo→photo VLM diff. */
+  const previousFullPhotoRef = useRef<HTMLCanvasElement | null>(null);
 
   const [lastMove, setLastMove] = useState<
     { san: string; side: Side } | null
@@ -525,6 +538,7 @@ export function CaptureGame() {
     chessRef.current = new Chess();
     baselineRef.current = null;
     previousFrameRef.current = null;
+    previousFullPhotoRef.current = null;
     captures.forEach((c) => URL.revokeObjectURL(c.url));
     setCaptures([]);
     setLastMove(null);
@@ -992,7 +1006,7 @@ export function CaptureGame() {
     if (legal.length === 0) return null;
     const verifier = config?.apiKey
       ? makeVerifier(config.provider, config.apiKey)
-      : makeAnthropicProxyVerifier(VLM_PROXY_URL);
+      : (makeProxyVerifier() as VlmVerifier);
     let result: VlmVerifyResult;
     try {
       result = await verifier.verify({
@@ -1017,13 +1031,13 @@ export function CaptureGame() {
   }
 
   /**
-   * Photo-to-FEN inference pipeline for test mode.
+   * Photo-to-photo VLM diff inference pipeline for test mode.
    *
-   * Each clock tap consumes the next uploaded photo, hands the *full* image
-   * to Claude (no rectification / no per-square classifier), asks for the
-   * FEN piece-placement field, then locally picks the legal move whose
-   * resulting position matches that FEN. Way more robust than CV+rectify
-   * because Claude sees the original perspective and resolution.
+   * Hands Claude the previous full photo + current full photo + list of
+   * legal moves, and asks which legal move was played. Way more robust
+   * than reading a full FEN from a single image (Claude only needs to
+   * identify what *changed*, not classify all 64 squares) and works
+   * regardless of board orientation in the photo.
    */
   async function runFenInferencePipeline(side: Side, moveNumber: number) {
     const frames = testFramesRef.current;
@@ -1047,8 +1061,8 @@ export function CaptureGame() {
     }
     setTestFrameIdx((i) => i + 1);
 
-    const resized = imageToResizedCanvas(img, 1024);
-    if (!resized) {
+    const afterCanvas = imageToResizedCanvas(img, 1280);
+    if (!afterCanvas) {
       setCaptures((prev) => [
         ...prev,
         {
@@ -1061,7 +1075,16 @@ export function CaptureGame() {
       ]);
       return;
     }
-    const url = await canvasToBlobUrl(resized);
+
+    // The "before" image is either the previously-processed photo's canvas
+    // (cached) or photo 0 (the starting position) for the very first move.
+    let beforeCanvas = previousFullPhotoRef.current;
+    if (!beforeCanvas) {
+      const photo0 = frames[0];
+      if (photo0) beforeCanvas = imageToResizedCanvas(photo0, 1280);
+    }
+
+    const url = await canvasToBlobUrl(afterCanvas);
     if (!url) return;
 
     setVlmActive(true);
@@ -1071,57 +1094,63 @@ export function CaptureGame() {
       | null = null;
     try {
       const userConfig = vlmConfigRef.current;
-      const result =
-        userConfig?.apiKey && userConfig.provider === "anthropic"
-          ? await readFenViaAnthropic(userConfig.apiKey, resized)
-          : VLM_PROXY_URL
-            ? await readFenViaProxy(VLM_PROXY_URL, resized)
-            : null;
+      const verifier = userConfig?.apiKey
+        ? makeVerifier(userConfig.provider, userConfig.apiKey)
+        : makeProxyVerifier();
 
-      if (!result) {
+      if (!verifier) {
         inference = {
           kind: "unmatched",
-          diff: ["Claude is not configured — paste a key or enable the proxy."],
-        };
-      } else if (result.kind === "error") {
-        inference = { kind: "unmatched", diff: [`Claude: ${result.reason}`] };
-      } else if (result.kind === "unreadable") {
-        inference = {
-          kind: "unmatched",
-          diff: ["Claude couldn't read this photo with confidence"],
+          diff: ["VLM is not configured — paste a key or enable the proxy."],
         };
       } else {
-        const matchResult = moveFromObservedBoard(chessRef.current, result.fen);
-        if (matchResult.kind === "matched") {
-          chessRef.current.move({
-            from: matchResult.move.from,
-            to: matchResult.move.to,
-            promotion: matchResult.move.promotion ?? "q",
-          });
-          inference = {
-            kind: "vlm-matched",
-            san: matchResult.move.san,
-            from: matchResult.move.from,
-            to: matchResult.move.to,
-            fen: matchResult.updatedFen,
-            provider: "anthropic" as VlmProvider,
-          };
-          setLastMove({ san: matchResult.move.san, side });
-          setMoveLog((log) => [
-            ...log,
-            { san: matchResult.move.san, viaVlm: true },
-          ]);
+        const legalMovesSan = chessRef.current.moves();
+        const previousFen = chessRef.current.fen();
+        const result = await verifier.verify({
+          previousFen,
+          legalMovesSan,
+          boardImage: afterCanvas,
+          previousBoardImage: beforeCanvas ?? undefined,
+        });
+        if (result.kind === "matched") {
+          let applied: ChessMove | null = null;
+          try {
+            applied = chessRef.current.move(result.san) as ChessMove | null;
+          } catch {
+            applied = null;
+          }
+          if (applied) {
+            previousFullPhotoRef.current = afterCanvas;
+            inference = {
+              kind: "vlm-matched",
+              san: applied.san,
+              from: applied.from,
+              to: applied.to,
+              fen: chessRef.current.fen(),
+              provider: verifier.provider,
+            };
+            setLastMove({ san: applied.san, side });
+            setMoveLog((log) => [
+              ...log,
+              { san: applied!.san, viaVlm: true },
+            ]);
+          } else {
+            inference = {
+              kind: "unmatched",
+              diff: [`Claude picked ${result.san} but chess.js rejected it.`],
+            };
+            const legalMoves = chessRef.current.moves({
+              verbose: true,
+            }) as ChessMove[];
+            unmatchedPick = { side, rectifiedUrl: url, legalMoves };
+          }
         } else {
-          // Claude returned a FEN, but no legal move from the engine's
-          // current state produces that position — Claude likely misread.
-          // Show the manual pick sheet with the full legal-move list.
           inference = {
             kind: "unmatched",
             diff: [
-              `Observed FEN: ${result.fen}`,
-              matchResult.kind === "ambiguous"
-                ? `Ambiguous: ${matchResult.candidates.map((c) => c.san).join(", ")}`
-                : "No legal move from current state matches this position.",
+              result.kind === "error"
+                ? `Claude: ${result.reason}`
+                : `Rejected: ${result.reason}`,
             ],
           };
           const legalMoves = chessRef.current.moves({
@@ -1135,6 +1164,10 @@ export function CaptureGame() {
         kind: "unmatched",
         diff: [e instanceof Error ? e.message : String(e)],
       };
+      const legalMoves = chessRef.current.moves({
+        verbose: true,
+      }) as ChessMove[];
+      unmatchedPick = { side, rectifiedUrl: url, legalMoves };
     } finally {
       setVlmActive(false);
     }
@@ -2206,11 +2239,13 @@ function SettingsScreen({
         <SettingsSection title="Vision-LM fallback">
           {VLM_PROXY_URL ? (
             <div className="rounded-2xl border border-emerald-500/30 bg-emerald-500/10 p-3 text-[12px] text-emerald-100">
-              <div className="font-medium">Claude is enabled by default.</div>
+              <div className="font-medium">
+                {VLM_PROXY_PROVIDER === "openai" ? "GPT-5" : "Claude"} is
+                enabled by default.
+              </div>
               <div className="mt-1 text-[11px] text-emerald-200/80">
-                When CV can&apos;t resolve a move, Claude Sonnet identifies
-                it via the bundled proxy — no key needed. Paste your own
-                key below to override.
+                Photo identification runs through the bundled proxy — no
+                key needed. Paste your own key below to override.
               </div>
               <details className="mt-2 text-[11px] text-emerald-100/80">
                 <summary className="cursor-pointer">Override with your own key</summary>

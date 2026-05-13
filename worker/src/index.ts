@@ -20,6 +20,8 @@
 
 export interface Env {
   ANTHROPIC_API_KEY: string;
+  /** Set to enable the /openai endpoint. Leave unset if you only want Claude. */
+  OPENAI_API_KEY?: string;
   /** Comma-separated list of allowed origins, e.g.
    *  "https://jlud7.github.io,http://localhost:3000". */
   ALLOWED_ORIGINS?: string;
@@ -29,6 +31,7 @@ export interface Env {
 }
 
 const ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
+const OPENAI_URL = "https://api.openai.com/v1/chat/completions";
 
 function parseAllowedOrigins(env: Env): string[] {
   if (!env.ALLOWED_ORIGINS) return [];
@@ -63,8 +66,16 @@ export default {
       return new Response(null, { status: 204, headers: baseCors });
     }
 
-    if (url.pathname !== "/verify" || req.method !== "POST") {
+    const isVerify = url.pathname === "/verify" && req.method === "POST";
+    const isOpenAi = url.pathname === "/openai" && req.method === "POST";
+    if (!isVerify && !isOpenAi) {
       return new Response("Not found", { status: 404, headers: baseCors });
+    }
+    if (isOpenAi && !env.OPENAI_API_KEY) {
+      return new Response("OpenAI not configured on this worker", {
+        status: 501,
+        headers: baseCors,
+      });
     }
 
     if (allowed.length > 0 && (!origin || !allowed.includes(origin))) {
@@ -92,15 +103,24 @@ export default {
       return new Response("Invalid JSON", { status: 400, headers: baseCors });
     }
 
-    const upstream = await fetch(ANTHROPIC_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": env.ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-      },
-      body,
-    });
+    const upstream = isVerify
+      ? await fetch(ANTHROPIC_URL, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-api-key": env.ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+          },
+          body,
+        })
+      : await fetch(OPENAI_URL, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${env.OPENAI_API_KEY}`,
+          },
+          body,
+        });
 
     const resHeaders = new Headers(baseCors);
     resHeaders.set(

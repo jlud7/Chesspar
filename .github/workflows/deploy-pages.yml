@@ -34,9 +34,13 @@ jobs:
         env:
           # URL of the Cloudflare Worker that proxies VLM requests.
           # Set this as a repository variable (Settings → Variables → Actions)
-          # to enable Claude by default in the deployed app. Leave unset
+          # to enable a VLM by default in the deployed app. Leave unset
           # to fall back to the paste-your-own-key flow.
           NEXT_PUBLIC_VLM_PROXY_URL: ${{ vars.VLM_PROXY_URL }}
+          # Which provider the proxy routes to: "anthropic" (default, calls
+          # /verify) or "openai" (calls /openai, needs OPENAI_API_KEY
+          # secret on the worker).
+          NEXT_PUBLIC_VLM_PROXY_PROVIDER: ${{ vars.VLM_PROXY_PROVIDER }}
         run: npm run build
 
       - name: Add nojekyll
