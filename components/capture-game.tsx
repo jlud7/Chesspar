@@ -13,7 +13,12 @@ import { Chess } from "chess.js";
 import clsx from "clsx";
 import { extractSquareCrops, warpBoard } from "@/lib/board-image";
 import type { Point } from "@/lib/homography";
-import { classifyBoard } from "@/lib/occupancy";
+import {
+  classifyBoard,
+  classifyBoardCalibrated,
+  computeBaseline,
+  type BaselineSignature,
+} from "@/lib/occupancy";
 import { inferMove } from "@/lib/move-inference";
 import {
   autoDetectBoardCorners,
@@ -100,6 +105,7 @@ export function CaptureGame() {
   const [inferring, setInferring] = useState(false);
 
   const chessRef = useRef<Chess>(new Chess());
+  const baselineRef = useRef<BaselineSignature | null>(null);
   const [pgn, setPgn] = useState<string>("");
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -392,6 +398,7 @@ export function CaptureGame() {
 
   function startSession() {
     chessRef.current = new Chess();
+    baselineRef.current = null;
     captures.forEach((c) => URL.revokeObjectURL(c.url));
     setCaptures([]);
     setLastMove(null);
@@ -510,11 +517,30 @@ export function CaptureGame() {
 
   function startPlayingFromCalibration() {
     if (cornersRef.current.length !== 4) return;
+    // Learn a per-board baseline from the current rectified frame. The
+    // calibration phase is *defined* as the starting position, so the
+    // 32 empty squares + 16 white + 16 black piece squares give us
+    // labelled reference signatures.
+    try {
+      const source = previewSource();
+      if (source) {
+        const warped = warpBoard(
+          source,
+          cornersRef.current as [Point, Point, Point, Point],
+          RECTIFIED_SIZE,
+        );
+        const crops = extractSquareCrops(warped);
+        baselineRef.current = computeBaseline(crops);
+      }
+    } catch {
+      baselineRef.current = null;
+    }
     setPhase("playing");
   }
 
   function recalibrate() {
     setCorners([]);
+    baselineRef.current = null;
     setPhase("calibrating");
   }
 
@@ -587,7 +613,11 @@ export function CaptureGame() {
         RECTIFIED_SIZE,
       );
       const crops = extractSquareCrops(warped);
-      const occupancy = classifyBoard(crops).map((c) => c.state);
+      const occupancy = (
+        baselineRef.current
+          ? classifyBoardCalibrated(crops, baselineRef.current)
+          : classifyBoard(crops)
+      ).map((c) => c.state);
       const result = inferMove(chessRef.current.fen(), occupancy);
       if (result.kind === "matched") {
         const move = result.move;

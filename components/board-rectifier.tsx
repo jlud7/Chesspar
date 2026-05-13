@@ -5,7 +5,14 @@ import { Chess } from "chess.js";
 import clsx from "clsx";
 import { extractSquareCrops, warpBoard } from "@/lib/board-image";
 import type { Point } from "@/lib/homography";
-import { classifyBoard, type ClassifyResult, type Occupancy } from "@/lib/occupancy";
+import {
+  classifyBoard,
+  classifyBoardCalibrated,
+  computeBaseline,
+  type BaselineSignature,
+  type ClassifyResult,
+  type Occupancy,
+} from "@/lib/occupancy";
 import { inferMove, type InferResult } from "@/lib/move-inference";
 import {
   autoDetectBoardCorners,
@@ -37,6 +44,7 @@ export function BoardRectifier() {
   const [prevFen, setPrevFen] = useState<string>(STARTING_FEN);
   const [pgn, setPgn] = useState<string>("");
   const [inferResult, setInferResult] = useState<InferResult | null>(null);
+  const [baseline, setBaseline] = useState<BaselineSignature | null>(null);
   const [busy, setBusy] = useState(false);
   const [autoDetected, setAutoDetected] = useState(false);
   const [autoDetectFailed, setAutoDetectFailed] = useState(false);
@@ -111,9 +119,29 @@ export function BoardRectifier() {
       }
       setCorners(bestCorners);
       if (bestWarped) {
+        // If we have a per-board baseline AND we're past the starting
+        // position, re-classify with the calibrated classifier — it
+        // significantly out-performs the generic thresholds on a known
+        // board+lighting setup.
+        let finalClasses = bestClasses;
+        if (baseline && prevFen !== STARTING_FEN) {
+          finalClasses = classifyBoardCalibrated(bestCrops, baseline);
+        }
+        // If this looks like the starting position, learn the baseline.
+        if (prevFen === STARTING_FEN) {
+          try {
+            const fresh = computeBaseline(bestCrops);
+            setBaseline(fresh);
+            // Re-classify with the fresh baseline so the user sees calibrated
+            // output even on the very first frame.
+            finalClasses = classifyBoardCalibrated(bestCrops, fresh);
+          } catch {
+            /* keep heuristic classes */
+          }
+        }
         setWarpedUrl(bestWarped.toDataURL("image/png"));
         setSquareUrls(bestCrops.map((c) => c.toDataURL("image/png")));
-        setOccupancy(bestClasses);
+        setOccupancy(finalClasses);
       }
       setAutoDetected(true);
       setAutoDetectFailed(false);
@@ -123,7 +151,7 @@ export function BoardRectifier() {
     } finally {
       setBusy(false);
     }
-  }, []);
+  }, [baseline, prevFen]);
 
   function onImageLoad() {
     const img = imageRef.current;
@@ -169,7 +197,19 @@ export function BoardRectifier() {
         RECTIFIED_SIZE,
       );
       const crops = extractSquareCrops(warped);
-      const classes = classifyBoard(crops);
+      let classes = classifyBoard(crops);
+      if (baseline && prevFen !== STARTING_FEN) {
+        classes = classifyBoardCalibrated(crops, baseline);
+      }
+      if (prevFen === STARTING_FEN) {
+        try {
+          const fresh = computeBaseline(crops);
+          setBaseline(fresh);
+          classes = classifyBoardCalibrated(crops, fresh);
+        } catch {
+          /* keep heuristic classes */
+        }
+      }
       setWarpedUrl(warped.toDataURL("image/png"));
       setSquareUrls(crops.map((c) => c.toDataURL("image/png")));
       setOccupancy(classes);
@@ -178,7 +218,7 @@ export function BoardRectifier() {
     } finally {
       setBusy(false);
     }
-  }, [corners]);
+  }, [corners, baseline, prevFen]);
 
   function runInference() {
     if (occupancy.length !== 64) return;
@@ -227,6 +267,7 @@ export function BoardRectifier() {
     setPrevFen(chessRef.current.fen());
     setPgn("");
     setInferResult(null);
+    setBaseline(null);
   }
 
   return (
@@ -406,6 +447,7 @@ export function BoardRectifier() {
           onAccept={applyInferenceResult}
           onReset={resetSession}
           pgn={pgn}
+          calibrated={Boolean(baseline)}
         />
       )}
     </div>
@@ -450,6 +492,7 @@ function InferencePanel({
   onAccept,
   onReset,
   pgn,
+  calibrated,
 }: {
   prevFen: string;
   onChangePrevFen: (fen: string) => void;
@@ -458,12 +501,23 @@ function InferencePanel({
   onAccept: () => void;
   onReset: () => void;
   pgn: string;
+  calibrated: boolean;
 }) {
   return (
     <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 p-4">
       <div className="mb-2 flex flex-wrap items-baseline justify-between gap-2">
-        <div className="text-xs uppercase tracking-wider text-zinc-400">
-          Move inference
+        <div className="flex items-center gap-2">
+          <div className="text-xs uppercase tracking-wider text-zinc-400">
+            Move inference
+          </div>
+          {calibrated && (
+            <span
+              className="rounded-full border border-emerald-500/40 bg-emerald-500/15 px-2 py-0.5 text-[10px] uppercase tracking-wider text-emerald-200"
+              title="Per-board baseline learned from a starting-position frame"
+            >
+              Calibrated
+            </span>
+          )}
         </div>
         <button
           onClick={onReset}
