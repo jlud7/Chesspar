@@ -1,12 +1,12 @@
 /**
- * Vision-LM fallback for chess move inference.
+ * Vision-LM identifier for chess moves.
  *
- * When the heuristic + calibrated classifiers fail to produce a unique
- * legal move, we hand a tight, constrained question to a vision model:
- * "Given this previous FEN and this list of legal moves, which one
- * happened?" The constrained-search architecture from the design doc:
- * the VLM picks from at most ~40 SAN strings, not from open ideas about
- * chess positions.
+ * The current design hands the model BOTH the rectified before-frame AND
+ * after-frame plus the previous FEN and the full list of legal moves. The
+ * model picks one — a constrained classification problem against ~40
+ * candidates rather than open-ended chess reasoning. Two-image diff makes
+ * it trivial for the model: "which of these legal moves explains this
+ * before→after change?"
  *
  * All callers go through the swappable `VlmVerifier` shape so we can
  * A/B different providers on the same input.
@@ -17,6 +17,8 @@ export type VlmVerifyInput = {
   legalMovesSan: string[];
   /** Rectified top-down board image (a8 top-left, h1 bottom-right). */
   boardImage: HTMLCanvasElement;
+  /** Rectified board image of the state BEFORE the move, if available. */
+  previousBoardImage?: HTMLCanvasElement;
 };
 
 export type VlmVerifyResult =
@@ -31,10 +33,10 @@ export interface VlmVerifier {
   verify(input: VlmVerifyInput): Promise<VlmVerifyResult>;
 }
 
-const VERIFIER_PROMPT = (
+const SINGLE_FRAME_PROMPT = (
   prevFen: string,
   legalMovesSan: string[],
-): string => `You are verifying a chess move from a photo.
+): string => `You are identifying a chess move from a photo.
 
 PREVIOUS POSITION FEN:
 ${prevFen}
@@ -42,9 +44,27 @@ ${prevFen}
 LEGAL MOVES (the move that happened is exactly one of these):
 ${legalMovesSan.join(", ")}
 
-The attached image is the rectified, top-down view of the board AFTER the move was played. a8 is the top-left square, h1 is the bottom-right square (White's pieces are at the bottom). Some squares may have lighting glitches or a hand mid-frame.
+The attached image is the rectified top-down view of the board AFTER the move was played. a8 is top-left, h1 is bottom-right (White's pieces are at the bottom).
 
-Reply with ONLY the SAN notation of the move that just happened, exactly as it appears in the legal-moves list above (e.g. "e4", "Nxf3", "O-O", "Qxh7#"). No explanation, no quotes, no extra punctuation.`;
+Reply with ONLY the SAN notation of the move that just happened, exactly as it appears in the legal-moves list above (e.g. "e4", "Nxf3", "O-O", "Qxh7#"). No explanation, no quotes.`;
+
+const TWO_FRAME_PROMPT = (
+  prevFen: string,
+  legalMovesSan: string[],
+): string => `You are identifying which chess move was just played by comparing two photos.
+
+IMAGE 1: the board BEFORE the move (top-down rectified view, a8 top-left, h1 bottom-right, White at bottom).
+IMAGE 2: the board AFTER the move (same orientation).
+
+PREVIOUS POSITION FEN:
+${prevFen}
+
+LEGAL MOVES — exactly one of these was played:
+${legalMovesSan.join(", ")}
+
+Compare the two images. Find the cells that changed. Pick the unique legal move whose result explains the change.
+
+Reply with ONLY the SAN notation of the move that happened, exactly as it appears in the legal-moves list above (e.g. "e4", "Nxf3", "O-O", "Qxh7#"). No explanation, no quotes.`;
 
 export function makeGeminiVerifier(
   apiKey: string,
@@ -52,29 +72,31 @@ export function makeGeminiVerifier(
 ): VlmVerifier {
   return {
     provider: "gemini",
-    async verify({ previousFen, legalMovesSan, boardImage }) {
+    async verify({ previousFen, legalMovesSan, boardImage, previousBoardImage }) {
       try {
-        const base64 = canvasToBase64(boardImage);
-        const prompt = VERIFIER_PROMPT(previousFen, legalMovesSan);
+        const afterB64 = canvasToBase64(boardImage);
+        const beforeB64 = previousBoardImage
+          ? canvasToBase64(previousBoardImage)
+          : null;
+        const prompt = beforeB64
+          ? TWO_FRAME_PROMPT(previousFen, legalMovesSan)
+          : SINGLE_FRAME_PROMPT(previousFen, legalMovesSan);
+        const parts: unknown[] = [{ text: prompt }];
+        if (beforeB64) {
+          parts.push({
+            inline_data: { mime_type: "image/jpeg", data: beforeB64 },
+          });
+        }
+        parts.push({
+          inline_data: { mime_type: "image/jpeg", data: afterB64 },
+        });
         const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
         const response = await fetch(url, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            contents: [
-              {
-                parts: [
-                  { text: prompt },
-                  {
-                    inline_data: { mime_type: "image/jpeg", data: base64 },
-                  },
-                ],
-              },
-            ],
-            generationConfig: {
-              temperature: 0.05,
-              maxOutputTokens: 32,
-            },
+            contents: [{ parts }],
+            generationConfig: { temperature: 0.05, maxOutputTokens: 32 },
           }),
         });
         if (!response.ok) {
@@ -85,9 +107,7 @@ export function makeGeminiVerifier(
           };
         }
         const data = (await response.json()) as {
-          candidates?: {
-            content?: { parts?: { text?: string }[] };
-          }[];
+          candidates?: { content?: { parts?: { text?: string }[] } }[];
         };
         const raw = data.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
         return resolveSan(raw, legalMovesSan);
@@ -107,10 +127,26 @@ export function makeOpenAiVerifier(
 ): VlmVerifier {
   return {
     provider: "openai",
-    async verify({ previousFen, legalMovesSan, boardImage }) {
+    async verify({ previousFen, legalMovesSan, boardImage, previousBoardImage }) {
       try {
-        const base64 = canvasToBase64(boardImage);
-        const prompt = VERIFIER_PROMPT(previousFen, legalMovesSan);
+        const afterB64 = canvasToBase64(boardImage);
+        const beforeB64 = previousBoardImage
+          ? canvasToBase64(previousBoardImage)
+          : null;
+        const prompt = beforeB64
+          ? TWO_FRAME_PROMPT(previousFen, legalMovesSan)
+          : SINGLE_FRAME_PROMPT(previousFen, legalMovesSan);
+        const content: unknown[] = [{ type: "text", text: prompt }];
+        if (beforeB64) {
+          content.push({
+            type: "image_url",
+            image_url: { url: `data:image/jpeg;base64,${beforeB64}` },
+          });
+        }
+        content.push({
+          type: "image_url",
+          image_url: { url: `data:image/jpeg;base64,${afterB64}` },
+        });
         const response = await fetch(
           "https://api.openai.com/v1/chat/completions",
           {
@@ -123,20 +159,7 @@ export function makeOpenAiVerifier(
               model,
               max_tokens: 32,
               temperature: 0.05,
-              messages: [
-                {
-                  role: "user",
-                  content: [
-                    { type: "text", text: prompt },
-                    {
-                      type: "image_url",
-                      image_url: {
-                        url: `data:image/jpeg;base64,${base64}`,
-                      },
-                    },
-                  ],
-                },
-              ],
+              messages: [{ role: "user", content }],
             }),
           },
         );
@@ -164,14 +187,39 @@ export function makeOpenAiVerifier(
 
 export function makeAnthropicVerifier(
   apiKey: string,
-  model = "claude-opus-4-7",
+  model = "claude-sonnet-4-6",
 ): VlmVerifier {
   return {
     provider: "anthropic",
-    async verify({ previousFen, legalMovesSan, boardImage }) {
+    async verify({ previousFen, legalMovesSan, boardImage, previousBoardImage }) {
       try {
-        const base64 = canvasToBase64(boardImage);
-        const prompt = VERIFIER_PROMPT(previousFen, legalMovesSan);
+        const afterB64 = canvasToBase64(boardImage);
+        const beforeB64 = previousBoardImage
+          ? canvasToBase64(previousBoardImage)
+          : null;
+        const prompt = beforeB64
+          ? TWO_FRAME_PROMPT(previousFen, legalMovesSan)
+          : SINGLE_FRAME_PROMPT(previousFen, legalMovesSan);
+        const content: unknown[] = [];
+        if (beforeB64) {
+          content.push({
+            type: "image",
+            source: {
+              type: "base64",
+              media_type: "image/jpeg",
+              data: beforeB64,
+            },
+          });
+        }
+        content.push({
+          type: "image",
+          source: {
+            type: "base64",
+            media_type: "image/jpeg",
+            data: afterB64,
+          },
+        });
+        content.push({ type: "text", text: prompt });
         const response = await fetch("https://api.anthropic.com/v1/messages", {
           method: "POST",
           headers: {
@@ -184,22 +232,7 @@ export function makeAnthropicVerifier(
             model,
             max_tokens: 32,
             temperature: 0.05,
-            messages: [
-              {
-                role: "user",
-                content: [
-                  {
-                    type: "image",
-                    source: {
-                      type: "base64",
-                      media_type: "image/jpeg",
-                      data: base64,
-                    },
-                  },
-                  { type: "text", text: prompt },
-                ],
-              },
-            ],
+            messages: [{ role: "user", content }],
           }),
         });
         if (!response.ok) {
@@ -212,8 +245,7 @@ export function makeAnthropicVerifier(
         const data = (await response.json()) as {
           content?: { type: string; text?: string }[];
         };
-        const raw =
-          data.content?.find((c) => c.type === "text")?.text ?? "";
+        const raw = data.content?.find((c) => c.type === "text")?.text ?? "";
         return resolveSan(raw, legalMovesSan);
       } catch (e) {
         return {
@@ -239,17 +271,13 @@ function resolveSan(raw: string, legalMovesSan: string[]): VlmVerifyResult {
   if (!trimmed) {
     return { kind: "rejected", raw, reason: "empty response" };
   }
-  // Exact match first
   if (legalMovesSan.includes(trimmed)) {
     return { kind: "matched", san: trimmed, raw };
   }
-  // Strip surrounding punctuation/markdown and try again
   const cleaned = trimmed.replace(/^["'`]+|["'`.,!?\s]+$/g, "");
   if (legalMovesSan.includes(cleaned)) {
     return { kind: "matched", san: cleaned, raw };
   }
-  // Search inside the response for a token that matches a legal move (handles
-  // models that prefix with "Answer: " or wrap in quotes).
   for (const candidate of legalMovesSan) {
     const re = new RegExp(
       `(^|[^A-Za-z0-9])${escapeRegExp(candidate)}([^A-Za-z0-9]|$)`,

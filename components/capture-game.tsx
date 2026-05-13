@@ -17,10 +17,11 @@ import {
   classifyBoard,
   classifyBoardCalibrated,
   computeBaseline,
+  computeCellDeltas,
   type BaselineSignature,
 } from "@/lib/occupancy";
 import { makeVerifier, type VlmProvider, type VlmVerifyResult } from "@/lib/vlm";
-import { inferMove } from "@/lib/move-inference";
+import { inferMoveFuzzy } from "@/lib/move-inference";
 import {
   autoDetectBoardCorners,
   refineCornersForFrame,
@@ -78,7 +79,12 @@ type VlmConfig = { provider: VlmProvider; apiKey: string };
 const VLM_PROVIDER_LABELS: Record<VlmProvider, string> = {
   gemini: "Gemini 2.5 Pro",
   openai: "OpenAI GPT-4o",
-  anthropic: "Claude Opus",
+  anthropic: "Claude Sonnet",
+};
+const VLM_PROVIDER_COST_HINT: Record<VlmProvider, string> = {
+  anthropic: "~$0.01 / move · ~$0.40 / 40-move game",
+  gemini: "~$0.005 / move · ~$0.20 / 40-move game",
+  openai: "~$0.02 / move · ~$0.80 / 40-move game",
 };
 const RECTIFIED_SIZE = 384;
 const CORNER_LABELS = ["a8", "h8", "h1", "a1"] as const;
@@ -122,9 +128,22 @@ export function CaptureGame() {
     { san: string; side: Side } | null
   >(null);
   const [inferring, setInferring] = useState(false);
+  const [vlmActive, setVlmActive] = useState(false);
 
   const chessRef = useRef<Chess>(new Chess());
   const baselineRef = useRef<BaselineSignature | null>(null);
+  /**
+   * Snapshot of the previous frame's classifier output + per-square crops
+   * + rectified canvas. Drives:
+   *   - frame-to-frame diff matching (consistent misclassifications cancel)
+   *   - per-cell pixel-delta computation (small piece detection)
+   *   - "before" image to ship to the VLM alongside the current frame
+   */
+  const previousFrameRef = useRef<{
+    occupancy: Array<"empty" | "white" | "black">;
+    crops: HTMLCanvasElement[];
+    warped: HTMLCanvasElement;
+  } | null>(null);
   const [pgn, setPgn] = useState<string>("");
 
   const [vlmConfig, setVlmConfig] = useState<VlmConfig | null>(null);
@@ -465,6 +484,7 @@ export function CaptureGame() {
   function startSession() {
     chessRef.current = new Chess();
     baselineRef.current = null;
+    previousFrameRef.current = null;
     captures.forEach((c) => URL.revokeObjectURL(c.url));
     setCaptures([]);
     setLastMove(null);
@@ -615,7 +635,9 @@ export function CaptureGame() {
     // Learn a per-board baseline from the current rectified frame. The
     // calibration phase is *defined* as the starting position, so the
     // 32 empty squares + 16 white + 16 black piece squares give us
-    // labelled reference signatures.
+    // labelled reference signatures. We also stash the rectified warp +
+    // crops + classifier output as `previousFrameRef`, which the
+    // first-move inference will diff against.
     try {
       const source = previewSource();
       if (source) {
@@ -625,10 +647,14 @@ export function CaptureGame() {
           RECTIFIED_SIZE,
         );
         const crops = extractSquareCrops(warped);
-        baselineRef.current = computeBaseline(crops);
+        const baseline = computeBaseline(crops);
+        baselineRef.current = baseline;
+        const occ = classifyBoardCalibrated(crops, baseline).map((c) => c.state);
+        previousFrameRef.current = { occupancy: occ, crops, warped };
       }
     } catch {
       baselineRef.current = null;
+      previousFrameRef.current = null;
     }
     setPhase("playing");
   }
@@ -636,6 +662,7 @@ export function CaptureGame() {
   function recalibrate() {
     setCorners([]);
     baselineRef.current = null;
+    previousFrameRef.current = null;
     setPhase("calibrating");
   }
 
@@ -667,12 +694,28 @@ export function CaptureGame() {
     setCorners((c) => [...c, { x, y }]);
   }
 
+  function onCornerDrag(idx: number, x: number, y: number) {
+    setCorners((c) => {
+      if (idx < 0 || idx >= c.length) return c;
+      const next = [...c];
+      next[idx] = { x, y };
+      return next;
+    });
+  }
+
   function undoCorner() {
     setCorners((c) => c.slice(0, -1));
   }
 
   function resetCorners() {
     setCorners([]);
+  }
+
+  /** Re-run the auto-detector from scratch. */
+  function redetectCorners() {
+    setCorners([]);
+    // The useEffect on phase==='calibrating' && corners.length<4 triggers
+    // tryAutoCalibrate; the next tick will pick this up.
   }
 
   async function runInferencePipeline(side: Side, moveNumber: number) {
@@ -704,10 +747,8 @@ export function CaptureGame() {
     let unmatchedPick:
       | { side: Side; rectifiedUrl: string; legalMoves: ChessMove[] }
       | null = null;
+    let nextPreviousFrame: typeof previousFrameRef.current = null;
     try {
-      // Per-frame corner refinement: re-detect the board on this frame and
-      // snap our saved corners to it when the camera has drifted slightly.
-      // Falls back to the saved corners on any failure or large drift.
       let activeCorners = cs as [Point, Point, Point, Point];
       try {
         const refined = refineCornersForFrame(frame, activeCorners);
@@ -721,79 +762,131 @@ export function CaptureGame() {
       }
       const warped = warpBoard(frame, activeCorners, RECTIFIED_SIZE);
       const crops = extractSquareCrops(warped);
-      const occupancy = (
-        baselineRef.current
-          ? classifyBoardCalibrated(crops, baselineRef.current)
-          : classifyBoard(crops)
-      ).map((c) => c.state);
-      const result = inferMove(chessRef.current.fen(), occupancy);
-      if (result.kind === "matched") {
-        const move = result.move;
+      const occResults = baselineRef.current
+        ? classifyBoardCalibrated(crops, baselineRef.current)
+        : classifyBoard(crops);
+      const occupancy = occResults.map((c) => c.state);
+      const confidences = occResults.map((c) => c.confidence);
+
+      const prev = previousFrameRef.current;
+      const cellDeltas = prev
+        ? computeCellDeltas(prev.crops, crops)
+        : undefined;
+
+      const fenBefore = chessRef.current.fen();
+      const cvResult = inferMoveFuzzy(fenBefore, occupancy, {
+        previousObserved: prev?.occupancy,
+        confidences,
+        cellDeltas,
+      });
+
+      // Decide path: CV slam-dunk = mismatch 0 AND winning confidently;
+      // anything murkier defers to the VLM identifier (when configured).
+      const cvSlamDunk =
+        cvResult.kind === "matched" &&
+        cvResult.ranked[0].mismatch === 0 &&
+        cvResult.ranked[0].weightedMismatch <= 0.6;
+
+      let viaVlm = false;
+      let appliedMove: ChessMove | null = null;
+      let appliedFen = fenBefore;
+
+      if (cvSlamDunk && cvResult.pick) {
+        appliedMove = cvResult.pick.move;
+        appliedFen = cvResult.pick.updatedFen;
         chessRef.current.move({
-          from: move.from,
-          to: move.to,
-          promotion: move.promotion ?? "q",
+          from: appliedMove.from,
+          to: appliedMove.to,
+          promotion: appliedMove.promotion ?? "q",
         });
-        inference = {
-          kind: "matched",
-          san: move.san,
-          from: move.from,
-          to: move.to,
-          fen: result.updatedFen,
-        };
-        setLastMove({ san: move.san, side });
-        setMoveLog((log) => [...log, { san: move.san, viaVlm: false }]);
-      } else if (result.kind === "ambiguous") {
-        // Default to queen-promotion; user can adjust later.
-        const queen = result.candidates.find((m) => m.promotion === "q");
-        const pick = queen ?? result.candidates[0];
+      } else if (vlmConfigRef.current?.apiKey) {
+        // VLM identifier — two-image diff against the legal-move list.
+        setVlmActive(true);
+        try {
+          const vlmPicked = await runVlmIdentifier({
+            before: prev?.warped,
+            after: warped,
+            previousFen: fenBefore,
+          });
+          if (vlmPicked) {
+            appliedMove = vlmPicked.move;
+            appliedFen = vlmPicked.fen;
+            viaVlm = true;
+          }
+        } finally {
+          setVlmActive(false);
+        }
+      }
+
+      // If neither slam-dunk nor VLM worked, accept the CV top pick when
+      // it's at least a "matched"; otherwise surface a manual pick sheet.
+      if (!appliedMove && cvResult.kind === "matched" && cvResult.pick) {
+        appliedMove = cvResult.pick.move;
+        appliedFen = cvResult.pick.updatedFen;
         chessRef.current.move({
-          from: pick.from,
-          to: pick.to,
-          promotion: pick.promotion ?? "q",
+          from: appliedMove.from,
+          to: appliedMove.to,
+          promotion: appliedMove.promotion ?? "q",
         });
+      }
+
+      if (appliedMove) {
+        inference = viaVlm
+          ? {
+              kind: "vlm-matched",
+              san: appliedMove.san,
+              from: appliedMove.from,
+              to: appliedMove.to,
+              fen: appliedFen,
+              provider: vlmConfigRef.current!.provider,
+            }
+          : {
+              kind: "matched",
+              san: appliedMove.san,
+              from: appliedMove.from,
+              to: appliedMove.to,
+              fen: appliedFen,
+            };
+        setLastMove({ san: appliedMove.san, side });
+        setMoveLog((log) => [...log, { san: appliedMove!.san, viaVlm }]);
+        nextPreviousFrame = { occupancy, crops, warped };
+      } else if (cvResult.kind === "ambiguous") {
         inference = {
           kind: "ambiguous",
-          sans: result.candidates.map((m) => m.san),
+          sans: cvResult.ranked.slice(0, 4).map((c) => c.move.san),
         };
-        setLastMove({ san: pick.san, side });
-        setMoveLog((log) => [...log, { san: pick.san, viaVlm: false }]);
+        const rectifiedDataUrl = warped.toDataURL("image/jpeg", 0.88);
+        unmatchedPick = {
+          side,
+          rectifiedUrl: rectifiedDataUrl,
+          legalMoves: cvResult.ranked.slice(0, 8).map((c) => c.move),
+        };
       } else {
-        // No legal move matches the diff. If a VLM verifier is configured,
-        // hand it the rectified board + previous FEN + legal-move list and
-        // see if it can pick the right one.
-        const fenBeforeVlm = chessRef.current.fen();
-        const vlmResolved = await tryVlmFallback({
-          warped,
-          previousFen: fenBeforeVlm,
-        });
-        if (vlmResolved) {
-          inference = vlmResolved;
-        } else {
-          inference = {
-            kind: "unmatched",
-            diff: result.diff.map(
-              (d) => `${d.square}:${d.before[0]}→${d.after[0]}`,
-            ),
-          };
-          // Surface a one-tap correction sheet on the clock screen with the
-          // exact legal moves at this position.
-          const rectifiedDataUrl = warped.toDataURL("image/jpeg", 0.88);
-          const legalMoves = chessRef.current.moves({
-            verbose: true,
-          }) as ChessMove[];
-          unmatchedPick = {
-            side,
-            rectifiedUrl: rectifiedDataUrl,
-            legalMoves,
-          };
-        }
+        inference = {
+          kind: "unmatched",
+          diff: cvResult.diff.map(
+            (d) => `${d.square}:${d.before[0]}→${d.after[0]}`,
+          ),
+        };
+        const rectifiedDataUrl = warped.toDataURL("image/jpeg", 0.88);
+        const legalMoves = chessRef.current.moves({
+          verbose: true,
+        }) as ChessMove[];
+        unmatchedPick = {
+          side,
+          rectifiedUrl: rectifiedDataUrl,
+          legalMoves,
+        };
       }
     } catch (e) {
       inference = {
         kind: "unmatched",
         diff: [e instanceof Error ? e.message : String(e)],
       };
+    }
+
+    if (nextPreviousFrame) {
+      previousFrameRef.current = nextPreviousFrame;
     }
 
     setCaptures((prev) => {
@@ -814,15 +907,15 @@ export function CaptureGame() {
   }
 
   /**
-   * Best-effort vision-LM fallback when the heuristic/calibrated classifier
-   * + legal-move diff failed to land on a unique move. Returns a fully-
-   * formed CaptureInference if the VLM produced a legal SAN, else null.
-   * Side-effects: applies the move to chessRef and updates lastMove.
+   * Two-image vision-LM identifier. Sends the BEFORE and AFTER rectified
+   * boards plus the legal-move list; the model picks one SAN. Returns the
+   * chess.js Move + resulting FEN on success.
    */
-  async function tryVlmFallback(args: {
-    warped: HTMLCanvasElement;
+  async function runVlmIdentifier(args: {
+    before: HTMLCanvasElement | undefined;
+    after: HTMLCanvasElement;
     previousFen: string;
-  }): Promise<CaptureInference | null> {
+  }): Promise<{ move: ChessMove; fen: string } | null> {
     const config = vlmConfigRef.current;
     if (!config?.apiKey) return null;
     const game = new Chess(args.previousFen);
@@ -834,7 +927,8 @@ export function CaptureGame() {
       result = await verifier.verify({
         previousFen: args.previousFen,
         legalMovesSan: legal,
-        boardImage: args.warped,
+        boardImage: args.after,
+        previousBoardImage: args.before,
       });
     } catch (e) {
       console.warn("VLM verifier threw", e);
@@ -848,19 +942,7 @@ export function CaptureGame() {
       return null;
     }
     if (!applied) return null;
-    setLastMove({
-      san: applied.san,
-      side: applied.color === "w" ? "white" : "black",
-    });
-    setMoveLog((log) => [...log, { san: applied.san, viaVlm: true }]);
-    return {
-      kind: "vlm-matched",
-      san: applied.san,
-      from: applied.from,
-      to: applied.to,
-      fen: chessRef.current.fen(),
-      provider: config.provider,
-    };
+    return { move: applied as ChessMove, fen: chessRef.current.fen() };
   }
 
   function endTurn(side: Side) {
@@ -1003,7 +1085,7 @@ export function CaptureGame() {
   const calibrationHint = busy
     ? "Detecting board automatically…"
     : corners.length === 4
-      ? "Corners found. Confirm to start the clock."
+      ? "Drag any corner to fine-tune, then start the clock."
       : CORNER_HINTS[corners.length];
 
   return (
@@ -1074,7 +1156,11 @@ export function CaptureGame() {
               />
             )}
             {phase === "calibrating" && videoDims && (
-              <CalibrationOverlay corners={corners} videoDims={videoDims} />
+              <CalibrationOverlay
+                corners={corners}
+                videoDims={videoDims}
+                onDragCorner={onCornerDrag}
+              />
             )}
           </div>
         </div>
@@ -1099,6 +1185,13 @@ export function CaptureGame() {
         )}
         {phase === "calibrating" && (
           <div className="flex shrink-0 items-center justify-center gap-2 bg-black/95 px-3 py-3">
+            <button
+              onClick={redetectCorners}
+              disabled={busy}
+              className="rounded-md border border-sky-500/40 bg-sky-500/15 px-3 py-2 text-sm text-sky-100 hover:bg-sky-500/25 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              {busy ? "Detecting…" : "Re-detect"}
+            </button>
             <button
               onClick={undoCorner}
               disabled={corners.length === 0}
@@ -1177,6 +1270,7 @@ export function CaptureGame() {
             captureCount={captures.length}
             moveLog={moveLog}
             inferring={inferring}
+            vlmActive={vlmActive}
             onTogglePause={togglePause}
             onReset={backToSettings}
             onToggleSound={() => setSoundOn((s) => !s)}
@@ -1427,6 +1521,7 @@ function CenterBar({
   captureCount,
   moveLog,
   inferring,
+  vlmActive,
   onTogglePause,
   onReset,
   onToggleSound,
@@ -1438,6 +1533,7 @@ function CenterBar({
   captureCount: number;
   moveLog: { san: string; viaVlm: boolean }[];
   inferring: boolean;
+  vlmActive: boolean;
   onTogglePause: () => void;
   onReset: () => void;
   onToggleSound: () => void;
@@ -1446,7 +1542,11 @@ function CenterBar({
 }) {
   return (
     <div className="relative flex shrink-0 flex-col border-y border-white/5 bg-zinc-950/70 backdrop-blur-xl">
-      <MoveLogStrip moveLog={moveLog} inferring={inferring} />
+      <MoveLogStrip
+        moveLog={moveLog}
+        inferring={inferring}
+        vlmActive={vlmActive}
+      />
       <div className="flex h-14 items-center justify-around px-2">
         <IconBtn onClick={onReset} label="Back to settings">
           <ResetIcon />
@@ -1479,15 +1579,22 @@ function CenterBar({
 function MoveLogStrip({
   moveLog,
   inferring,
+  vlmActive,
 }: {
   moveLog: { san: string; viaVlm: boolean }[];
   inferring: boolean;
+  vlmActive: boolean;
 }) {
   const ref = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
     const el = ref.current;
     if (el) el.scrollLeft = el.scrollWidth;
   }, [moveLog.length]);
+  const emptyLabel = vlmActive
+    ? "Reading the board with vision model…"
+    : inferring
+      ? "Inferring first move…"
+      : "Tap your clock to record the first move";
   return (
     <div className="flex h-9 shrink-0 items-center gap-2 px-3">
       <div
@@ -1497,9 +1604,7 @@ function MoveLogStrip({
       >
         {moveLog.length === 0 ? (
           <span className="text-[11px] tracking-wide text-zinc-500">
-            {inferring
-              ? "Inferring first move…"
-              : "Tap your clock to record the first move"}
+            {emptyLabel}
           </span>
         ) : (
           moveLog.map((m, i) => {
@@ -1539,9 +1644,16 @@ function MoveLogStrip({
           })
         )}
       </div>
-      {inferring && moveLog.length > 0 && (
-        <span className="shrink-0 rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] uppercase tracking-widest text-emerald-200">
-          Inferring
+      {(inferring || vlmActive) && moveLog.length > 0 && (
+        <span
+          className={clsx(
+            "shrink-0 rounded-full px-2 py-0.5 text-[10px] uppercase tracking-widest",
+            vlmActive
+              ? "bg-sky-500/20 text-sky-200"
+              : "bg-emerald-500/15 text-emerald-200",
+          )}
+        >
+          {vlmActive ? "Vision · reading" : "Inferring"}
         </span>
       )}
     </div>
@@ -1565,18 +1677,55 @@ function PausedOverlay({ onResume }: { onResume: () => void }) {
 function CalibrationOverlay({
   corners,
   videoDims,
+  onDragCorner,
 }: {
   corners: Point[];
   videoDims: VideoDims;
+  onDragCorner?: (idx: number, x: number, y: number) => void;
 }) {
   const stroke = Math.max(2, videoDims.w / 400);
-  const dotR = Math.max(8, videoDims.w / 100);
+  const dotR = Math.max(12, videoDims.w / 80);
   const fontSize = Math.max(16, videoDims.w / 35);
-  const labelOffset = dotR * 2.2;
+  const labelOffset = dotR * 1.8;
+  const svgRef = useRef<SVGSVGElement | null>(null);
+  const dragRef = useRef<number | null>(null);
+
+  function clientToImage(clientX: number, clientY: number): Point | null {
+    const svg = svgRef.current;
+    if (!svg) return null;
+    const rect = svg.getBoundingClientRect();
+    const x = ((clientX - rect.left) / rect.width) * videoDims.w;
+    const y = ((clientY - rect.top) / rect.height) * videoDims.h;
+    return { x, y };
+  }
+  function onPointerDown(idx: number) {
+    return (e: React.PointerEvent<SVGCircleElement>) => {
+      e.preventDefault();
+      e.stopPropagation();
+      dragRef.current = idx;
+      (e.target as SVGCircleElement).setPointerCapture(e.pointerId);
+    };
+  }
+  function onPointerMove(e: React.PointerEvent<SVGElement>) {
+    if (dragRef.current === null) return;
+    const p = clientToImage(e.clientX, e.clientY);
+    if (!p) return;
+    onDragCorner?.(dragRef.current, p.x, p.y);
+  }
+  function onPointerUp(e: React.PointerEvent<SVGElement>) {
+    if (dragRef.current === null) return;
+    (e.target as SVGElement).releasePointerCapture?.(e.pointerId);
+    dragRef.current = null;
+  }
   return (
     <svg
+      ref={svgRef}
       viewBox={`0 0 ${videoDims.w} ${videoDims.h}`}
-      className="pointer-events-none absolute inset-0 h-full w-full"
+      onPointerMove={onPointerMove}
+      onPointerUp={onPointerUp}
+      onPointerCancel={onPointerUp}
+      className="absolute inset-0 h-full w-full"
+      style={{ touchAction: "none" }}
     >
       {corners.length >= 2 && corners.length < 4 && (
         <polyline
@@ -1599,10 +1748,22 @@ function CalibrationOverlay({
           <circle
             cx={p.x}
             cy={p.y}
+            r={dotR * 2.4}
+            fill="transparent"
+            stroke="rgba(16,185,129,0.0)"
+            strokeWidth={0}
+            onPointerDown={onPointerDown(i)}
+            style={{ cursor: "grab", touchAction: "none" }}
+          />
+          <circle
+            cx={p.x}
+            cy={p.y}
             r={dotR}
             fill="rgba(16,185,129,0.95)"
             stroke="white"
             strokeWidth={stroke * 0.6}
+            onPointerDown={onPointerDown(i)}
+            style={{ cursor: "grab" }}
           />
           <text
             x={p.x}
@@ -1614,6 +1775,7 @@ function CalibrationOverlay({
             fontSize={fontSize}
             fontWeight="bold"
             textAnchor="middle"
+            pointerEvents="none"
           >
             {CORNER_LABELS[i]}
           </text>
@@ -1816,7 +1978,7 @@ function VlmConfigEditor({
 }) {
   const [enabled, setEnabled] = useState<boolean>(Boolean(config));
   const [provider, setProvider] = useState<VlmProvider>(
-    config?.provider ?? "gemini",
+    config?.provider ?? "anthropic",
   );
   const [apiKey, setApiKey] = useState<string>(config?.apiKey ?? "");
   const [revealed, setRevealed] = useState(false);
@@ -1839,11 +2001,13 @@ function VlmConfigEditor({
       <label className="flex items-center justify-between gap-3">
         <div className="min-w-0">
           <div className="text-[13px] font-medium text-zinc-100">
-            Use a vision model on misses
+            Vision-model identifier
           </div>
           <p className="mt-0.5 text-[11px] leading-snug text-zinc-400">
-            Only called when the CV pipeline can&apos;t pin a unique legal
-            move.
+            Sends each move&apos;s before + after rectified board to the
+            model with the legal-move list. Dramatically more accurate than
+            CV alone on hard sets (cream pieces on a coloured board, tall
+            kings, mat curl).
           </p>
         </div>
         <input
@@ -1856,7 +2020,7 @@ function VlmConfigEditor({
       {enabled && (
         <div className="mt-3 flex flex-col gap-2">
           <div className="flex gap-1.5">
-            {(["gemini", "anthropic", "openai"] as const).map((p) => (
+            {(["anthropic", "gemini", "openai"] as const).map((p) => (
               <button
                 key={p}
                 type="button"
@@ -1890,10 +2054,15 @@ function VlmConfigEditor({
               {revealed ? "Hide" : "Show"}
             </button>
           </div>
-          <p className="text-[10px] leading-snug text-zinc-500">
-            Key is stored in your browser&apos;s localStorage and sent
-            directly to the provider — never our servers.
-          </p>
+          <div className="flex items-baseline justify-between">
+            <p className="text-[10px] leading-snug text-zinc-500">
+              Key stays in your browser&apos;s localStorage and is sent
+              directly to the provider.
+            </p>
+            <p className="text-[10px] font-mono text-emerald-200/70">
+              {VLM_PROVIDER_COST_HINT[provider]}
+            </p>
+          </div>
         </div>
       )}
     </div>

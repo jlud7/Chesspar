@@ -27,3 +27,9 @@ yarn-error.log*
 
 # typescript
 *.tsbuildinfo
+
+# detection test harness outputs
+/scripts/detection-test/out/
+
+# user-provided test photos (private game shots, large)
+/test_photos/
