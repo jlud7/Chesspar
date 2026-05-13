@@ -19,6 +19,7 @@ import {
   computeBaseline,
   type BaselineSignature,
 } from "@/lib/occupancy";
+import { makeVerifier, type VlmProvider, type VlmVerifyResult } from "@/lib/vlm";
 import { inferMove } from "@/lib/move-inference";
 import {
   autoDetectBoardCorners,
@@ -33,6 +34,14 @@ type TimeControl = { baseSeconds: number; incrementSeconds: number };
 
 type CaptureInference =
   | { kind: "matched"; san: string; from: string; to: string; fen: string }
+  | {
+      kind: "vlm-matched";
+      san: string;
+      from: string;
+      to: string;
+      fen: string;
+      provider: VlmProvider;
+    }
   | { kind: "ambiguous"; sans: string[] }
   | { kind: "unmatched"; diff: string[] }
   | { kind: "skipped"; reason: string };
@@ -62,6 +71,14 @@ const PRESETS: { label: string; tc: TimeControl }[] = [
 const DEFAULT_TC = PRESETS[2].tc;
 const TC_STORAGE = "chesspar:capture-tc-v1";
 const CORNERS_STORAGE = "chesspar:capture-corners-v1";
+const VLM_STORAGE = "chesspar:capture-vlm-v1";
+
+type VlmConfig = { provider: VlmProvider; apiKey: string };
+const VLM_PROVIDER_LABELS: Record<VlmProvider, string> = {
+  gemini: "Gemini 2.5 Pro",
+  openai: "OpenAI GPT-4o",
+  anthropic: "Claude Opus",
+};
 const RECTIFIED_SIZE = 384;
 const CORNER_LABELS = ["a8", "h8", "h1", "a1"] as const;
 const CORNER_HINTS = [
@@ -107,6 +124,9 @@ export function CaptureGame() {
   const chessRef = useRef<Chess>(new Chess());
   const baselineRef = useRef<BaselineSignature | null>(null);
   const [pgn, setPgn] = useState<string>("");
+
+  const [vlmConfig, setVlmConfig] = useState<VlmConfig | null>(null);
+  const vlmConfigRef = useRef<VlmConfig | null>(null);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -154,11 +174,41 @@ export function CaptureGame() {
           setCorners(parsed);
         }
       }
+      const rawVlm = window.localStorage.getItem(VLM_STORAGE);
+      if (rawVlm) {
+        const parsed = JSON.parse(rawVlm) as Partial<VlmConfig>;
+        if (
+          (parsed.provider === "gemini" ||
+            parsed.provider === "openai" ||
+            parsed.provider === "anthropic") &&
+          typeof parsed.apiKey === "string" &&
+          parsed.apiKey.length > 0
+        ) {
+          setVlmConfig({ provider: parsed.provider, apiKey: parsed.apiKey });
+        }
+      }
     } catch {
       /* ignore */
     }
     setHydrated(true);
   }, []);
+
+  useEffect(() => {
+    vlmConfigRef.current = vlmConfig;
+  }, [vlmConfig]);
+
+  useEffect(() => {
+    if (!hydrated || typeof window === "undefined") return;
+    try {
+      if (vlmConfig) {
+        window.localStorage.setItem(VLM_STORAGE, JSON.stringify(vlmConfig));
+      } else {
+        window.localStorage.removeItem(VLM_STORAGE);
+      }
+    } catch {
+      /* ignore */
+    }
+  }, [vlmConfig, hydrated]);
 
   useEffect(() => {
     if (!hydrated || typeof window === "undefined") return;
@@ -649,12 +699,24 @@ export function CaptureGame() {
         };
         setLastMove({ san: pick.san, side });
       } else {
-        inference = {
-          kind: "unmatched",
-          diff: result.diff.map(
-            (d) => `${d.square}:${d.before[0]}→${d.after[0]}`,
-          ),
-        };
+        // No legal move matches the diff. If a VLM verifier is configured,
+        // hand it the rectified board + previous FEN + legal-move list and
+        // see if it can pick the right one.
+        const fenBeforeVlm = chessRef.current.fen();
+        const vlmResolved = await tryVlmFallback({
+          warped,
+          previousFen: fenBeforeVlm,
+        });
+        if (vlmResolved) {
+          inference = vlmResolved;
+        } else {
+          inference = {
+            kind: "unmatched",
+            diff: result.diff.map(
+              (d) => `${d.square}:${d.before[0]}→${d.after[0]}`,
+            ),
+          };
+        }
       }
     } catch (e) {
       inference = {
@@ -667,6 +729,55 @@ export function CaptureGame() {
       ...prev,
       { side, moveNumber, url, timestamp: Date.now(), inference },
     ]);
+  }
+
+  /**
+   * Best-effort vision-LM fallback when the heuristic/calibrated classifier
+   * + legal-move diff failed to land on a unique move. Returns a fully-
+   * formed CaptureInference if the VLM produced a legal SAN, else null.
+   * Side-effects: applies the move to chessRef and updates lastMove.
+   */
+  async function tryVlmFallback(args: {
+    warped: HTMLCanvasElement;
+    previousFen: string;
+  }): Promise<CaptureInference | null> {
+    const config = vlmConfigRef.current;
+    if (!config?.apiKey) return null;
+    const game = new Chess(args.previousFen);
+    const legal = game.moves();
+    if (legal.length === 0) return null;
+    const verifier = makeVerifier(config.provider, config.apiKey);
+    let result: VlmVerifyResult;
+    try {
+      result = await verifier.verify({
+        previousFen: args.previousFen,
+        legalMovesSan: legal,
+        boardImage: args.warped,
+      });
+    } catch (e) {
+      console.warn("VLM verifier threw", e);
+      return null;
+    }
+    if (result.kind !== "matched") return null;
+    let applied;
+    try {
+      applied = chessRef.current.move(result.san);
+    } catch {
+      return null;
+    }
+    if (!applied) return null;
+    setLastMove({
+      san: applied.san,
+      side: applied.color === "w" ? "white" : "black",
+    });
+    return {
+      kind: "vlm-matched",
+      san: applied.san,
+      from: applied.from,
+      to: applied.to,
+      fen: chessRef.current.fen(),
+      provider: config.provider,
+    };
   }
 
   function endTurn(side: Side) {
@@ -832,6 +943,8 @@ export function CaptureGame() {
           }}
           testFrameCount={testFrames.length}
           onLoadTestFrames={(files) => void loadTestFrames(files)}
+          vlmConfig={vlmConfig}
+          onChangeVlmConfig={setVlmConfig}
         />
       )}
 
@@ -1106,6 +1219,8 @@ function SettingsScreen({
   onToggleTestMode,
   testFrameCount,
   onLoadTestFrames,
+  vlmConfig,
+  onChangeVlmConfig,
 }: {
   tc: TimeControl;
   onChangeTc: (tc: TimeControl) => void;
@@ -1117,6 +1232,8 @@ function SettingsScreen({
   onToggleTestMode: (on: boolean) => void;
   testFrameCount: number;
   onLoadTestFrames: (files: FileList | null) => void;
+  vlmConfig: VlmConfig | null;
+  onChangeVlmConfig: (next: VlmConfig | null) => void;
 }) {
   return (
     <div className="relative flex flex-1 flex-col overflow-y-auto px-6 py-10">
@@ -1207,6 +1324,8 @@ function SettingsScreen({
           )}
         </div>
 
+        <VlmConfigEditor config={vlmConfig} onChange={onChangeVlmConfig} />
+
         <button
           onClick={onStart}
           disabled={testMode && testFrameCount === 0}
@@ -1244,6 +1363,95 @@ function SettingsScreen({
           to test the rectifier + classifier on a still photo first.
         </div>
       </div>
+    </div>
+  );
+}
+
+function VlmConfigEditor({
+  config,
+  onChange,
+}: {
+  config: VlmConfig | null;
+  onChange: (next: VlmConfig | null) => void;
+}) {
+  const [enabled, setEnabled] = useState<boolean>(Boolean(config));
+  const [provider, setProvider] = useState<VlmProvider>(
+    config?.provider ?? "gemini",
+  );
+  const [apiKey, setApiKey] = useState<string>(config?.apiKey ?? "");
+  const [revealed, setRevealed] = useState(false);
+
+  useEffect(() => {
+    if (!enabled) {
+      onChange(null);
+      return;
+    }
+    if (apiKey.trim().length > 0) {
+      onChange({ provider, apiKey: apiKey.trim() });
+    } else {
+      onChange(null);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [enabled, provider, apiKey]);
+
+  return (
+    <div className="mt-4 rounded-lg border border-zinc-800 bg-zinc-900/60 p-3">
+      <label className="flex items-center justify-between gap-3">
+        <span className="text-xs uppercase tracking-wider text-zinc-300">
+          VLM fallback for unmatched moves
+        </span>
+        <input
+          type="checkbox"
+          checked={enabled}
+          onChange={(e) => setEnabled(e.target.checked)}
+          className="h-4 w-4 cursor-pointer accent-emerald-500"
+        />
+      </label>
+      {enabled && (
+        <div className="mt-3 flex flex-col gap-2">
+          <div className="flex gap-1.5">
+            {(["gemini", "anthropic", "openai"] as const).map((p) => (
+              <button
+                key={p}
+                type="button"
+                onClick={() => setProvider(p)}
+                className={clsx(
+                  "flex-1 rounded-md border px-2 py-1.5 text-xs transition",
+                  provider === p
+                    ? "border-emerald-500/50 bg-emerald-500/15 text-emerald-100"
+                    : "border-zinc-800 bg-zinc-900 text-zinc-300 hover:bg-zinc-800",
+                )}
+              >
+                {VLM_PROVIDER_LABELS[p]}
+              </button>
+            ))}
+          </div>
+          <div className="flex items-center gap-2">
+            <input
+              type={revealed ? "text" : "password"}
+              placeholder={`${VLM_PROVIDER_LABELS[provider]} API key`}
+              value={apiKey}
+              onChange={(e) => setApiKey(e.target.value)}
+              autoComplete="off"
+              spellCheck={false}
+              className="flex-1 rounded border border-zinc-700 bg-zinc-950 px-2 py-1 font-mono text-xs text-zinc-100"
+            />
+            <button
+              type="button"
+              onClick={() => setRevealed((r) => !r)}
+              className="rounded border border-zinc-700 bg-zinc-800 px-2 py-1 text-[10px] uppercase tracking-wider text-zinc-300 hover:bg-zinc-700"
+            >
+              {revealed ? "Hide" : "Show"}
+            </button>
+          </div>
+          <p className="text-[10px] leading-snug text-zinc-500">
+            Used only when the classifier-diff pipeline can&apos;t find a
+            unique legal move. The key is stored in this browser&apos;s
+            localStorage and sent directly to the provider — never to our
+            servers.
+          </p>
+        </div>
+      )}
     </div>
   );
 }
@@ -1452,19 +1660,23 @@ function CaptureCard({ capture }: { capture: Capture }) {
   const badgeText =
     inf.kind === "matched"
       ? inf.san
-      : inf.kind === "ambiguous"
-        ? "?"
-        : inf.kind === "unmatched"
-          ? "—"
-          : "·";
+      : inf.kind === "vlm-matched"
+        ? inf.san
+        : inf.kind === "ambiguous"
+          ? "?"
+          : inf.kind === "unmatched"
+            ? "—"
+            : "·";
   const badgeTone =
     inf.kind === "matched"
       ? "bg-emerald-500/25 text-emerald-100"
-      : inf.kind === "ambiguous"
-        ? "bg-amber-500/25 text-amber-100"
-        : inf.kind === "unmatched"
-          ? "bg-rose-500/25 text-rose-100"
-          : "bg-zinc-700/50 text-zinc-300";
+      : inf.kind === "vlm-matched"
+        ? "bg-sky-500/25 text-sky-100"
+        : inf.kind === "ambiguous"
+          ? "bg-amber-500/25 text-amber-100"
+          : inf.kind === "unmatched"
+            ? "bg-rose-500/25 text-rose-100"
+            : "bg-zinc-700/50 text-zinc-300";
   return (
     <div className="overflow-hidden rounded-md border border-zinc-800 bg-zinc-900">
       <div className="relative">
@@ -1479,8 +1691,16 @@ function CaptureCard({ capture }: { capture: Capture }) {
             "absolute left-1 top-1 rounded px-1.5 py-0.5 text-[10px] font-mono font-semibold",
             badgeTone,
           )}
+          title={
+            inf.kind === "vlm-matched"
+              ? `Resolved by ${VLM_PROVIDER_LABELS[inf.provider]}`
+              : undefined
+          }
         >
           {badgeText}
+          {inf.kind === "vlm-matched" && (
+            <span className="ml-1 opacity-75">VLM</span>
+          )}
         </div>
       </div>
       <div className="flex items-center justify-between px-2 py-1 text-[10px] uppercase tracking-wider text-zinc-400">
