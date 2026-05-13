@@ -7,6 +7,11 @@ import { extractSquareCrops, warpBoard } from "@/lib/board-image";
 import type { Point } from "@/lib/homography";
 import { classifyBoard, type ClassifyResult, type Occupancy } from "@/lib/occupancy";
 import { inferMove, type InferResult } from "@/lib/move-inference";
+import {
+  autoDetectBoardCorners,
+  rotateCorners,
+  scorePlayingOrientation,
+} from "@/lib/board-detection";
 
 const STARTING_FEN = new Chess().fen();
 
@@ -30,11 +35,15 @@ export function BoardRectifier() {
   const [squareUrls, setSquareUrls] = useState<string[]>([]);
   const [occupancy, setOccupancy] = useState<ClassifyResult[]>([]);
   const [prevFen, setPrevFen] = useState<string>(STARTING_FEN);
+  const [pgn, setPgn] = useState<string>("");
   const [inferResult, setInferResult] = useState<InferResult | null>(null);
   const [busy, setBusy] = useState(false);
+  const [autoDetected, setAutoDetected] = useState(false);
+  const [autoDetectFailed, setAutoDetectFailed] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const imageRef = useRef<HTMLImageElement | null>(null);
+  const chessRef = useRef<Chess>(new Chess());
 
   useEffect(() => {
     return () => {
@@ -60,13 +69,69 @@ export function BoardRectifier() {
     });
     setImageDims(null);
     setCorners([]);
+    setAutoDetected(false);
+    setAutoDetectFailed(false);
     clearResults();
   }
+
+  const autoDetect = useCallback(async () => {
+    const img = imageRef.current;
+    if (!img || !img.naturalWidth) return;
+    setBusy(true);
+    setError(null);
+    setInferResult(null);
+    try {
+      await new Promise<void>((r) => requestAnimationFrame(() => r()));
+      const detection = autoDetectBoardCorners(img);
+      if (!detection) {
+        setAutoDetectFailed(true);
+        setAutoDetected(false);
+        return;
+      }
+      // Try 4 cyclic rotations of the detected quad; pick the one whose
+      // rectified output best resembles a chess position (white on bottom).
+      let bestScore = -Infinity;
+      let bestCrops: HTMLCanvasElement[] = [];
+      let bestClasses: ClassifyResult[] = [];
+      let bestWarped: HTMLCanvasElement | null = null;
+      let bestCorners: [Point, Point, Point, Point] = detection.corners;
+      for (let k = 0; k < 4; k++) {
+        const rotated = rotateCorners(detection.corners, k);
+        const warped = warpBoard(img, rotated, RECTIFIED_SIZE);
+        const crops = extractSquareCrops(warped);
+        const classes = classifyBoard(crops);
+        const score = scorePlayingOrientation(classes.map((c) => c.state));
+        if (score > bestScore) {
+          bestScore = score;
+          bestCorners = rotated;
+          bestCrops = crops;
+          bestClasses = classes;
+          bestWarped = warped;
+        }
+      }
+      setCorners(bestCorners);
+      if (bestWarped) {
+        setWarpedUrl(bestWarped.toDataURL("image/png"));
+        setSquareUrls(bestCrops.map((c) => c.toDataURL("image/png")));
+        setOccupancy(bestClasses);
+      }
+      setAutoDetected(true);
+      setAutoDetectFailed(false);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setAutoDetectFailed(true);
+    } finally {
+      setBusy(false);
+    }
+  }, []);
 
   function onImageLoad() {
     const img = imageRef.current;
     if (!img) return;
     setImageDims({ w: img.naturalWidth, h: img.naturalHeight });
+    if (corners.length === 0) {
+      void autoDetect();
+    }
   }
 
   function onImageClick(e: React.MouseEvent<HTMLImageElement>) {
@@ -130,9 +195,38 @@ export function BoardRectifier() {
 
   function applyInferenceResult() {
     if (inferResult?.kind === "matched") {
-      setPrevFen(inferResult.updatedFen);
+      try {
+        chessRef.current.move({
+          from: inferResult.move.from,
+          to: inferResult.move.to,
+          promotion: inferResult.move.promotion ?? "q",
+        });
+        setPrevFen(chessRef.current.fen());
+        setPgn(chessRef.current.pgn());
+      } catch {
+        setPrevFen(inferResult.updatedFen);
+      }
       setInferResult(null);
     }
+  }
+
+  function setPrevFenManual(fen: string) {
+    try {
+      chessRef.current = new Chess(fen);
+      setPrevFen(chessRef.current.fen());
+      setPgn(chessRef.current.pgn());
+      setInferResult(null);
+    } catch {
+      setPrevFen(fen);
+      setInferResult(null);
+    }
+  }
+
+  function resetSession() {
+    chessRef.current = new Chess();
+    setPrevFen(chessRef.current.fen());
+    setPgn("");
+    setInferResult(null);
   }
 
   return (
@@ -144,9 +238,15 @@ export function BoardRectifier() {
           <div
             className={clsx(
               "mb-3 flex items-start gap-3 rounded-md border px-3 py-2 text-sm",
-              corners.length < 4
-                ? "border-emerald-500/30 bg-emerald-500/5 text-emerald-200"
-                : "border-zinc-700 bg-zinc-950/60 text-zinc-200",
+              busy
+                ? "border-zinc-700 bg-zinc-950/60 text-zinc-300"
+                : autoDetected
+                  ? "border-emerald-500/30 bg-emerald-500/5 text-emerald-200"
+                  : autoDetectFailed && corners.length < 4
+                    ? "border-amber-500/30 bg-amber-500/5 text-amber-200"
+                    : corners.length === 4
+                      ? "border-emerald-500/30 bg-emerald-500/5 text-emerald-200"
+                      : "border-emerald-500/30 bg-emerald-500/5 text-emerald-200",
             )}
           >
             <CornerHintInset step={corners.length} />
@@ -154,10 +254,21 @@ export function BoardRectifier() {
               <span className="mr-2 inline-block rounded-full bg-emerald-500/15 px-2 py-0.5 text-xs uppercase tracking-wider text-emerald-200">
                 Step 2
               </span>
-              {corners.length < 4
-                ? CORNER_HINTS[corners.length]
-                : "All four corners set. Click Compute to rectify."}
-              {corners.length < 4 && (
+              {busy ? (
+                "Detecting board…"
+              ) : autoDetected ? (
+                <>Auto-detected board corners. Adjust below if needed.</>
+              ) : autoDetectFailed && corners.length < 4 ? (
+                <>
+                  Auto-detect couldn&apos;t find a clear board. Tap the four
+                  corners manually below, or click Re-detect to retry.
+                </>
+              ) : corners.length < 4 ? (
+                CORNER_HINTS[corners.length]
+              ) : (
+                "All four corners set. Click Compute to rectify."
+              )}
+              {!busy && corners.length < 4 && !autoDetectFailed && (
                 <div className="mt-1 text-xs text-zinc-400">
                   Photo orientation doesn&apos;t matter — corner names define
                   the rectified output.
@@ -184,6 +295,17 @@ export function BoardRectifier() {
 
           <div className="mt-3 flex flex-wrap gap-2">
             <button
+              onClick={() => void autoDetect()}
+              disabled={busy}
+              className="rounded-md border border-emerald-500/40 bg-emerald-500/15 px-3 py-1.5 text-sm font-medium text-emerald-200 hover:bg-emerald-500/25 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              {busy
+                ? "Detecting…"
+                : autoDetected || corners.length === 4
+                  ? "Re-detect"
+                  : "Auto-detect corners"}
+            </button>
+            <button
               onClick={undoCorner}
               disabled={corners.length === 0}
               className="rounded-md border border-zinc-700 bg-zinc-800 px-3 py-1.5 text-sm text-zinc-200 hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-40"
@@ -200,9 +322,9 @@ export function BoardRectifier() {
             <button
               onClick={compute}
               disabled={corners.length !== 4 || busy}
-              className="rounded-md border border-emerald-500/40 bg-emerald-500/15 px-3 py-1.5 text-sm font-medium text-emerald-200 hover:bg-emerald-500/25 disabled:cursor-not-allowed disabled:opacity-40"
+              className="rounded-md border border-zinc-700 bg-zinc-800 px-3 py-1.5 text-sm text-zinc-200 hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-40"
             >
-              {busy ? "Warping…" : "Compute rectified board"}
+              {busy ? "Warping…" : "Recompute"}
             </button>
           </div>
 
@@ -278,13 +400,12 @@ export function BoardRectifier() {
       {occupancy.length === 64 && (
         <InferencePanel
           prevFen={prevFen}
-          onChangePrevFen={(f) => {
-            setPrevFen(f);
-            setInferResult(null);
-          }}
+          onChangePrevFen={setPrevFenManual}
           inferResult={inferResult}
           onInfer={runInference}
           onAccept={applyInferenceResult}
+          onReset={resetSession}
+          pgn={pgn}
         />
       )}
     </div>
@@ -327,12 +448,16 @@ function InferencePanel({
   inferResult,
   onInfer,
   onAccept,
+  onReset,
+  pgn,
 }: {
   prevFen: string;
   onChangePrevFen: (fen: string) => void;
   inferResult: InferResult | null;
   onInfer: () => void;
   onAccept: () => void;
+  onReset: () => void;
+  pgn: string;
 }) {
   return (
     <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 p-4">
@@ -341,15 +466,16 @@ function InferencePanel({
           Move inference
         </div>
         <button
-          onClick={() => onChangePrevFen(STARTING_FEN)}
+          onClick={onReset}
           className="text-[10px] uppercase tracking-wider text-zinc-500 hover:text-zinc-300"
         >
-          Reset to start position
+          Reset session
         </button>
       </div>
       <p className="mb-3 text-xs text-zinc-400">
         Diff the predicted occupancy against the previous FEN, then pick the
-        unique legal move that matches.
+        unique legal move that matches. Accept to chain into the next
+        uploaded photo.
       </p>
       <label className="mb-3 block">
         <span className="mb-1 block text-[10px] uppercase tracking-wider text-zinc-500">
@@ -369,6 +495,17 @@ function InferencePanel({
       >
         Infer move
       </button>
+
+      {pgn && (
+        <div className="mt-4 rounded-md border border-zinc-800 bg-zinc-950 p-3">
+          <div className="mb-1 text-[10px] uppercase tracking-wider text-zinc-500">
+            PGN so far
+          </div>
+          <pre className="max-h-32 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] text-zinc-300">
+            {pgn}
+          </pre>
+        </div>
+      )}
 
       {inferResult && (
         <div className="mt-4 rounded-md border border-zinc-800 bg-zinc-950/60 p-3 text-sm">
