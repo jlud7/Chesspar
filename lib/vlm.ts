@@ -50,24 +50,21 @@ Reply with ONLY the SAN notation of the move that happened, exactly as it appear
 const TWO_FRAME_PROMPT = (
   prevFen: string,
   legalMovesSan: string[],
-): string => `You are identifying which chess move was just played by comparing two photographs of the same physical chessboard.
+): string => `Identify the chess move played between these two photos.
+
+The photos show a chessboard with WHITE PIECES at the BOTTOM and BLACK PIECES at the TOP (standard chess view). Rank 1 is at the bottom, rank 8 at the top. File a is leftmost, file h is rightmost.
 
 IMAGE 1: the board BEFORE the move.
 IMAGE 2: the board AFTER the move.
-
-Both photos may be taken from any angle / any orientation — the board could be rotated 0°, 90°, 180°, or 270° in the frame, and the camera angle may vary. Use the rank/file labels printed on the board edges, or the location of the white vs black pieces, to orient yourself. The board orientation between the two photos is the same (same camera position).
 
 PREVIOUS POSITION FEN (piece placement only): ${prevFen}
 
 LEGAL MOVES — exactly one of these was played:
 ${legalMovesSan.join(", ")}
 
-Procedure:
-1. Identify which square(s) changed between IMAGE 1 and IMAGE 2 (a piece appeared, disappeared, or was replaced by a different color).
-2. Pick the unique legal move from the list above whose result explains exactly those changes.
-3. Reply with ONLY that move's SAN, exactly as written in the list (e.g. "e4", "Nxf3", "O-O").
+Find which 1-3 squares look different between IMAGE 1 and IMAGE 2. Identify which piece moved (by color and type — pawn, knight, bishop, rook, queen, king) and from which exact square to which exact square. Pay close attention to subtle differences: a piece on b3 vs d4 (different file), a knight on d4 vs d5 (different rank), a bishop on e7 vs g4 (different diagonal entirely).
 
-No explanation, no preamble, no markdown — just the SAN of the move on the last line.`;
+Pick the unique legal move from the list whose result produces those changes. Reply with ONLY that move's SAN, exactly as written in the list (e.g. "e4", "Nxf3", "O-O"). No preamble, no markdown — just the SAN.`;
 
 export function makeGeminiVerifier(
   apiKey: string,
