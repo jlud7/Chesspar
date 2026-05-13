@@ -199,6 +199,54 @@ export function rotateCorners(
   ];
 }
 
+/**
+ * Per-frame corner refinement: re-run the auto-detector on `frame`, align
+ * the resulting clockwise quad to the previously-saved corner ordering by
+ * picking whichever cyclic rotation has the smallest total point-distance,
+ * then accept the refined corners only if they're close enough to the
+ * saved ones (i.e. the camera was nudged, not entirely re-pointed).
+ *
+ * Returns the saved corners unchanged when auto-detect fails, when the
+ * detected quad doesn't match closely, or when there's no reasonable
+ * alignment. This makes the refinement strictly non-destructive — at
+ * worst we keep what we had.
+ */
+export function refineCornersForFrame(
+  frame: HTMLImageElement | HTMLCanvasElement,
+  saved: [Point, Point, Point, Point],
+  options: { maxAvgDriftFraction?: number } = {},
+): { corners: [Point, Point, Point, Point]; drifted: boolean } {
+  const maxAvgDriftFraction = options.maxAvgDriftFraction ?? 0.1;
+  const detection = autoDetectBoardCorners(frame);
+  if (!detection) return { corners: saved, drifted: false };
+  const w =
+    frame instanceof HTMLImageElement ? frame.naturalWidth : frame.width;
+  const h =
+    frame instanceof HTMLImageElement ? frame.naturalHeight : frame.height;
+  if (!w || !h) return { corners: saved, drifted: false };
+  const diag = Math.hypot(w, h);
+
+  let bestAligned: [Point, Point, Point, Point] = detection.corners;
+  let bestAvg = Infinity;
+  for (let k = 0; k < 4; k++) {
+    const rotated = rotateCorners(detection.corners, k);
+    let total = 0;
+    for (let j = 0; j < 4; j++) {
+      total += Math.hypot(rotated[j].x - saved[j].x, rotated[j].y - saved[j].y);
+    }
+    const avg = total / 4;
+    if (avg < bestAvg) {
+      bestAvg = avg;
+      bestAligned = rotated;
+    }
+  }
+  const driftFraction = bestAvg / diag;
+  if (driftFraction > maxAvgDriftFraction) {
+    return { corners: saved, drifted: false };
+  }
+  return { corners: bestAligned, drifted: driftFraction > 0.005 };
+}
+
 function computeLocalVariance(
   lum: Float32Array,
   w: number,
