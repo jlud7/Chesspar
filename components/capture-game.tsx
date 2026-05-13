@@ -133,6 +133,12 @@ export function CaptureGame() {
   const [calibrationPreviewUrl, setCalibrationPreviewUrl] = useState<string | null>(null);
   const [moveLog, setMoveLog] = useState<{ san: string; viaVlm: boolean }[]>([]);
   const [selectedCaptureIdx, setSelectedCaptureIdx] = useState<number | null>(null);
+  const [pendingPick, setPendingPick] = useState<{
+    captureIdx: number;
+    side: Side;
+    rectifiedUrl: string | null;
+    legalMoves: ChessMove[];
+  } | null>(null);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -695,6 +701,9 @@ export function CaptureGame() {
     if (!url) return;
 
     let inference: CaptureInference;
+    let unmatchedPick:
+      | { side: Side; rectifiedUrl: string; legalMoves: ChessMove[] }
+      | null = null;
     try {
       // Per-frame corner refinement: re-detect the board on this frame and
       // snap our saved corners to it when the camera has drifted slightly.
@@ -767,6 +776,17 @@ export function CaptureGame() {
               (d) => `${d.square}:${d.before[0]}→${d.after[0]}`,
             ),
           };
+          // Surface a one-tap correction sheet on the clock screen with the
+          // exact legal moves at this position.
+          const rectifiedDataUrl = warped.toDataURL("image/jpeg", 0.88);
+          const legalMoves = chessRef.current.moves({
+            verbose: true,
+          }) as ChessMove[];
+          unmatchedPick = {
+            side,
+            rectifiedUrl: rectifiedDataUrl,
+            legalMoves,
+          };
         }
       }
     } catch (e) {
@@ -776,10 +796,21 @@ export function CaptureGame() {
       };
     }
 
-    setCaptures((prev) => [
-      ...prev,
-      { side, moveNumber, url, timestamp: Date.now(), inference },
-    ]);
+    setCaptures((prev) => {
+      const next = [
+        ...prev,
+        { side, moveNumber, url, timestamp: Date.now(), inference },
+      ];
+      if (unmatchedPick) {
+        setPendingPick({
+          captureIdx: next.length - 1,
+          side: unmatchedPick.side,
+          rectifiedUrl: unmatchedPick.rectifiedUrl,
+          legalMoves: unmatchedPick.legalMoves,
+        });
+      }
+      return next;
+    });
   }
 
   /**
@@ -1171,6 +1202,7 @@ export function CaptureGame() {
         <EndScreen
           winner={winner}
           captureCount={captures.length}
+          recordedMoves={moveLog.length}
           moves={moves}
           pgn={pgn}
           onNewGame={backToSettings}
@@ -1199,6 +1231,121 @@ export function CaptureGame() {
           onDelete={deleteCapture}
         />
       )}
+
+      {pendingPick && captures[pendingPick.captureIdx] && (
+        <PendingPickSheet
+          side={pendingPick.side}
+          moveNumber={captures[pendingPick.captureIdx].moveNumber}
+          rectifiedUrl={pendingPick.rectifiedUrl}
+          legalMoves={pendingPick.legalMoves}
+          onPick={(move) => {
+            overrideCaptureMove(pendingPick.captureIdx, move);
+            setPendingPick(null);
+          }}
+          onSkip={() => setPendingPick(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+function PendingPickSheet({
+  side,
+  moveNumber,
+  rectifiedUrl,
+  legalMoves,
+  onPick,
+  onSkip,
+}: {
+  side: Side;
+  moveNumber: number;
+  rectifiedUrl: string | null;
+  legalMoves: ChessMove[];
+  onPick: (move: ChessMove) => void;
+  onSkip: () => void;
+}) {
+  const [confirmSkip, setConfirmSkip] = useState(false);
+  return (
+    <div className="fixed inset-0 z-50 flex flex-col bg-black/65 backdrop-blur-xl">
+      <div className="relative mt-auto flex max-h-[90vh] flex-col overflow-hidden rounded-t-[28px] border-t border-white/10 bg-zinc-950/95 backdrop-blur-xl shadow-2xl sm:my-auto sm:mx-auto sm:w-full sm:max-w-md sm:rounded-[28px]">
+        <div className="mx-auto mt-2 h-1 w-10 rounded-full bg-white/15" />
+        <div className="px-5 pb-3 pt-3">
+          <div className="text-[11px] font-semibold uppercase tracking-[0.3em] text-amber-300">
+            We missed move {moveNumber}
+          </div>
+          <div className="mt-1 text-[20px] font-semibold leading-tight text-zinc-50">
+            Pick what {side === "white" ? "White" : "Black"} just played
+          </div>
+          <p className="mt-1 text-[12px] leading-snug text-zinc-400">
+            Our pipeline couldn&apos;t pin a unique move. Tap the right one
+            below and we&apos;ll resync the PGN.
+          </p>
+        </div>
+
+        <div className="flex-1 overflow-y-auto px-5 pb-5">
+          {rectifiedUrl && (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img
+              src={rectifiedUrl}
+              alt="Rectified board"
+              className="mb-4 aspect-square w-40 rounded-2xl border border-white/5 object-cover"
+            />
+          )}
+
+          <div className="mb-1 text-[10px] uppercase tracking-widest text-zinc-500">
+            Legal moves · {legalMoves.length}
+          </div>
+          <div className="flex flex-wrap gap-1.5">
+            {legalMoves.length === 0 ? (
+              <span className="text-xs text-zinc-500">
+                No legal moves at this position.
+              </span>
+            ) : (
+              legalMoves.map((m) => (
+                <button
+                  key={m.san}
+                  onClick={() => onPick(m)}
+                  className="rounded-full border border-white/10 bg-white/5 px-3 py-1.5 text-[13px] font-mono text-zinc-100 transition active:scale-95 hover:bg-emerald-500/20 hover:border-emerald-400/40"
+                >
+                  {m.san}
+                </button>
+              ))
+            )}
+          </div>
+
+          <div className="mt-5 border-t border-white/5 pt-4">
+            {confirmSkip ? (
+              <div className="flex flex-col gap-2">
+                <p className="text-[11px] text-amber-100">
+                  Skipping leaves this move unrecorded. Subsequent moves may
+                  also fail to infer. Continue?
+                </p>
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => setConfirmSkip(false)}
+                    className="flex-1 rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm text-zinc-200"
+                  >
+                    Back
+                  </button>
+                  <button
+                    onClick={onSkip}
+                    className="flex-1 rounded-xl bg-amber-500/80 px-3 py-2 text-sm font-semibold text-amber-950 hover:bg-amber-400"
+                  >
+                    Skip anyway
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <button
+                onClick={() => setConfirmSkip(true)}
+                className="block w-full rounded-xl border border-white/5 bg-white/5 px-4 py-2.5 text-sm text-zinc-300 transition hover:bg-white/10"
+              >
+                Skip — leave this move unrecorded
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
@@ -1810,6 +1957,7 @@ function CustomTcEditor({
 function EndScreen({
   winner,
   captureCount,
+  recordedMoves,
   moves,
   pgn,
   onNewGame,
@@ -1818,6 +1966,7 @@ function EndScreen({
 }: {
   winner: Side | null;
   captureCount: number;
+  recordedMoves: number;
   moves: { white: number; black: number };
   pgn: string;
   onNewGame: () => void;
@@ -1828,6 +1977,8 @@ function EndScreen({
   const title = winner
     ? `${winner === "white" ? "White" : "Black"} wins on time`
     : "Game ended";
+  const hasRecordedMoves = recordedMoves > 0;
+  const unrecorded = Math.max(0, captureCount - recordedMoves);
 
   async function copyPgn() {
     try {
@@ -1866,11 +2017,42 @@ function EndScreen({
             </div>
           </div>
         </div>
-        <div className="mb-6 rounded-2xl border border-white/5 bg-white/5 px-4 py-3 text-sm text-zinc-300">
-          {captureCount} position{captureCount === 1 ? "" : "s"} captured.
-        </div>
 
-        {pgn && (
+        {!hasRecordedMoves && captureCount > 0 ? (
+          <div className="mb-6 rounded-2xl border border-amber-400/30 bg-amber-500/10 px-4 py-4">
+            <div className="text-[10px] font-semibold uppercase tracking-[0.3em] text-amber-300">
+              No moves were recorded
+            </div>
+            <p className="mt-1 text-[13px] leading-snug text-amber-100">
+              The pipeline didn&apos;t pin a unique move for any of your{" "}
+              {captureCount} capture{captureCount === 1 ? "" : "s"}. Tap
+              <strong> View captures</strong> and assign each one the move
+              that actually happened — your PGN rebuilds as you go.
+            </p>
+            <button
+              onClick={onViewCaptures}
+              className="mt-3 rounded-full bg-amber-500/80 px-4 py-1.5 text-[12px] font-semibold text-amber-950 hover:bg-amber-400"
+            >
+              Review captures →
+            </button>
+          </div>
+        ) : (
+          <div className="mb-6 rounded-2xl border border-white/5 bg-white/5 px-4 py-3 text-sm text-zinc-300">
+            {recordedMoves} move{recordedMoves === 1 ? "" : "s"} recorded
+            {unrecorded > 0 && (
+              <span className="text-amber-200">
+                {" "}
+                · {unrecorded} awaiting review
+              </span>
+            )}
+            <span className="text-zinc-500">
+              {" "}
+              from {captureCount} capture{captureCount === 1 ? "" : "s"}.
+            </span>
+          </div>
+        )}
+
+        {hasRecordedMoves && pgn && (
           <div className="mb-6 rounded-2xl border border-white/5 bg-zinc-950/60 p-3">
             <div className="mb-2 flex items-center justify-between">
               <div className="text-[10px] uppercase tracking-widest text-zinc-500">
