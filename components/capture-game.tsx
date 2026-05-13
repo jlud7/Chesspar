@@ -23,6 +23,8 @@ import {
 import {
   makeAnthropicProxyVerifier,
   makeVerifier,
+  readFenViaAnthropic,
+  readFenViaProxy,
   type VlmProvider,
   type VlmVerifyResult,
 } from "@/lib/vlm";
@@ -34,7 +36,7 @@ import {
  * build or hitting Gemini/OpenAI directly.
  */
 const VLM_PROXY_URL = process.env.NEXT_PUBLIC_VLM_PROXY_URL || "";
-import { inferMoveFuzzy } from "@/lib/move-inference";
+import { inferMoveFuzzy, moveFromObservedBoard } from "@/lib/move-inference";
 import {
   autoDetectBoardCorners,
   refineCornersForFrame,
@@ -457,6 +459,31 @@ export function CaptureGame() {
   }
 
   /**
+   * Downscale an image to a canvas with max edge `maxDim`, preserving
+   * aspect ratio. iPhone photos are 24MP / 5712x4284 — way more pixels
+   * than the VLM needs and a large base64 payload over the network. A
+   * 1024px-edge JPEG is ~150KB and still resolves piece details.
+   */
+  function imageToResizedCanvas(
+    img: HTMLImageElement,
+    maxDim = 1024,
+  ): HTMLCanvasElement | null {
+    if (!img.naturalWidth) return null;
+    const scale = Math.min(
+      1,
+      maxDim / Math.max(img.naturalWidth, img.naturalHeight),
+    );
+    const c = document.createElement("canvas");
+    c.width = Math.max(1, Math.round(img.naturalWidth * scale));
+    c.height = Math.max(1, Math.round(img.naturalHeight * scale));
+    const ctx = c.getContext("2d");
+    if (!ctx) return null;
+    ctx.imageSmoothingQuality = "high";
+    ctx.drawImage(img, 0, 0, c.width, c.height);
+    return c;
+  }
+
+  /**
    * Grab the next frame to feed into the pipeline.
    * In test mode this consumes the current test image and advances the
    * pointer; in camera mode it grabs from the live video.
@@ -508,15 +535,20 @@ export function CaptureGame() {
     setBlackMs(tc.baseSeconds * 1000);
     setWinner(null);
     setPgn("");
-    setTestFrameIdx(0);
     if (testMode) {
-      // In test mode the first uploaded image is the "starting position".
-      // Run auto-detection on it before the clock starts.
+      // Photo→FEN pipeline. Photo 0 is the starting position (we trust
+      // it's the standard chess opening and don't analyze it); photos
+      // 1..N each represent one half-move and are sent to Claude on
+      // each clock tap. No corner calibration / rectification needed.
+      testFrameIdxRef.current = 1;
+      setTestFrameIdx(1);
       setCorners([]);
-      setPhase("calibrating");
+      setPhase("playing");
     } else if (corners.length === 4) {
+      setTestFrameIdx(0);
       setPhase("playing");
     } else {
+      setTestFrameIdx(0);
       setPhase("calibrating");
     }
   }
@@ -984,6 +1016,146 @@ export function CaptureGame() {
     return { move: applied as ChessMove, fen: chessRef.current.fen() };
   }
 
+  /**
+   * Photo-to-FEN inference pipeline for test mode.
+   *
+   * Each clock tap consumes the next uploaded photo, hands the *full* image
+   * to Claude (no rectification / no per-square classifier), asks for the
+   * FEN piece-placement field, then locally picks the legal move whose
+   * resulting position matches that FEN. Way more robust than CV+rectify
+   * because Claude sees the original perspective and resolution.
+   */
+  async function runFenInferencePipeline(side: Side, moveNumber: number) {
+    const frames = testFramesRef.current;
+    const idx = testFrameIdxRef.current;
+    const img = frames[idx];
+    if (!img) {
+      setCaptures((prev) => [
+        ...prev,
+        {
+          side,
+          moveNumber,
+          url: "",
+          timestamp: Date.now(),
+          inference: {
+            kind: "skipped",
+            reason: `no photo at index ${idx} (uploaded ${frames.length} total)`,
+          },
+        },
+      ]);
+      return;
+    }
+    setTestFrameIdx((i) => i + 1);
+
+    const resized = imageToResizedCanvas(img, 1024);
+    if (!resized) {
+      setCaptures((prev) => [
+        ...prev,
+        {
+          side,
+          moveNumber,
+          url: "",
+          timestamp: Date.now(),
+          inference: { kind: "skipped", reason: "image decode failed" },
+        },
+      ]);
+      return;
+    }
+    const url = await canvasToBlobUrl(resized);
+    if (!url) return;
+
+    setVlmActive(true);
+    let inference: CaptureInference;
+    let unmatchedPick:
+      | { side: Side; rectifiedUrl: string; legalMoves: ChessMove[] }
+      | null = null;
+    try {
+      const userConfig = vlmConfigRef.current;
+      const result =
+        userConfig?.apiKey && userConfig.provider === "anthropic"
+          ? await readFenViaAnthropic(userConfig.apiKey, resized)
+          : VLM_PROXY_URL
+            ? await readFenViaProxy(VLM_PROXY_URL, resized)
+            : null;
+
+      if (!result) {
+        inference = {
+          kind: "unmatched",
+          diff: ["Claude is not configured — paste a key or enable the proxy."],
+        };
+      } else if (result.kind === "error") {
+        inference = { kind: "unmatched", diff: [`Claude: ${result.reason}`] };
+      } else if (result.kind === "unreadable") {
+        inference = {
+          kind: "unmatched",
+          diff: ["Claude couldn't read this photo with confidence"],
+        };
+      } else {
+        const matchResult = moveFromObservedBoard(chessRef.current, result.fen);
+        if (matchResult.kind === "matched") {
+          chessRef.current.move({
+            from: matchResult.move.from,
+            to: matchResult.move.to,
+            promotion: matchResult.move.promotion ?? "q",
+          });
+          inference = {
+            kind: "vlm-matched",
+            san: matchResult.move.san,
+            from: matchResult.move.from,
+            to: matchResult.move.to,
+            fen: matchResult.updatedFen,
+            provider: "anthropic" as VlmProvider,
+          };
+          setLastMove({ san: matchResult.move.san, side });
+          setMoveLog((log) => [
+            ...log,
+            { san: matchResult.move.san, viaVlm: true },
+          ]);
+        } else {
+          // Claude returned a FEN, but no legal move from the engine's
+          // current state produces that position — Claude likely misread.
+          // Show the manual pick sheet with the full legal-move list.
+          inference = {
+            kind: "unmatched",
+            diff: [
+              `Observed FEN: ${result.fen}`,
+              matchResult.kind === "ambiguous"
+                ? `Ambiguous: ${matchResult.candidates.map((c) => c.san).join(", ")}`
+                : "No legal move from current state matches this position.",
+            ],
+          };
+          const legalMoves = chessRef.current.moves({
+            verbose: true,
+          }) as ChessMove[];
+          unmatchedPick = { side, rectifiedUrl: url, legalMoves };
+        }
+      }
+    } catch (e) {
+      inference = {
+        kind: "unmatched",
+        diff: [e instanceof Error ? e.message : String(e)],
+      };
+    } finally {
+      setVlmActive(false);
+    }
+
+    setCaptures((prev) => {
+      const next = [
+        ...prev,
+        { side, moveNumber, url, timestamp: Date.now(), inference },
+      ];
+      if (unmatchedPick) {
+        setPendingPick({
+          captureIdx: next.length - 1,
+          side: unmatchedPick.side,
+          rectifiedUrl: unmatchedPick.rectifiedUrl,
+          legalMoves: unmatchedPick.legalMoves,
+        });
+      }
+      return next;
+    });
+  }
+
   function endTurn(side: Side) {
     if (phase !== "playing" || active !== side) return;
     const isWhite = side === "white";
@@ -1001,9 +1173,10 @@ export function CaptureGame() {
 
     const totalMoves = nextMoves.white + nextMoves.black;
     setInferring(true);
-    void runInferencePipeline(side, totalMoves).finally(() =>
-      setInferring(false),
-    );
+    const pipeline = testModeRef.current
+      ? runFenInferencePipeline(side, totalMoves)
+      : runInferencePipeline(side, totalMoves);
+    void pipeline.finally(() => setInferring(false));
   }
 
   function endGame() {

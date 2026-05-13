@@ -1,6 +1,56 @@
 import { Chess, type Move } from "chess.js";
 import type { Occupancy } from "./occupancy";
 
+/**
+ * Given a chess.js game and an observed FEN piece-placement field, find
+ * the legal move (or moves) whose result matches the observation. Used by
+ * the photo→FEN pipeline: ask Claude what position is in the photo, then
+ * pick the legal move that explains the change.
+ *
+ * Comparison is on piece-placement only (the bit before the first space),
+ * so castling rights / en-passant / fullmove counter don't have to match —
+ * Claude doesn't see those and shouldn't have to guess them.
+ *
+ * Returns null when no legal move produces the observed board (typically
+ * means Claude misread the position).
+ */
+export function moveFromObservedBoard(
+  chess: Chess,
+  observedBoardFen: string,
+):
+  | { kind: "matched"; move: Move; updatedFen: string }
+  | { kind: "ambiguous"; candidates: Move[] }
+  | { kind: "none" } {
+  const target = observedBoardFen.split(/\s+/)[0];
+  const legal = chess.moves({ verbose: true }) as Move[];
+  const matches: { move: Move; updatedFen: string }[] = [];
+  for (const move of legal) {
+    const probe = new Chess(chess.fen());
+    try {
+      probe.move({
+        from: move.from,
+        to: move.to,
+        promotion: move.promotion ?? "q",
+      });
+    } catch {
+      continue;
+    }
+    const probeBoard = probe.fen().split(/\s+/)[0];
+    if (probeBoard === target) {
+      matches.push({ move, updatedFen: probe.fen() });
+    }
+  }
+  if (matches.length === 0) return { kind: "none" };
+  if (matches.length === 1) {
+    return {
+      kind: "matched",
+      move: matches[0].move,
+      updatedFen: matches[0].updatedFen,
+    };
+  }
+  return { kind: "ambiguous", candidates: matches.map((m) => m.move) };
+}
+
 export type SquareDiff = {
   square: string;
   before: Occupancy;

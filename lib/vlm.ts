@@ -33,6 +33,149 @@ export interface VlmVerifier {
   verify(input: VlmVerifyInput): Promise<VlmVerifyResult>;
 }
 
+/**
+ * Result of reading a chess position directly from a photo into a FEN
+ * piece-placement string. Used by the test-mode pipeline that bypasses
+ * CV entirely and just asks the VLM "what position is this?".
+ */
+export type FenReadResult =
+  | { kind: "fen"; fen: string; raw: string }
+  | { kind: "unreadable"; raw: string }
+  | { kind: "error"; reason: string };
+
+const FEN_READ_PROMPT = `You are reading a chess position from a photograph of a real chessboard.
+
+Reply with ONLY the FEN piece-placement field — just the board layout, nothing else. Example for the standard starting position:
+rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR
+
+Conventions:
+- Read with white at the bottom of the photo, black at the top.
+- Write rank 8 first (top of the image), rank 1 last (bottom).
+- Within each rank: a-file leftmost, h-file rightmost (from white's view).
+- Pieces: K Q R B N P (white, uppercase) and k q r b n p (black, lowercase).
+- Empty squares: digits 1-8 for consecutive empty squares within a rank.
+- Ranks separated by /.
+
+No explanation, no quotes, no markdown, no surrounding text — just the eight ranks separated by slashes.
+
+If you cannot identify the position with high confidence (occluded pieces, blurry, ambiguous angle), reply with the single word UNREADABLE.`;
+
+function isValidFenPlacement(s: string): boolean {
+  const ranks = s.split("/");
+  if (ranks.length !== 8) return false;
+  for (const rank of ranks) {
+    let count = 0;
+    for (const ch of rank) {
+      if (ch >= "1" && ch <= "8") count += Number(ch);
+      else if ("KQRBNPkqrbnp".includes(ch)) count += 1;
+      else return false;
+    }
+    if (count !== 8) return false;
+  }
+  return true;
+}
+
+function parseFenResponse(raw: string): FenReadResult {
+  const trimmed = raw.trim();
+  if (!trimmed) return { kind: "error", reason: "empty response" };
+  if (/\bUNREADABLE\b/i.test(trimmed)) return { kind: "unreadable", raw };
+  const cleaned = trimmed
+    .replace(/```[a-z]*\n?|\n?```/gi, "")
+    .replace(/^["'`]+|["'`.,!?]+$/g, "")
+    .trim()
+    .split(/\s+/)[0];
+  if (!isValidFenPlacement(cleaned)) {
+    return {
+      kind: "error",
+      reason: `not a valid FEN placement: ${cleaned.slice(0, 80)}`,
+    };
+  }
+  return { kind: "fen", fen: cleaned, raw };
+}
+
+type AnthropicFenCallArgs = {
+  url: string;
+  extraHeaders: Record<string, string>;
+  image: HTMLCanvasElement;
+  model: string;
+};
+
+async function callAnthropicForFen(
+  args: AnthropicFenCallArgs,
+): Promise<FenReadResult> {
+  try {
+    const b64 = canvasToBase64(args.image);
+    const response = await fetch(args.url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...args.extraHeaders },
+      body: JSON.stringify({
+        model: args.model,
+        max_tokens: 80,
+        temperature: 0.05,
+        messages: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "image",
+                source: {
+                  type: "base64",
+                  media_type: "image/jpeg",
+                  data: b64,
+                },
+              },
+              { type: "text", text: FEN_READ_PROMPT },
+            ],
+          },
+        ],
+      }),
+    });
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      return {
+        kind: "error",
+        reason: `HTTP ${response.status}: ${text.slice(0, 160)}`,
+      };
+    }
+    const data = (await response.json()) as {
+      content?: { type: string; text?: string }[];
+    };
+    const raw = data.content?.find((c) => c.type === "text")?.text ?? "";
+    return parseFenResponse(raw);
+  } catch (e) {
+    return {
+      kind: "error",
+      reason: e instanceof Error ? e.message : String(e),
+    };
+  }
+}
+
+export async function readFenViaProxy(
+  proxyUrl: string,
+  image: HTMLCanvasElement,
+  model = "claude-sonnet-4-6",
+): Promise<FenReadResult> {
+  const url = proxyUrl.replace(/\/$/, "") + "/verify";
+  return callAnthropicForFen({ url, extraHeaders: {}, image, model });
+}
+
+export async function readFenViaAnthropic(
+  apiKey: string,
+  image: HTMLCanvasElement,
+  model = "claude-sonnet-4-6",
+): Promise<FenReadResult> {
+  return callAnthropicForFen({
+    url: "https://api.anthropic.com/v1/messages",
+    extraHeaders: {
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01",
+      "anthropic-dangerous-direct-browser-access": "true",
+    },
+    image,
+    model,
+  });
+}
+
 const SINGLE_FRAME_PROMPT = (
   prevFen: string,
   legalMovesSan: string[],
