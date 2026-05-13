@@ -1,0 +1,11 @@
+name = "chesspar-vlm"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+
+# Set with: wrangler secret put ANTHROPIC_API_KEY
+# (do NOT put the key in this file — it's committed to git)
+
+[vars]
+# Browsers that are allowed to call this worker. Add localhost while
+# developing. Update if you point a custom domain at the site.
+ALLOWED_ORIGINS = "https://jlud7.github.io,http://localhost:3000"

@@ -14,7 +14,8 @@ const nextConfig: NextConfig = {
   basePath,
   assetPrefix: basePath ? `${basePath}/` : undefined,
   env: {
-    NEXT_PUBLIC_BASE_PATH: basePath
+    NEXT_PUBLIC_BASE_PATH: basePath,
+    NEXT_PUBLIC_VLM_PROXY_URL: process.env.NEXT_PUBLIC_VLM_PROXY_URL ?? ""
   }
 };
 

@@ -31,6 +31,12 @@ jobs:
         run: npm ci
 
       - name: Build static export
+        env:
+          # URL of the Cloudflare Worker that proxies VLM requests.
+          # Set this as a repository variable (Settings → Variables → Actions)
+          # to enable Claude by default in the deployed app. Leave unset
+          # to fall back to the paste-your-own-key flow.
+          NEXT_PUBLIC_VLM_PROXY_URL: ${{ vars.VLM_PROXY_URL }}
         run: npm run build
 
       - name: Add nojekyll

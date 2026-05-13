@@ -20,7 +20,20 @@ import {
   computeCellDeltas,
   type BaselineSignature,
 } from "@/lib/occupancy";
-import { makeVerifier, type VlmProvider, type VlmVerifyResult } from "@/lib/vlm";
+import {
+  makeAnthropicProxyVerifier,
+  makeVerifier,
+  type VlmProvider,
+  type VlmVerifyResult,
+} from "@/lib/vlm";
+
+/**
+ * If a VLM proxy URL is baked in at build time (Cloudflare Worker holding the
+ * Anthropic key), VLM identification is "always on" and the user doesn't need
+ * to paste a key. The pasted-key flow remains for users running their own
+ * build or hitting Gemini/OpenAI directly.
+ */
+const VLM_PROXY_URL = process.env.NEXT_PUBLIC_VLM_PROXY_URL || "";
 import { inferMoveFuzzy } from "@/lib/move-inference";
 import {
   autoDetectBoardCorners,
@@ -515,10 +528,22 @@ export function CaptureGame() {
     // Revoke any existing test frame URLs
     testFrameUrlsRef.current.forEach((u) => URL.revokeObjectURL(u));
     testFrameUrlsRef.current = [];
+    // Sort by filename so IMG_8819…IMG_8833 lands in chronological order.
+    // The iOS Photos picker often returns selection-order, not date-order;
+    // an unsorted FileList is a common cause of "move 1 looks illegal".
+    // Files with no name (rare) sink to the end, original order preserved
+    // among themselves via the stable sort.
+    const sortedFiles = Array.from(files).sort((a, b) => {
+      if (!a.name) return 1;
+      if (!b.name) return -1;
+      return a.name.localeCompare(b.name, undefined, {
+        numeric: true,
+        sensitivity: "base",
+      });
+    });
     const loaded: HTMLImageElement[] = [];
     const urls: string[] = [];
-    for (let i = 0; i < files.length; i++) {
-      const file = files[i];
+    for (const file of sortedFiles) {
       const url = URL.createObjectURL(file);
       urls.push(url);
       try {
@@ -807,7 +832,7 @@ export function CaptureGame() {
           to: appliedMove.to,
           promotion: appliedMove.promotion ?? "q",
         });
-      } else if (vlmConfigRef.current?.apiKey) {
+      } else if (vlmConfigRef.current?.apiKey || VLM_PROXY_URL) {
         // VLM identifier — two-image diff against the legal-move list.
         setVlmActive(true);
         try {
@@ -846,7 +871,8 @@ export function CaptureGame() {
               from: appliedMove.from,
               to: appliedMove.to,
               fen: appliedFen,
-              provider: vlmConfigRef.current!.provider,
+              provider:
+                vlmConfigRef.current?.provider ?? ("anthropic" as VlmProvider),
             }
           : {
               kind: "matched",
@@ -925,11 +951,16 @@ export function CaptureGame() {
     previousFen: string;
   }): Promise<{ move: ChessMove; fen: string } | null> {
     const config = vlmConfigRef.current;
-    if (!config?.apiKey) return null;
+    // Prefer a pasted user key (lets users override with Gemini/OpenAI or
+    // their own Claude key); otherwise fall through to the proxy if one was
+    // baked in at build time.
+    if (!config?.apiKey && !VLM_PROXY_URL) return null;
     const game = new Chess(args.previousFen);
     const legal = game.moves();
     if (legal.length === 0) return null;
-    const verifier = makeVerifier(config.provider, config.apiKey);
+    const verifier = config?.apiKey
+      ? makeVerifier(config.provider, config.apiKey)
+      : makeAnthropicProxyVerifier(VLM_PROXY_URL);
     let result: VlmVerifyResult;
     try {
       result = await verifier.verify({
@@ -1257,6 +1288,7 @@ export function CaptureGame() {
             }
           }}
           testFrameCount={testFrames.length}
+          testFrameSrcs={testFrames.map((f) => f.src)}
           onLoadTestFrames={(files) => void loadTestFrames(files)}
           vlmConfig={vlmConfig}
           onChangeVlmConfig={setVlmConfig}
@@ -1807,6 +1839,7 @@ function SettingsScreen({
   testMode,
   onToggleTestMode,
   testFrameCount,
+  testFrameSrcs,
   onLoadTestFrames,
   vlmConfig,
   onChangeVlmConfig,
@@ -1820,6 +1853,7 @@ function SettingsScreen({
   testMode: boolean;
   onToggleTestMode: (on: boolean) => void;
   testFrameCount: number;
+  testFrameSrcs: string[];
   onLoadTestFrames: (files: FileList | null) => void;
   vlmConfig: VlmConfig | null;
   onChangeVlmConfig: (next: VlmConfig | null) => void;
@@ -1927,24 +1961,69 @@ function SettingsScreen({
                   {testFrameCount > 0 ? "Replace photos" : "Choose photos"}
                 </label>
                 {testFrameCount > 0 && (
-                  <p className="text-[11px] text-zinc-400">
-                    {testFrameCount} loaded ·{" "}
-                    <span className="text-zinc-200">
-                      1 starting + {testFrameCount - 1} half-move
-                      {testFrameCount - 1 === 1 ? "" : "s"}
-                    </span>
-                    {testFrameCount >= 3 && (
-                      <>
-                        {" "}
-                        ({Math.floor((testFrameCount - 1) / 2)} full turn
-                        {Math.floor((testFrameCount - 1) / 2) === 1 ? "" : "s"}
-                        {(testFrameCount - 1) % 2 === 1
-                          ? " + white's move"
-                          : ""}
-                        )
-                      </>
-                    )}
-                  </p>
+                  <>
+                    <p className="text-[11px] text-zinc-400">
+                      {testFrameCount} loaded ·{" "}
+                      <span className="text-zinc-200">
+                        1 starting + {testFrameCount - 1} half-move
+                        {testFrameCount - 1 === 1 ? "" : "s"}
+                      </span>
+                      {testFrameCount >= 3 && (
+                        <>
+                          {" "}
+                          ({Math.floor((testFrameCount - 1) / 2)} full turn
+                          {Math.floor((testFrameCount - 1) / 2) === 1
+                            ? ""
+                            : "s"}
+                          {(testFrameCount - 1) % 2 === 1
+                            ? " + white's move"
+                            : ""}
+                          )
+                        </>
+                      )}
+                    </p>
+                    <div className="flex gap-1.5 overflow-x-auto pb-1">
+                      {testFrameSrcs.map((src, i) => (
+                        <div
+                          key={`${src}-${i}`}
+                          className="relative shrink-0"
+                          title={
+                            i === 0
+                              ? "Photo 1 — starting position"
+                              : `Photo ${i + 1} — half-move ${i} (${
+                                  i % 2 === 1 ? "white" : "black"
+                                })`
+                          }
+                        >
+                          {/* eslint-disable-next-line @next/next/no-img-element */}
+                          <img
+                            src={src}
+                            alt={`Photo ${i + 1}`}
+                            className={clsx(
+                              "h-12 w-12 rounded-md object-cover ring-1",
+                              i === 0
+                                ? "ring-emerald-400/70"
+                                : "ring-white/10",
+                            )}
+                          />
+                          <span
+                            className={clsx(
+                              "absolute bottom-0.5 right-0.5 rounded-sm px-1 text-[9px] font-semibold leading-tight tabular-nums",
+                              i === 0
+                                ? "bg-emerald-500/90 text-emerald-950"
+                                : "bg-black/70 text-zinc-100",
+                            )}
+                          >
+                            {i === 0 ? "start" : i}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                    <p className="text-[10px] text-zinc-500">
+                      Confirm the order looks right — first should be the
+                      starting position, then each half-move in sequence.
+                    </p>
+                  </>
                 )}
               </div>
             )}
@@ -1952,7 +2031,27 @@ function SettingsScreen({
         </SettingsSection>
 
         <SettingsSection title="Vision-LM fallback">
-          <VlmConfigEditor config={vlmConfig} onChange={onChangeVlmConfig} />
+          {VLM_PROXY_URL ? (
+            <div className="rounded-2xl border border-emerald-500/30 bg-emerald-500/10 p-3 text-[12px] text-emerald-100">
+              <div className="font-medium">Claude is enabled by default.</div>
+              <div className="mt-1 text-[11px] text-emerald-200/80">
+                When CV can&apos;t resolve a move, Claude Sonnet identifies
+                it via the bundled proxy — no key needed. Paste your own
+                key below to override.
+              </div>
+              <details className="mt-2 text-[11px] text-emerald-100/80">
+                <summary className="cursor-pointer">Override with your own key</summary>
+                <div className="mt-2">
+                  <VlmConfigEditor
+                    config={vlmConfig}
+                    onChange={onChangeVlmConfig}
+                  />
+                </div>
+              </details>
+            </div>
+          ) : (
+            <VlmConfigEditor config={vlmConfig} onChange={onChangeVlmConfig} />
+          )}
         </SettingsSection>
 
         <button

@@ -257,6 +257,83 @@ export function makeAnthropicVerifier(
   };
 }
 
+/**
+ * Anthropic verifier that goes through a Cloudflare Worker (or any compatible
+ * proxy) instead of api.anthropic.com directly. The proxy holds the API key
+ * server-side; the browser never sees it.
+ *
+ * Proxy contract: POST {proxyUrl}/verify with a body identical to the
+ * Anthropic /v1/messages payload. The proxy attaches x-api-key and returns
+ * the upstream response verbatim.
+ */
+export function makeAnthropicProxyVerifier(
+  proxyUrl: string,
+  model = "claude-sonnet-4-6",
+): VlmVerifier {
+  const endpoint = proxyUrl.replace(/\/$/, "") + "/verify";
+  return {
+    provider: "anthropic",
+    async verify({ previousFen, legalMovesSan, boardImage, previousBoardImage }) {
+      try {
+        const afterB64 = canvasToBase64(boardImage);
+        const beforeB64 = previousBoardImage
+          ? canvasToBase64(previousBoardImage)
+          : null;
+        const prompt = beforeB64
+          ? TWO_FRAME_PROMPT(previousFen, legalMovesSan)
+          : SINGLE_FRAME_PROMPT(previousFen, legalMovesSan);
+        const content: unknown[] = [];
+        if (beforeB64) {
+          content.push({
+            type: "image",
+            source: {
+              type: "base64",
+              media_type: "image/jpeg",
+              data: beforeB64,
+            },
+          });
+        }
+        content.push({
+          type: "image",
+          source: {
+            type: "base64",
+            media_type: "image/jpeg",
+            data: afterB64,
+          },
+        });
+        content.push({ type: "text", text: prompt });
+        const response = await fetch(endpoint, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model,
+            max_tokens: 32,
+            temperature: 0.05,
+            messages: [{ role: "user", content }],
+          }),
+        });
+        if (!response.ok) {
+          const text = await response.text().catch(() => "");
+          return {
+            kind: "error",
+            reason: `Proxy HTTP ${response.status}: ${text.slice(0, 160)}`,
+          };
+        }
+        const data = (await response.json()) as {
+          content?: { type: string; text?: string }[];
+        };
+        const raw = data.content?.find((c) => c.type === "text")?.text ?? "";
+        return resolveSan(raw, legalMovesSan);
+      } catch (e) {
+        return {
+          kind: "error",
+          reason: e instanceof Error ? e.message : String(e),
+        };
+      }
+    },
+  };
+}
+
 export function makeVerifier(
   provider: VlmProvider,
   apiKey: string,
