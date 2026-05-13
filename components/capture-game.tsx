@@ -112,6 +112,7 @@ export function CaptureGame() {
   const [testMode, setTestMode] = useState(false);
   const [testFrames, setTestFrames] = useState<HTMLImageElement[]>([]);
   const [testFrameIdx, setTestFrameIdx] = useState(0);
+  const testModeRef = useRef(false);
   const testFramesRef = useRef<HTMLImageElement[]>([]);
   const testFrameIdxRef = useRef(0);
   const testFrameUrlsRef = useRef<string[]>([]);
@@ -138,6 +139,10 @@ export function CaptureGame() {
   useEffect(() => {
     cornersRef.current = corners;
   }, [corners]);
+
+  useEffect(() => {
+    testModeRef.current = testMode;
+  }, [testMode]);
 
   useEffect(() => {
     testFramesRef.current = testFrames;
@@ -427,7 +432,7 @@ export function CaptureGame() {
   }
 
   function previewSource(): HTMLCanvasElement | HTMLImageElement | null {
-    if (testMode) {
+    if (testModeRef.current) {
       return testFramesRef.current[testFrameIdxRef.current] ?? null;
     }
     return grabVideoFrame();

@@ -17,9 +17,11 @@ type Mask = Uint8Array;
 
 const MAX_DIM = 320;
 const VARIANCE_HALF_WINDOW = 2; // 5x5 window
-const MIN_COMPONENT_FRACTION = 0.04;
-const VARIANCE_PERCENTILE = 0.7;
-const MIN_VARIANCE_ABSOLUTE = 80;
+const MIN_COMPONENT_FRACTION = 0.035;
+const VARIANCE_PERCENTILE = 0.65;
+const MIN_VARIANCE_ABSOLUTE = 60;
+const GRADIENT_PERCENTILE = 0.6;
+const MIN_GRADIENT_ABSOLUTE = 12;
 
 /**
  * Locate the chessboard quadrilateral in `source` using purely image stats.
@@ -64,45 +66,71 @@ export function autoDetectBoardCorners(
       0.114 * img.data[i + 2];
   }
 
+  const dilateRadius = Math.max(1, Math.floor(Math.min(w, h) / 80));
+
+  // Strategy A: local-variance mask. Fast and works on most photos.
   const variance = computeLocalVariance(lum, w, h, VARIANCE_HALF_WINDOW);
-  const threshold = pickVarianceThreshold(variance);
-  const mask = thresholdMask(variance, threshold);
-  const dilated = dilate(mask, w, h, Math.max(1, Math.floor(Math.min(w, h) / 80)));
+  const varThreshold = pickPercentileThreshold(
+    variance,
+    VARIANCE_PERCENTILE,
+    MIN_VARIANCE_ABSOLUTE,
+  );
+  const varMask = thresholdMask(variance, varThreshold);
 
-  const { labels, sizes } = connectedComponents(dilated, w, h);
-  let bestLabel = 0;
-  let bestSize = 0;
-  for (let lbl = 1; lbl < sizes.length; lbl++) {
-    if (sizes[lbl] > bestSize) {
-      bestSize = sizes[lbl];
-      bestLabel = lbl;
-    }
-  }
-  if (!bestLabel || bestSize < w * h * MIN_COMPONENT_FRACTION) return null;
+  // Strategy B: checkerboard-specific mask — min(|gx|, |gy|) is high only
+  // where there are edges in *both* directions, which is unique to grid
+  // patterns. Filters out wood-grain and carpet that have edges in just
+  // one direction.
+  const checker = computeCheckerSignal(lum, w, h);
+  const chkThreshold = pickPercentileThreshold(
+    checker,
+    GRADIENT_PERCENTILE,
+    MIN_GRADIENT_ABSOLUTE,
+  );
+  const chkMask = thresholdMask(checker, chkThreshold);
 
-  const pts: Point[] = [];
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      if (labels[y * w + x] === bestLabel) {
-        pts.push({ x, y });
+  // AND the two masks — accept only pixels that are both texturally rough
+  // AND have bidirectional gradient. Falls back to either alone if that
+  // produces too small a region.
+  const combined = andMask(varMask, chkMask);
+
+  const candidates: Uint8Array[] = [combined, chkMask, varMask];
+
+  let chosen: { ordered: Point[]; bestSize: number; quadArea: number } | null = null;
+  for (const candidate of candidates) {
+    const dilated = dilate(candidate, w, h, dilateRadius);
+    const { labels, sizes } = connectedComponents(dilated, w, h);
+    let bestLabel = 0;
+    let bestSize = 0;
+    for (let lbl = 1; lbl < sizes.length; lbl++) {
+      if (sizes[lbl] > bestSize) {
+        bestSize = sizes[lbl];
+        bestLabel = lbl;
       }
     }
+    if (!bestLabel || bestSize < w * h * MIN_COMPONENT_FRACTION) continue;
+    const pts: Point[] = [];
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        if (labels[y * w + x] === bestLabel) pts.push({ x, y });
+      }
+    }
+    const hull = convexHull(pts);
+    if (hull.length < 4) continue;
+    const quad = simplifyToQuadrilateral(hull);
+    if (quad.length !== 4) continue;
+    const quadArea = polygonArea(quad);
+    if (quadArea <= 0) continue;
+    const ordered = orderClockwise(quad);
+    chosen = { ordered, bestSize, quadArea };
+    break;
   }
 
-  const hull = convexHull(pts);
-  if (hull.length < 4) return null;
+  if (!chosen) return null;
 
-  const quad = simplifyToQuadrilateral(hull);
-  if (quad.length !== 4) return null;
+  const coverage = Math.min(1, chosen.bestSize / chosen.quadArea);
 
-  const componentArea = bestSize;
-  const quadArea = polygonArea(quad);
-  if (quadArea <= 0) return null;
-  const coverage = Math.min(1, componentArea / quadArea);
-
-  const ordered = orderClockwise(quad);
-
-  const cornersOrig: [Point, Point, Point, Point] = ordered.map((p) => ({
+  const cornersOrig: [Point, Point, Point, Point] = chosen.ordered.map((p) => ({
     x: p.x / scale,
     y: p.y / scale,
   })) as [Point, Point, Point, Point];
@@ -112,6 +140,34 @@ export function autoDetectBoardCorners(
     confidence: coverage,
     oriented: false,
   };
+}
+
+function andMask(a: Uint8Array, b: Uint8Array): Uint8Array {
+  const out = new Uint8Array(a.length);
+  for (let i = 0; i < a.length; i++) out[i] = a[i] && b[i] ? 1 : 0;
+  return out;
+}
+
+/**
+ * Per-pixel "is this part of a checkerboard?" signal: min(|gx|, |gy|).
+ * High only when edges exist in both directions; near zero on smooth
+ * surfaces, wood grain (edges in one direction), or out-of-focus regions.
+ */
+function computeCheckerSignal(
+  lum: Float32Array,
+  w: number,
+  h: number,
+): Float32Array {
+  const out = new Float32Array(w * h);
+  for (let y = 1; y < h - 1; y++) {
+    for (let x = 1; x < w - 1; x++) {
+      const i = y * w + x;
+      const gx = Math.abs(lum[i + 1] - lum[i - 1]);
+      const gy = Math.abs(lum[i + w] - lum[i - w]);
+      out[i] = gx < gy ? gx : gy;
+    }
+  }
+  return out;
 }
 
 /** Score a 64-cell occupancy by how "white on bottom, black on top" it looks. */
@@ -171,11 +227,15 @@ function computeLocalVariance(
   return out;
 }
 
-function pickVarianceThreshold(variance: Float32Array): number {
-  const arr = Array.from(variance);
+function pickPercentileThreshold(
+  values: Float32Array,
+  percentile: number,
+  floor: number,
+): number {
+  const arr = Array.from(values);
   arr.sort((a, b) => a - b);
-  const p = arr[Math.floor(arr.length * VARIANCE_PERCENTILE)];
-  return Math.max(p, MIN_VARIANCE_ABSOLUTE);
+  const p = arr[Math.floor(arr.length * percentile)];
+  return Math.max(p, floor);
 }
 
 function thresholdMask(variance: Float32Array, threshold: number): Mask {
