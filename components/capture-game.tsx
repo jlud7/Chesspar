@@ -9,7 +9,7 @@ import {
   type ReactNode,
 } from "react";
 import Link from "next/link";
-import { Chess } from "chess.js";
+import { Chess, type Move as ChessMove } from "chess.js";
 import clsx from "clsx";
 import { extractSquareCrops, warpBoard } from "@/lib/board-image";
 import type { Point } from "@/lib/homography";
@@ -132,6 +132,7 @@ export function CaptureGame() {
 
   const [calibrationPreviewUrl, setCalibrationPreviewUrl] = useState<string | null>(null);
   const [moveLog, setMoveLog] = useState<{ san: string; viaVlm: boolean }[]>([]);
+  const [selectedCaptureIdx, setSelectedCaptureIdx] = useState<number | null>(null);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -858,6 +859,114 @@ export function CaptureGame() {
     setPhase("ended");
   }
 
+  /**
+   * Truncate the game state back to before `captureIndex`, then apply
+   * the user-picked move as if it had happened at that point. Subsequent
+   * captures and their inferred moves are discarded — the user is asked
+   * to confirm before this happens.
+   */
+  function overrideCaptureMove(captureIndex: number, picked: ChessMove) {
+    if (captureIndex < 0 || captureIndex >= captures.length) return;
+    const targetCapture = captures[captureIndex];
+    // Rewind chess.js to the position BEFORE the targeted move.
+    const targetMoveCount = targetCapture.moveNumber - 1; // history is 1-indexed
+    while (chessRef.current.history().length > targetMoveCount) {
+      chessRef.current.undo();
+    }
+    let applied;
+    try {
+      applied = chessRef.current.move({
+        from: picked.from,
+        to: picked.to,
+        promotion: picked.promotion ?? "q",
+      });
+    } catch {
+      applied = null;
+    }
+    if (!applied) return;
+
+    // Drop and free everything after the override point.
+    for (let i = captureIndex + 1; i < captures.length; i++) {
+      URL.revokeObjectURL(captures[i].url);
+    }
+    const newCapture: Capture = {
+      ...targetCapture,
+      inference: {
+        kind: "matched",
+        san: applied.san,
+        from: applied.from,
+        to: applied.to,
+        fen: chessRef.current.fen(),
+      },
+    };
+    setCaptures((prev) => [...prev.slice(0, captureIndex), newCapture]);
+    setMoveLog((prev) => [
+      ...prev.slice(0, captureIndex),
+      { san: applied.san, viaVlm: false },
+    ]);
+
+    // The side to move is now the opposite of whoever just moved.
+    // Reset clocks-state-keeping logic conservatively: leave them as-is
+    // (the user is mid-game), but flip active to whichever side is now
+    // to move.
+    setActive(chessRef.current.turn() === "w" ? "white" : "black");
+    setLastMove({
+      san: applied.san,
+      side: applied.color === "w" ? "white" : "black",
+    });
+    setMoves((m) => {
+      // Recount from move numbers.
+      const h = chessRef.current.history();
+      let w = 0;
+      let b = 0;
+      for (let i = 0; i < h.length; i++) {
+        if (i % 2 === 0) w++;
+        else b++;
+      }
+      return { white: w, black: b };
+    });
+    setPgn(chessRef.current.pgn());
+    setSelectedCaptureIdx(null);
+  }
+
+  function deleteCapture(captureIndex: number) {
+    if (captureIndex < 0 || captureIndex >= captures.length) return;
+    // Truncate chess.js back to before this capture.
+    const targetMoveCount = captures[captureIndex].moveNumber - 1;
+    while (chessRef.current.history().length > targetMoveCount) {
+      chessRef.current.undo();
+    }
+    for (let i = captureIndex; i < captures.length; i++) {
+      URL.revokeObjectURL(captures[i].url);
+    }
+    setCaptures((prev) => prev.slice(0, captureIndex));
+    setMoveLog((prev) => prev.slice(0, captureIndex));
+    setActive(chessRef.current.turn() === "w" ? "white" : "black");
+    setLastMove(
+      captureIndex > 0
+        ? (() => {
+            const prevMoves = chessRef.current.history({ verbose: true });
+            const last = prevMoves[prevMoves.length - 1];
+            return last
+              ? { san: last.san, side: last.color === "w" ? "white" : "black" }
+              : null;
+          })()
+        : null,
+    );
+    setMoves((m) => {
+      const h = chessRef.current.history();
+      let w = 0;
+      let b = 0;
+      for (let i = 0; i < h.length; i++) {
+        if (i % 2 === 0) w++;
+        else b++;
+      }
+      return { white: w, black: b };
+    });
+    setPgn(chessRef.current.pgn());
+    setSelectedCaptureIdx(null);
+  }
+
   const tcLabel = useMemo(() => describeTc(tc), [tc]);
 
   const calibrationHint = busy
@@ -1074,6 +1183,20 @@ export function CaptureGame() {
         <CapturesDrawer
           captures={captures}
           onClose={() => setShowCaptures(false)}
+          onSelectCapture={(idx) => setSelectedCaptureIdx(idx)}
+        />
+      )}
+
+      {selectedCaptureIdx !== null && captures[selectedCaptureIdx] && (
+        <CaptureDetailModal
+          captureIndex={selectedCaptureIdx}
+          capture={captures[selectedCaptureIdx]}
+          chess={chessRef.current}
+          corners={cornersRef.current}
+          subsequentCount={captures.length - selectedCaptureIdx - 1}
+          onClose={() => setSelectedCaptureIdx(null)}
+          onOverride={overrideCaptureMove}
+          onDelete={deleteCapture}
         />
       )}
     </div>
@@ -1107,30 +1230,46 @@ function PlayerPanel({
       onClick={onTap}
       disabled={disabled}
       className={clsx(
-        "flex flex-1 select-none flex-col items-center justify-center transition-colors duration-150",
+        "relative flex flex-1 select-none flex-col items-center justify-center overflow-hidden transition-all duration-200",
         isActive
-          ? "bg-zinc-100 text-zinc-900"
-          : "bg-zinc-800 text-zinc-400",
+          ? "bg-gradient-to-b from-zinc-50 to-zinc-200 text-zinc-900 shadow-[inset_0_-12px_30px_rgba(0,0,0,0.05)]"
+          : "bg-zinc-900 text-zinc-500",
         flash && "ring-4 ring-inset ring-emerald-400/70",
         rotated && "rotate-180",
+        "active:scale-[0.995]",
       )}
     >
-      <div className="text-[10px] font-medium uppercase tracking-[0.2em] opacity-60">
-        {side === "white" ? "White" : "Black"}
-      </div>
-      <div
+      <span
         className={clsx(
-          "mt-2 text-7xl font-light tabular-nums tracking-tight md:text-8xl",
-          low && isActive && "text-rose-600",
+          "absolute left-1/2 top-7 -translate-x-1/2 text-[10px] font-semibold uppercase tracking-[0.32em]",
+          isActive ? "text-zinc-500" : "text-zinc-600",
+        )}
+      >
+        {side === "white" ? "White" : "Black"}
+      </span>
+      <span
+        className={clsx(
+          "select-none tabular-nums leading-none",
+          "text-[clamp(4rem,18vw,8.5rem)] font-extralight tracking-tighter",
+          low && isActive
+            ? "text-rose-600"
+            : isActive
+              ? "text-zinc-900"
+              : "text-zinc-500",
         )}
       >
         {formatTime(ms)}
-      </div>
-      <div className="mt-3 flex items-center gap-3 text-[11px] uppercase tracking-[0.18em] opacity-60">
+      </span>
+      <span
+        className={clsx(
+          "absolute inset-x-0 bottom-6 flex items-center justify-center gap-3 text-[11px] tracking-[0.22em] uppercase",
+          isActive ? "text-zinc-500" : "text-zinc-600",
+        )}
+      >
         <span>Moves · {moves}</span>
-        <span aria-hidden>•</span>
+        <span aria-hidden>·</span>
         <span>{tcLabel}</span>
-      </div>
+      </span>
     </button>
   );
 }
@@ -1159,7 +1298,7 @@ function CenterBar({
   onEndGame: () => void;
 }) {
   return (
-    <div className="flex shrink-0 flex-col bg-black/95">
+    <div className="relative flex shrink-0 flex-col border-y border-white/5 bg-zinc-950/70 backdrop-blur-xl">
       <MoveLogStrip moveLog={moveLog} inferring={inferring} />
       <div className="flex h-14 items-center justify-around px-2">
         <IconBtn onClick={onReset} label="Back to settings">
@@ -1174,7 +1313,7 @@ function CenterBar({
         <IconBtn onClick={onShowCaptures} label="Captures">
           <CamIcon />
           {captureCount > 0 && (
-            <span className="absolute -right-1 -top-1 inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-emerald-500 px-1 text-[10px] font-bold text-emerald-950">
+            <span className="absolute -right-0.5 -top-0.5 inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-emerald-500 px-1 text-[10px] font-bold text-emerald-950 shadow-md shadow-emerald-500/30">
               {captureCount}
             </span>
           )}
@@ -1203,15 +1342,17 @@ function MoveLogStrip({
     if (el) el.scrollLeft = el.scrollWidth;
   }, [moveLog.length]);
   return (
-    <div className="flex h-8 shrink-0 items-center gap-2 border-b border-zinc-900 px-2">
+    <div className="flex h-9 shrink-0 items-center gap-2 px-3">
       <div
         ref={ref}
-        className="flex flex-1 items-center gap-1 overflow-x-auto whitespace-nowrap scroll-smooth py-0.5"
+        className="flex flex-1 items-center gap-1.5 overflow-x-auto whitespace-nowrap scroll-smooth py-1"
         style={{ scrollbarWidth: "none" }}
       >
         {moveLog.length === 0 ? (
-          <span className="px-1 text-[11px] text-zinc-600">
-            {inferring ? "Inferring first move…" : "No moves yet · tap a clock to begin"}
+          <span className="text-[11px] tracking-wide text-zinc-500">
+            {inferring
+              ? "Inferring first move…"
+              : "Tap your clock to record the first move"}
           </span>
         ) : (
           moveLog.map((m, i) => {
@@ -1228,11 +1369,11 @@ function MoveLogStrip({
                 )}
                 <span
                   className={clsx(
-                    "rounded-md px-1.5 py-0.5 font-mono",
+                    "rounded-full px-2 py-0.5 font-mono transition",
                     isLast
                       ? m.viaVlm
-                        ? "bg-sky-500/25 text-sky-100"
-                        : "bg-emerald-500/25 text-emerald-100"
+                        ? "bg-sky-500/25 text-sky-100 ring-1 ring-sky-400/30"
+                        : "bg-emerald-500/25 text-emerald-100 ring-1 ring-emerald-400/30"
                       : m.viaVlm
                         ? "text-sky-300"
                         : "text-zinc-200",
@@ -1252,8 +1393,8 @@ function MoveLogStrip({
         )}
       </div>
       {inferring && moveLog.length > 0 && (
-        <span className="shrink-0 rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] uppercase tracking-wider text-emerald-200">
-          Inferring…
+        <span className="shrink-0 rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] uppercase tracking-widest text-emerald-200">
+          Inferring
         </span>
       )}
     </div>
@@ -1262,11 +1403,12 @@ function MoveLogStrip({
 
 function PausedOverlay({ onResume }: { onResume: () => void }) {
   return (
-    <div className="pointer-events-none absolute inset-0 z-30 flex items-center justify-center bg-black/50">
+    <div className="pointer-events-none absolute inset-0 z-30 flex items-center justify-center bg-black/40 backdrop-blur-md">
       <button
         onClick={onResume}
-        className="pointer-events-auto rounded-full border border-emerald-400/40 bg-emerald-500/15 px-6 py-3 text-sm font-medium uppercase tracking-widest text-emerald-100 hover:bg-emerald-500/25"
+        className="pointer-events-auto flex items-center gap-3 rounded-full bg-white/10 px-7 py-3.5 text-sm font-semibold uppercase tracking-[0.25em] text-zinc-50 ring-1 ring-white/15 backdrop-blur-md transition hover:bg-white/15"
       >
+        <span className="block h-2.5 w-2.5 animate-pulse rounded-full bg-emerald-400" />
         Paused — tap to resume
       </button>
     </div>
@@ -1362,74 +1504,83 @@ function SettingsScreen({
   onChangeVlmConfig: (next: VlmConfig | null) => void;
 }) {
   return (
-    <div className="relative flex flex-1 flex-col overflow-y-auto px-6 py-10">
+    <div className="relative flex flex-1 flex-col overflow-y-auto px-5 py-8">
       <Link
         href="/"
-        className="absolute left-4 top-4 text-xs uppercase tracking-wider text-zinc-400 hover:text-zinc-200"
+        className="absolute left-4 top-4 inline-flex items-center gap-1 rounded-full bg-white/5 px-3 py-1 text-[11px] uppercase tracking-widest text-zinc-300 hover:bg-white/10"
       >
         ← Home
       </Link>
       <div className="mx-auto w-full max-w-md">
-        <h1 className="mb-2 mt-6 text-2xl font-semibold">Live game</h1>
-        <p className="mb-6 text-sm text-zinc-400">
-          Pick a time control, calibrate the board corners once, then each
-          tap captures + infers the move that just happened.
+        <div className="mb-1 mt-6 text-[11px] uppercase tracking-[0.3em] text-emerald-300">
+          New game
+        </div>
+        <h1 className="mb-2 text-[2rem] font-semibold tracking-tight">
+          Set up the board
+        </h1>
+        <p className="mb-7 text-[15px] leading-snug text-zinc-400">
+          Pick a time control. We&apos;ll calibrate the camera once and then
+          watch the board between each tap of your clock.
         </p>
 
-        <div className="mb-3 text-xs uppercase tracking-wider text-zinc-500">
-          Time control
-        </div>
-        <div className="mb-6 grid grid-cols-2 gap-2">
-          {PRESETS.map((p) => {
-            const selected =
-              p.tc.baseSeconds === tc.baseSeconds &&
-              p.tc.incrementSeconds === tc.incrementSeconds;
-            return (
-              <button
-                key={p.label}
-                onClick={() => onChangeTc(p.tc)}
-                className={clsx(
-                  "rounded-md border px-3 py-2 text-sm transition",
-                  selected
-                    ? "border-emerald-500/60 bg-emerald-500/15 text-emerald-100"
-                    : "border-zinc-800 bg-zinc-900 text-zinc-300 hover:bg-zinc-800",
-                )}
-              >
-                {p.label}
-              </button>
-            );
-          })}
-        </div>
-
-        <CustomTcEditor tc={tc} onChange={onChangeTc} />
-
-        {hasSavedCorners && !testMode && (
-          <div className="mt-4 flex items-center justify-between rounded-md border border-zinc-800 bg-zinc-900/60 px-3 py-2 text-xs text-zinc-300">
-            <span>Board corners saved from last session.</span>
-            <button
-              onClick={onClearCorners}
-              className="rounded border border-zinc-700 px-2 py-0.5 text-zinc-300 hover:bg-zinc-800"
-            >
-              Recalibrate
-            </button>
+        <SettingsSection title="Time control">
+          <div className="grid grid-cols-2 gap-2">
+            {PRESETS.map((p) => {
+              const selected =
+                p.tc.baseSeconds === tc.baseSeconds &&
+                p.tc.incrementSeconds === tc.incrementSeconds;
+              return (
+                <button
+                  key={p.label}
+                  onClick={() => onChangeTc(p.tc)}
+                  className={clsx(
+                    "rounded-2xl border px-3 py-2.5 text-sm font-medium transition",
+                    selected
+                      ? "border-emerald-400/60 bg-emerald-500/20 text-emerald-50 shadow-inner shadow-emerald-500/10"
+                      : "border-white/5 bg-white/5 text-zinc-200 hover:bg-white/10",
+                  )}
+                >
+                  {p.label}
+                </button>
+              );
+            })}
           </div>
-        )}
+          <div className="mt-3">
+            <CustomTcEditor tc={tc} onChange={onChangeTc} />
+          </div>
+        </SettingsSection>
 
-        <div className="mt-4 rounded-lg border border-zinc-800 bg-zinc-900/60 p-3">
-          <label className="flex items-center justify-between gap-3">
-            <span className="text-xs uppercase tracking-wider text-zinc-300">
-              Test mode · use uploaded photos
-            </span>
-            <input
-              type="checkbox"
-              checked={testMode}
-              onChange={(e) => onToggleTestMode(e.target.checked)}
-              className="h-4 w-4 cursor-pointer accent-emerald-500"
-            />
-          </label>
-          {testMode && (
-            <div className="mt-3 flex flex-col gap-2">
-              <label className="inline-flex cursor-pointer items-center justify-center gap-2 rounded-md border border-zinc-700 bg-zinc-800 px-3 py-1.5 text-xs text-zinc-200 hover:bg-zinc-700">
+        <SettingsSection title="Source">
+          {hasSavedCorners && !testMode && (
+            <div className="mb-3 flex items-center justify-between rounded-2xl border border-white/5 bg-white/5 px-3 py-2 text-[13px] text-zinc-300">
+              <span>Board corners saved from last session.</span>
+              <button
+                onClick={onClearCorners}
+                className="rounded-full border border-white/10 bg-white/5 px-2.5 py-0.5 text-[11px] text-zinc-200 hover:bg-white/10"
+              >
+                Recalibrate
+              </button>
+            </div>
+          )}
+          <div className="rounded-2xl border border-white/5 bg-white/5 p-3">
+            <label className="flex items-center justify-between gap-3">
+              <span className="text-[13px] font-medium text-zinc-100">
+                Use uploaded photos
+              </span>
+              <input
+                type="checkbox"
+                checked={testMode}
+                onChange={(e) => onToggleTestMode(e.target.checked)}
+                className="h-5 w-5 cursor-pointer accent-emerald-500"
+              />
+            </label>
+            <p className="mt-1 text-[11px] leading-snug text-zinc-400">
+              Test the pipeline against still photos instead of the live
+              camera. First photo = starting position; subsequent files are
+              consumed per clock tap.
+            </p>
+            {testMode && (
+              <label className="mt-3 inline-flex cursor-pointer items-center justify-center gap-2 rounded-full border border-white/10 bg-white/10 px-3 py-1.5 text-[12px] text-zinc-100 hover:bg-white/15">
                 <input
                   type="file"
                   accept="image/*"
@@ -1439,57 +1590,73 @@ function SettingsScreen({
                 />
                 {testFrameCount > 0
                   ? `Replace photos · ${testFrameCount} loaded`
-                  : "Choose test photos (first = starting position)"}
+                  : "Choose photos"}
               </label>
-              <p className="text-[11px] text-zinc-500">
-                The first photo is used as the starting position. Each
-                subsequent photo is consumed when the active player taps
-                their clock. Camera is disabled.
-              </p>
-            </div>
-          )}
-        </div>
+            )}
+          </div>
+        </SettingsSection>
 
-        <VlmConfigEditor config={vlmConfig} onChange={onChangeVlmConfig} />
+        <SettingsSection title="Vision-LM fallback">
+          <VlmConfigEditor config={vlmConfig} onChange={onChangeVlmConfig} />
+        </SettingsSection>
 
         <button
           onClick={onStart}
           disabled={testMode && testFrameCount === 0}
-          className="mt-6 w-full rounded-md border border-emerald-500/50 bg-emerald-500/20 px-4 py-3 text-base font-medium text-emerald-100 hover:bg-emerald-500/30 disabled:cursor-not-allowed disabled:opacity-40"
+          className="mt-2 block w-full rounded-2xl bg-emerald-500/90 px-4 py-3.5 text-base font-semibold text-emerald-950 transition hover:bg-emerald-400 disabled:cursor-not-allowed disabled:bg-zinc-800 disabled:text-zinc-500"
         >
           {testMode
-            ? "Start (test mode)"
+            ? "Start with test photos"
             : hasSavedCorners
               ? "Start game"
               : "Calibrate & start"}
         </button>
 
         {!testMode && (
-          <p className="mt-3 text-center text-[11px] text-zinc-500">
-            You&apos;ll be asked for camera permission so we can capture each
-            position.
+          <p className="mt-3 text-center text-[11px] tracking-wide text-zinc-500">
+            We&apos;ll ask for camera permission once.
           </p>
         )}
 
         {cameraError && (
-          <div className="mt-4 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+          <div className="mt-4 rounded-2xl border border-amber-400/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-100">
             Camera unavailable: {cameraError}. The clock will still work; no
             photos will be saved.
           </div>
         )}
 
-        <div className="mt-8 rounded-lg border border-zinc-800 bg-zinc-900/40 p-4 text-xs text-zinc-400">
-          <div className="mb-1 font-medium uppercase tracking-wider text-zinc-300">
+        <div className="mt-8 rounded-2xl border border-white/5 bg-white/5 px-4 py-3 text-[12px] text-zinc-400">
+          <div className="mb-1 text-[10px] font-semibold uppercase tracking-[0.3em] text-zinc-300">
             Tip
           </div>
           Visit{" "}
-          <Link href="/detect" className="text-emerald-300 underline">
+          <Link
+            href="/detect"
+            className="font-medium text-emerald-300 underline-offset-2 hover:underline"
+          >
             /detect
           </Link>{" "}
           to test the rectifier + classifier on a still photo first.
         </div>
       </div>
     </div>
+  );
+}
+
+function SettingsSection({
+  title,
+  children,
+}: {
+  title: string;
+  children: ReactNode;
+}) {
+  return (
+    <section className="mb-5">
+      <div className="mb-2 text-[10px] font-semibold uppercase tracking-[0.3em] text-zinc-500">
+        {title}
+      </div>
+      {children}
+    </section>
   );
 }
 
@@ -1521,16 +1688,22 @@ function VlmConfigEditor({
   }, [enabled, provider, apiKey]);
 
   return (
-    <div className="mt-4 rounded-lg border border-zinc-800 bg-zinc-900/60 p-3">
+    <div className="rounded-2xl border border-white/5 bg-white/5 p-3">
       <label className="flex items-center justify-between gap-3">
-        <span className="text-xs uppercase tracking-wider text-zinc-300">
-          VLM fallback for unmatched moves
-        </span>
+        <div className="min-w-0">
+          <div className="text-[13px] font-medium text-zinc-100">
+            Use a vision model on misses
+          </div>
+          <p className="mt-0.5 text-[11px] leading-snug text-zinc-400">
+            Only called when the CV pipeline can&apos;t pin a unique legal
+            move.
+          </p>
+        </div>
         <input
           type="checkbox"
           checked={enabled}
           onChange={(e) => setEnabled(e.target.checked)}
-          className="h-4 w-4 cursor-pointer accent-emerald-500"
+          className="h-5 w-5 shrink-0 cursor-pointer accent-emerald-500"
         />
       </label>
       {enabled && (
@@ -1542,10 +1715,10 @@ function VlmConfigEditor({
                 type="button"
                 onClick={() => setProvider(p)}
                 className={clsx(
-                  "flex-1 rounded-md border px-2 py-1.5 text-xs transition",
+                  "flex-1 rounded-full border px-2 py-1.5 text-[11px] font-medium transition",
                   provider === p
-                    ? "border-emerald-500/50 bg-emerald-500/15 text-emerald-100"
-                    : "border-zinc-800 bg-zinc-900 text-zinc-300 hover:bg-zinc-800",
+                    ? "border-emerald-400/50 bg-emerald-500/15 text-emerald-100"
+                    : "border-white/10 bg-white/5 text-zinc-300 hover:bg-white/10",
                 )}
               >
                 {VLM_PROVIDER_LABELS[p]}
@@ -1560,21 +1733,19 @@ function VlmConfigEditor({
               onChange={(e) => setApiKey(e.target.value)}
               autoComplete="off"
               spellCheck={false}
-              className="flex-1 rounded border border-zinc-700 bg-zinc-950 px-2 py-1 font-mono text-xs text-zinc-100"
+              className="flex-1 rounded-xl border border-white/10 bg-zinc-950 px-3 py-1.5 font-mono text-xs text-zinc-100 placeholder:text-zinc-600"
             />
             <button
               type="button"
               onClick={() => setRevealed((r) => !r)}
-              className="rounded border border-zinc-700 bg-zinc-800 px-2 py-1 text-[10px] uppercase tracking-wider text-zinc-300 hover:bg-zinc-700"
+              className="rounded-full border border-white/10 bg-white/5 px-2.5 py-1.5 text-[10px] uppercase tracking-widest text-zinc-300 hover:bg-white/10"
             >
               {revealed ? "Hide" : "Show"}
             </button>
           </div>
           <p className="text-[10px] leading-snug text-zinc-500">
-            Used only when the classifier-diff pipeline can&apos;t find a
-            unique legal move. The key is stored in this browser&apos;s
-            localStorage and sent directly to the provider — never to our
-            servers.
+            Key is stored in your browser&apos;s localStorage and sent
+            directly to the provider — never our servers.
           </p>
         </div>
       )}
@@ -1590,13 +1761,13 @@ function CustomTcEditor({
   onChange: (tc: TimeControl) => void;
 }) {
   return (
-    <div className="rounded-lg border border-zinc-800 bg-zinc-900/60 p-3">
-      <div className="mb-2 text-xs uppercase tracking-wider text-zinc-500">
+    <div className="rounded-2xl border border-white/5 bg-white/5 p-3">
+      <div className="mb-2 text-[10px] font-semibold uppercase tracking-[0.3em] text-zinc-500">
         Custom
       </div>
       <div className="flex items-center gap-3">
         <label className="flex flex-1 flex-col gap-1">
-          <span className="text-[10px] uppercase tracking-wider text-zinc-500">
+          <span className="text-[10px] uppercase tracking-widest text-zinc-500">
             Minutes
           </span>
           <input
@@ -1610,11 +1781,11 @@ function CustomTcEditor({
                 baseSeconds: Math.max(1, Number(e.target.value) || 1) * 60,
               })
             }
-            className="rounded border border-zinc-700 bg-zinc-950 px-2 py-1 text-sm tabular-nums text-zinc-100"
+            className="rounded-xl border border-white/10 bg-zinc-950 px-3 py-2 text-sm tabular-nums text-zinc-100"
           />
         </label>
         <label className="flex flex-1 flex-col gap-1">
-          <span className="text-[10px] uppercase tracking-wider text-zinc-500">
+          <span className="text-[10px] uppercase tracking-widest text-zinc-500">
             + Increment (s)
           </span>
           <input
@@ -1628,7 +1799,7 @@ function CustomTcEditor({
                 incrementSeconds: Math.max(0, Number(e.target.value) || 0),
               })
             }
-            className="rounded border border-zinc-700 bg-zinc-950 px-2 py-1 text-sm tabular-nums text-zinc-100"
+            className="rounded-xl border border-white/10 bg-zinc-950 px-3 py-2 text-sm tabular-nums text-zinc-100"
           />
         </label>
       </div>
@@ -1669,44 +1840,50 @@ function EndScreen({
   }
 
   return (
-    <div className="flex flex-1 flex-col overflow-y-auto px-6 py-8">
+    <div className="flex flex-1 flex-col overflow-y-auto px-5 py-10">
       <div className="mx-auto w-full max-w-md">
-        <div className="mb-2 text-xs uppercase tracking-widest text-zinc-500">
+        <div className="mb-1 text-[11px] uppercase tracking-[0.3em] text-zinc-500">
           Game over
         </div>
-        <div className="mb-6 text-2xl font-semibold">{title}</div>
-        <div className="mb-6 grid grid-cols-2 gap-2 text-sm">
-          <div className="rounded-md border border-zinc-800 bg-zinc-900/60 px-3 py-2">
+        <div className="mb-6 text-[2rem] font-semibold tracking-tight text-zinc-50">
+          {title}
+        </div>
+        <div className="mb-5 grid grid-cols-2 gap-2 text-sm">
+          <div className="rounded-2xl border border-white/5 bg-white/5 px-4 py-3">
             <div className="text-[10px] uppercase tracking-widest text-zinc-500">
               White moves
             </div>
-            <div className="text-xl tabular-nums text-zinc-100">{moves.white}</div>
+            <div className="text-2xl tabular-nums text-zinc-50">
+              {moves.white}
+            </div>
           </div>
-          <div className="rounded-md border border-zinc-800 bg-zinc-900/60 px-3 py-2">
+          <div className="rounded-2xl border border-white/5 bg-white/5 px-4 py-3">
             <div className="text-[10px] uppercase tracking-widest text-zinc-500">
               Black moves
             </div>
-            <div className="text-xl tabular-nums text-zinc-100">{moves.black}</div>
+            <div className="text-2xl tabular-nums text-zinc-50">
+              {moves.black}
+            </div>
           </div>
         </div>
-        <div className="mb-6 rounded-md border border-zinc-800 bg-zinc-900/60 px-4 py-3 text-sm text-zinc-300">
+        <div className="mb-6 rounded-2xl border border-white/5 bg-white/5 px-4 py-3 text-sm text-zinc-300">
           {captureCount} position{captureCount === 1 ? "" : "s"} captured.
         </div>
 
         {pgn && (
-          <div className="mb-6 rounded-md border border-zinc-800 bg-zinc-950 p-3">
+          <div className="mb-6 rounded-2xl border border-white/5 bg-zinc-950/60 p-3">
             <div className="mb-2 flex items-center justify-between">
-              <div className="text-xs uppercase tracking-widest text-zinc-500">
+              <div className="text-[10px] uppercase tracking-widest text-zinc-500">
                 PGN
               </div>
               <button
                 onClick={copyPgn}
-                className="rounded border border-zinc-700 bg-zinc-800 px-2 py-0.5 text-xs text-zinc-200 hover:bg-zinc-700"
+                className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-[11px] uppercase tracking-widest text-zinc-200 hover:bg-white/10"
               >
                 {copied ? "Copied" : "Copy"}
               </button>
             </div>
-            <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] text-zinc-300">
+            <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words font-mono text-[12px] leading-relaxed text-zinc-300">
               {pgn}
             </pre>
           </div>
@@ -1714,27 +1891,27 @@ function EndScreen({
 
         <div className="flex flex-col gap-2">
           <button
-            onClick={onViewCaptures}
-            disabled={captureCount === 0}
-            className="rounded-md border border-zinc-700 bg-zinc-800 px-4 py-2 text-sm text-zinc-100 hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-40"
-          >
-            View captures
-          </button>
-          <button
             onClick={onNewGame}
-            className="rounded-md border border-emerald-500/40 bg-emerald-500/15 px-4 py-2 text-sm text-emerald-100 hover:bg-emerald-500/25"
+            className="rounded-2xl bg-emerald-500/90 px-4 py-3 text-base font-semibold text-emerald-950 hover:bg-emerald-400"
           >
             New game
           </button>
           <button
+            onClick={onViewCaptures}
+            disabled={captureCount === 0}
+            className="rounded-2xl border border-white/10 bg-white/5 px-4 py-2.5 text-sm text-zinc-100 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            View captures
+          </button>
+          <button
             onClick={onRecalibrate}
-            className="rounded-md border border-zinc-800 bg-zinc-900 px-4 py-2 text-sm text-zinc-300 hover:bg-zinc-800"
+            className="rounded-2xl border border-white/5 bg-white/5 px-4 py-2.5 text-sm text-zinc-300 hover:bg-white/10"
           >
             Recalibrate corners
           </button>
           <Link
             href="/"
-            className="mt-2 text-center text-xs uppercase tracking-wider text-zinc-500 hover:text-zinc-300"
+            className="mt-2 text-center text-[11px] uppercase tracking-widest text-zinc-500 hover:text-zinc-300"
           >
             Back to home
           </Link>
@@ -1747,32 +1924,41 @@ function EndScreen({
 function CapturesDrawer({
   captures,
   onClose,
+  onSelectCapture,
 }: {
   captures: Capture[];
   onClose: () => void;
+  onSelectCapture: (idx: number) => void;
 }) {
   return (
-    <div className="fixed inset-0 z-50 flex flex-col bg-black/95 px-4 py-5">
-      <div className="mb-4 flex items-center justify-between">
-        <div className="text-sm font-medium text-zinc-100">
-          Captures · {captures.length}
+    <div className="fixed inset-0 z-40 flex flex-col bg-zinc-950/95 backdrop-blur-xl">
+      <div className="flex shrink-0 items-center justify-between border-b border-white/5 px-5 py-4">
+        <div>
+          <div className="text-base font-semibold text-zinc-50">Captures</div>
+          <div className="text-[11px] uppercase tracking-widest text-zinc-500">
+            {captures.length} frame{captures.length === 1 ? "" : "s"} · tap to review
+          </div>
         </div>
         <button
           onClick={onClose}
-          className="rounded-md border border-zinc-700 bg-zinc-800 px-3 py-1 text-xs text-zinc-200 hover:bg-zinc-700"
+          className="rounded-full bg-white/10 px-4 py-1.5 text-sm font-medium text-zinc-100 transition hover:bg-white/20"
         >
-          Close
+          Done
         </button>
       </div>
-      <div className="flex-1 overflow-y-auto">
+      <div className="flex-1 overflow-y-auto px-4 py-4">
         {captures.length === 0 ? (
           <div className="mt-12 text-center text-sm text-zinc-500">
             No captures yet.
           </div>
         ) : (
-          <div className="grid grid-cols-2 gap-2 pb-6 sm:grid-cols-3 md:grid-cols-4">
+          <div className="grid grid-cols-2 gap-3 pb-6 sm:grid-cols-3 md:grid-cols-4">
             {captures.map((c, i) => (
-              <CaptureCard key={i} capture={c} />
+              <CaptureCard
+                key={i}
+                capture={c}
+                onClick={() => onSelectCapture(i)}
+              />
             ))}
           </div>
         )}
@@ -1781,7 +1967,13 @@ function CapturesDrawer({
   );
 }
 
-function CaptureCard({ capture }: { capture: Capture }) {
+function CaptureCard({
+  capture,
+  onClick,
+}: {
+  capture: Capture;
+  onClick: () => void;
+}) {
   const inf = capture.inference;
   const badgeText =
     inf.kind === "matched"
@@ -1804,17 +1996,20 @@ function CaptureCard({ capture }: { capture: Capture }) {
             ? "bg-rose-500/25 text-rose-100"
             : "bg-zinc-700/50 text-zinc-300";
   return (
-    <div className="overflow-hidden rounded-md border border-zinc-800 bg-zinc-900">
+    <button
+      onClick={onClick}
+      className="group block w-full overflow-hidden rounded-2xl border border-white/5 bg-zinc-900/80 text-left transition-transform active:scale-[0.98]"
+    >
       <div className="relative">
         {/* eslint-disable-next-line @next/next/no-img-element */}
         <img
           src={capture.url}
           alt={`Move ${capture.moveNumber}`}
-          className="block w-full"
+          className="block w-full transition-transform group-hover:scale-[1.02]"
         />
         <div
           className={clsx(
-            "absolute left-1 top-1 rounded px-1.5 py-0.5 text-[10px] font-mono font-semibold",
+            "absolute left-1.5 top-1.5 rounded-full px-2 py-0.5 text-[10px] font-mono font-semibold backdrop-blur",
             badgeTone,
           )}
           title={
@@ -1829,9 +2024,285 @@ function CaptureCard({ capture }: { capture: Capture }) {
           )}
         </div>
       </div>
-      <div className="flex items-center justify-between px-2 py-1 text-[10px] uppercase tracking-wider text-zinc-400">
-        <span>#{capture.moveNumber}</span>
+      <div className="flex items-center justify-between px-3 py-2 text-[10px] uppercase tracking-widest text-zinc-400">
+        <span className="tabular-nums">#{capture.moveNumber}</span>
         <span>after {capture.side === "white" ? "W" : "B"}</span>
+      </div>
+    </button>
+  );
+}
+
+function CaptureDetailModal({
+  captureIndex,
+  capture,
+  chess,
+  corners,
+  subsequentCount,
+  onClose,
+  onOverride,
+  onDelete,
+}: {
+  captureIndex: number;
+  capture: Capture;
+  chess: Chess;
+  corners: Point[];
+  subsequentCount: number;
+  onClose: () => void;
+  onOverride: (idx: number, move: ChessMove) => void;
+  onDelete: (idx: number) => void;
+}) {
+  const [rectifiedUrl, setRectifiedUrl] = useState<string | null>(null);
+  const [pickedSan, setPickedSan] = useState<string | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+
+  const inf = capture.inference;
+  const currentSan =
+    inf.kind === "matched" || inf.kind === "vlm-matched" ? inf.san : null;
+
+  const legalAtThisPoint = useMemo<ChessMove[]>(() => {
+    const history = chess.history({ verbose: true });
+    const c = new Chess();
+    const targetMoveCount = capture.moveNumber - 1;
+    for (let i = 0; i < targetMoveCount && i < history.length; i++) {
+      try {
+        c.move(history[i]);
+      } catch {
+        break;
+      }
+    }
+    return c.moves({ verbose: true }) as ChessMove[];
+  }, [chess, capture.moveNumber]);
+
+  useEffect(() => {
+    if (corners.length !== 4) {
+      setRectifiedUrl(null);
+      return;
+    }
+    let cancelled = false;
+    const img = new Image();
+    img.onload = () => {
+      if (cancelled) return;
+      try {
+        const warped = warpBoard(
+          img,
+          corners as [Point, Point, Point, Point],
+          320,
+        );
+        setRectifiedUrl(warped.toDataURL("image/jpeg", 0.9));
+      } catch {
+        setRectifiedUrl(null);
+      }
+    };
+    img.src = capture.url;
+    return () => {
+      cancelled = true;
+    };
+  }, [capture.url, corners]);
+
+  const canApply = pickedSan !== null && pickedSan !== currentSan;
+  const picked = pickedSan
+    ? legalAtThisPoint.find((m) => m.san === pickedSan) ?? null
+    : null;
+
+  const inferenceLabel =
+    inf.kind === "matched"
+      ? `Detected ${inf.san}`
+      : inf.kind === "vlm-matched"
+        ? `${VLM_PROVIDER_LABELS[inf.provider]} resolved ${inf.san}`
+        : inf.kind === "ambiguous"
+          ? `Ambiguous · defaulted to ${inf.sans[0] ?? "?"}`
+          : inf.kind === "unmatched"
+            ? "No legal move matched"
+            : "Skipped";
+
+  const inferenceTone =
+    inf.kind === "matched"
+      ? "from-emerald-500/25 to-emerald-500/0"
+      : inf.kind === "vlm-matched"
+        ? "from-sky-500/25 to-sky-500/0"
+        : inf.kind === "ambiguous"
+          ? "from-amber-500/25 to-amber-500/0"
+          : inf.kind === "unmatched"
+            ? "from-rose-500/25 to-rose-500/0"
+            : "from-zinc-500/15 to-zinc-500/0";
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex flex-col bg-black/70 backdrop-blur-xl"
+      onClick={onClose}
+    >
+      <div
+        className="relative mt-auto flex max-h-[92vh] flex-col overflow-hidden rounded-t-[28px] border-t border-white/10 bg-zinc-950/95 backdrop-blur-xl shadow-2xl sm:my-auto sm:mx-auto sm:w-full sm:max-w-xl sm:rounded-[28px]"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="mx-auto mt-2 h-1 w-10 rounded-full bg-white/15" />
+        <div className="flex shrink-0 items-center justify-between px-5 pt-2 pb-3">
+          <button
+            onClick={onClose}
+            className="text-[15px] text-zinc-300 transition hover:text-white"
+          >
+            Cancel
+          </button>
+          <div className="text-[13px] font-semibold uppercase tracking-widest text-zinc-400">
+            Move #{capture.moveNumber} · {capture.side === "white" ? "after White" : "after Black"}
+          </div>
+          <div className="w-12" aria-hidden />
+        </div>
+
+        <div className="flex-1 overflow-y-auto px-5 pb-6">
+          <div
+            className={clsx(
+              "mb-4 rounded-2xl bg-gradient-to-b px-4 py-3 text-sm",
+              inferenceTone,
+            )}
+          >
+            <div className="text-[10px] uppercase tracking-widest text-zinc-400">
+              Pipeline result
+            </div>
+            <div className="mt-1 font-medium text-zinc-50">
+              {inferenceLabel}
+            </div>
+            {inf.kind === "ambiguous" && (
+              <div className="mt-1 text-[11px] text-zinc-400">
+                {inf.sans.join(" · ")}
+              </div>
+            )}
+            {inf.kind === "unmatched" && inf.diff.length > 0 && (
+              <div className="mt-1 text-[11px] text-zinc-400">
+                Observed change: {inf.diff.slice(0, 4).join(", ")}
+                {inf.diff.length > 4 ? "…" : ""}
+              </div>
+            )}
+          </div>
+
+          <div className="mb-5 grid grid-cols-2 gap-3">
+            <div>
+              <div className="mb-1.5 text-[10px] uppercase tracking-widest text-zinc-500">
+                Photo
+              </div>
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img
+                src={capture.url}
+                alt="Captured frame"
+                className="aspect-square w-full rounded-2xl border border-white/5 object-cover"
+              />
+            </div>
+            <div>
+              <div className="mb-1.5 text-[10px] uppercase tracking-widest text-zinc-500">
+                Rectified
+              </div>
+              {rectifiedUrl ? (
+                // eslint-disable-next-line @next/next/no-img-element
+                <img
+                  src={rectifiedUrl}
+                  alt="Rectified board"
+                  className="aspect-square w-full rounded-2xl border border-white/5 object-cover"
+                />
+              ) : (
+                <div className="flex aspect-square w-full items-center justify-center rounded-2xl border border-white/5 bg-zinc-900/60 text-[11px] text-zinc-500">
+                  No rectification
+                </div>
+              )}
+            </div>
+          </div>
+
+          <div className="mb-2 flex items-baseline justify-between">
+            <div className="text-[10px] uppercase tracking-widest text-zinc-500">
+              Override · {legalAtThisPoint.length} legal moves
+            </div>
+            {currentSan && (
+              <div className="text-[10px] tracking-widest text-zinc-500">
+                Current ·{" "}
+                <span className="font-mono text-zinc-300">{currentSan}</span>
+              </div>
+            )}
+          </div>
+          <div className="mb-4 flex flex-wrap gap-1.5">
+            {legalAtThisPoint.length === 0 ? (
+              <span className="text-xs text-zinc-500">
+                No legal moves at this position (terminal state).
+              </span>
+            ) : (
+              legalAtThisPoint.map((m) => {
+                const isCurrent = m.san === currentSan;
+                const isPicked = m.san === pickedSan;
+                return (
+                  <button
+                    key={m.san}
+                    onClick={() =>
+                      setPickedSan((p) => (p === m.san ? null : m.san))
+                    }
+                    className={clsx(
+                      "rounded-full border px-2.5 py-1 text-[12px] font-mono transition",
+                      isPicked
+                        ? "border-emerald-400/70 bg-emerald-500/25 text-emerald-50"
+                        : isCurrent
+                          ? "border-zinc-600 bg-zinc-800 text-zinc-100"
+                          : "border-white/10 bg-white/5 text-zinc-300 hover:bg-white/10",
+                    )}
+                  >
+                    {m.san}
+                  </button>
+                );
+              })
+            )}
+          </div>
+
+          {subsequentCount > 0 && pickedSan && (
+            <div className="mb-4 rounded-2xl border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-[11px] leading-snug text-amber-100">
+              Applying this override will discard{" "}
+              <strong>
+                {subsequentCount} capture{subsequentCount === 1 ? "" : "s"}
+              </strong>{" "}
+              that came after — you&apos;ll need to recapture from this point
+              to continue.
+            </div>
+          )}
+
+          <button
+            onClick={() => {
+              if (picked) onOverride(captureIndex, picked);
+            }}
+            disabled={!canApply}
+            className="block w-full rounded-2xl bg-emerald-500/90 px-4 py-3 text-base font-semibold text-emerald-950 transition hover:bg-emerald-400 disabled:cursor-not-allowed disabled:bg-zinc-800 disabled:text-zinc-500"
+          >
+            {pickedSan
+              ? `Override move ${capture.moveNumber} → ${pickedSan}`
+              : "Pick a replacement move above"}
+          </button>
+
+          <div className="mt-4 border-t border-white/5 pt-4">
+            {confirmDelete ? (
+              <div className="flex flex-col gap-2">
+                <p className="text-[11px] text-rose-200">
+                  Delete this capture and {subsequentCount} subsequent capture
+                  {subsequentCount === 1 ? "" : "s"}?
+                </p>
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => setConfirmDelete(false)}
+                    className="flex-1 rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm text-zinc-200"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    onClick={() => onDelete(captureIndex)}
+                    className="flex-1 rounded-xl bg-rose-500/90 px-3 py-2 text-sm font-semibold text-rose-950 hover:bg-rose-400"
+                  >
+                    Delete
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <button
+                onClick={() => setConfirmDelete(true)}
+                className="block w-full rounded-xl border border-white/5 bg-white/5 px-4 py-2.5 text-sm text-rose-200 transition hover:bg-rose-500/15"
+              >
+                Delete from this move onward
+              </button>
+            )}
+          </div>
+        </div>
       </div>
     </div>
   );
