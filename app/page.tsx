@@ -24,6 +24,12 @@ export default function HomePage() {
             >
               Start playing →
             </Link>
+            <Link
+              href="/capture"
+              className="inline-flex items-center gap-2 rounded-md border border-zinc-700 bg-zinc-900 px-4 py-2 text-sm font-medium text-zinc-100 hover:bg-zinc-800"
+            >
+              Live game + capture
+            </Link>
             <a
               href="#roadmap"
               className="inline-flex items-center rounded-md border border-zinc-700 bg-zinc-900 px-4 py-2 text-sm font-medium text-zinc-100 hover:bg-zinc-800"

@@ -1,9 +1,14 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { Chess } from "chess.js";
 import clsx from "clsx";
 import { extractSquareCrops, warpBoard } from "@/lib/board-image";
 import type { Point } from "@/lib/homography";
+import { classifyBoard, type ClassifyResult, type Occupancy } from "@/lib/occupancy";
+import { inferMove, type InferResult } from "@/lib/move-inference";
+
+const STARTING_FEN = new Chess().fen();
 
 const CORNER_LABELS = ["a8", "h8", "h1", "a1"] as const;
 const CORNER_HINTS = [
@@ -23,6 +28,9 @@ export function BoardRectifier() {
   const [corners, setCorners] = useState<Point[]>([]);
   const [warpedUrl, setWarpedUrl] = useState<string | null>(null);
   const [squareUrls, setSquareUrls] = useState<string[]>([]);
+  const [occupancy, setOccupancy] = useState<ClassifyResult[]>([]);
+  const [prevFen, setPrevFen] = useState<string>(STARTING_FEN);
+  const [inferResult, setInferResult] = useState<InferResult | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -34,6 +42,14 @@ export function BoardRectifier() {
     };
   }, [imageUrl]);
 
+  function clearResults() {
+    setWarpedUrl(null);
+    setSquareUrls([]);
+    setOccupancy([]);
+    setInferResult(null);
+    setError(null);
+  }
+
   function onFileChange(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -44,9 +60,7 @@ export function BoardRectifier() {
     });
     setImageDims(null);
     setCorners([]);
-    setWarpedUrl(null);
-    setSquareUrls([]);
-    setError(null);
+    clearResults();
   }
 
   function onImageLoad() {
@@ -63,23 +77,17 @@ export function BoardRectifier() {
     const x = ((e.clientX - rect.left) / rect.width) * img.naturalWidth;
     const y = ((e.clientY - rect.top) / rect.height) * img.naturalHeight;
     setCorners((c) => [...c, { x, y }]);
-    setWarpedUrl(null);
-    setSquareUrls([]);
-    setError(null);
+    clearResults();
   }
 
   function undoCorner() {
     setCorners((c) => c.slice(0, -1));
-    setWarpedUrl(null);
-    setSquareUrls([]);
-    setError(null);
+    clearResults();
   }
 
   function resetCorners() {
     setCorners([]);
-    setWarpedUrl(null);
-    setSquareUrls([]);
-    setError(null);
+    clearResults();
   }
 
   const compute = useCallback(async () => {
@@ -87,6 +95,7 @@ export function BoardRectifier() {
     if (!img || corners.length !== 4) return;
     setBusy(true);
     setError(null);
+    setInferResult(null);
     try {
       await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
       const warped = warpBoard(
@@ -95,14 +104,36 @@ export function BoardRectifier() {
         RECTIFIED_SIZE,
       );
       const crops = extractSquareCrops(warped);
+      const classes = classifyBoard(crops);
       setWarpedUrl(warped.toDataURL("image/png"));
       setSquareUrls(crops.map((c) => c.toDataURL("image/png")));
+      setOccupancy(classes);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(false);
     }
   }, [corners]);
+
+  function runInference() {
+    if (occupancy.length !== 64) return;
+    try {
+      const result = inferMove(
+        prevFen,
+        occupancy.map((c) => c.state),
+      );
+      setInferResult(result);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  function applyInferenceResult() {
+    if (inferResult?.kind === "matched") {
+      setPrevFen(inferResult.updatedFen);
+      setInferResult(null);
+    }
+  }
 
   return (
     <div className="flex flex-col gap-6">
@@ -199,17 +230,24 @@ export function BoardRectifier() {
 
       {squareUrls.length === 64 && (
         <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 p-4">
-          <div className="mb-2 text-xs uppercase tracking-wider text-zinc-400">
-            Per-square crops · a8 top-left, h1 bottom-right
+          <div className="mb-3 flex flex-wrap items-baseline justify-between gap-2">
+            <div className="text-xs uppercase tracking-wider text-zinc-400">
+              Per-square crops + predicted occupancy
+            </div>
+            <OccupancyLegend />
           </div>
           <div className="grid w-full max-w-md grid-cols-8 gap-0.5">
             {squareUrls.map((src, i) => {
               const file = "abcdefgh"[i % 8];
               const rank = 8 - Math.floor(i / 8);
+              const cls = occupancy[i];
               return (
                 <div
                   key={i}
-                  className="relative aspect-square overflow-hidden bg-zinc-950"
+                  className={clsx(
+                    "relative aspect-square overflow-hidden bg-zinc-950",
+                    cls && occupancyRingClass(cls.state),
+                  )}
                 >
                   {/* eslint-disable-next-line @next/next/no-img-element */}
                   <img
@@ -217,6 +255,15 @@ export function BoardRectifier() {
                     alt={`${file}${rank}`}
                     className="block h-full w-full object-cover"
                   />
+                  {cls && (
+                    <span
+                      className={clsx(
+                        "pointer-events-none absolute left-0 top-0 inline-block h-2.5 w-full",
+                        occupancyDotClass(cls.state),
+                      )}
+                      style={{ opacity: 0.4 + 0.6 * cls.confidence }}
+                    />
+                  )}
                   <div className="pointer-events-none absolute bottom-0 right-0 rounded-tl bg-black/70 px-1 text-[9px] font-medium leading-tight text-zinc-200">
                     {file}
                     {rank}
@@ -225,6 +272,165 @@ export function BoardRectifier() {
               );
             })}
           </div>
+        </div>
+      )}
+
+      {occupancy.length === 64 && (
+        <InferencePanel
+          prevFen={prevFen}
+          onChangePrevFen={(f) => {
+            setPrevFen(f);
+            setInferResult(null);
+          }}
+          inferResult={inferResult}
+          onInfer={runInference}
+          onAccept={applyInferenceResult}
+        />
+      )}
+    </div>
+  );
+}
+
+function occupancyRingClass(state: Occupancy): string {
+  if (state === "white") return "ring-1 ring-inset ring-zinc-100/70";
+  if (state === "black") return "ring-1 ring-inset ring-zinc-900";
+  return "";
+}
+
+function occupancyDotClass(state: Occupancy): string {
+  if (state === "white") return "bg-zinc-100";
+  if (state === "black") return "bg-zinc-900";
+  return "bg-emerald-500/0";
+}
+
+function OccupancyLegend() {
+  return (
+    <div className="flex items-center gap-3 text-[10px] uppercase tracking-wider text-zinc-500">
+      <span className="inline-flex items-center gap-1">
+        <span className="inline-block h-2 w-3 bg-zinc-100" /> White
+      </span>
+      <span className="inline-flex items-center gap-1">
+        <span className="inline-block h-2 w-3 bg-zinc-900 ring-1 ring-zinc-700" />
+        Black
+      </span>
+      <span className="inline-flex items-center gap-1">
+        <span className="inline-block h-2 w-3 bg-transparent ring-1 ring-zinc-700" />
+        Empty
+      </span>
+    </div>
+  );
+}
+
+function InferencePanel({
+  prevFen,
+  onChangePrevFen,
+  inferResult,
+  onInfer,
+  onAccept,
+}: {
+  prevFen: string;
+  onChangePrevFen: (fen: string) => void;
+  inferResult: InferResult | null;
+  onInfer: () => void;
+  onAccept: () => void;
+}) {
+  return (
+    <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 p-4">
+      <div className="mb-2 flex flex-wrap items-baseline justify-between gap-2">
+        <div className="text-xs uppercase tracking-wider text-zinc-400">
+          Move inference
+        </div>
+        <button
+          onClick={() => onChangePrevFen(STARTING_FEN)}
+          className="text-[10px] uppercase tracking-wider text-zinc-500 hover:text-zinc-300"
+        >
+          Reset to start position
+        </button>
+      </div>
+      <p className="mb-3 text-xs text-zinc-400">
+        Diff the predicted occupancy against the previous FEN, then pick the
+        unique legal move that matches.
+      </p>
+      <label className="mb-3 block">
+        <span className="mb-1 block text-[10px] uppercase tracking-wider text-zinc-500">
+          Previous FEN
+        </span>
+        <input
+          type="text"
+          value={prevFen}
+          onChange={(e) => onChangePrevFen(e.target.value)}
+          spellCheck={false}
+          className="w-full rounded border border-zinc-700 bg-zinc-950 px-2 py-1 font-mono text-xs text-zinc-100"
+        />
+      </label>
+      <button
+        onClick={onInfer}
+        className="rounded-md border border-emerald-500/40 bg-emerald-500/15 px-3 py-1.5 text-sm font-medium text-emerald-200 hover:bg-emerald-500/25"
+      >
+        Infer move
+      </button>
+
+      {inferResult && (
+        <div className="mt-4 rounded-md border border-zinc-800 bg-zinc-950/60 p-3 text-sm">
+          {inferResult.kind === "matched" && (
+            <>
+              <div className="mb-1 text-xs uppercase tracking-wider text-emerald-300">
+                Matched
+              </div>
+              <div className="mb-2 text-base">
+                <span className="font-mono text-emerald-200">
+                  {inferResult.move.san}
+                </span>{" "}
+                <span className="text-zinc-500">
+                  ({inferResult.move.from} → {inferResult.move.to})
+                </span>
+              </div>
+              <div className="mb-2 font-mono text-[11px] text-zinc-400 break-all">
+                {inferResult.updatedFen}
+              </div>
+              <button
+                onClick={onAccept}
+                className="rounded-md border border-emerald-500/40 bg-emerald-500/15 px-2.5 py-1 text-xs text-emerald-200 hover:bg-emerald-500/25"
+              >
+                Accept · use as next previous FEN
+              </button>
+            </>
+          )}
+
+          {inferResult.kind === "ambiguous" && (
+            <>
+              <div className="mb-1 text-xs uppercase tracking-wider text-amber-300">
+                Ambiguous · {inferResult.candidates.length} candidates
+              </div>
+              <div className="text-zinc-300">
+                {inferResult.candidates.map((m) => m.san).join(" · ")}
+              </div>
+              <div className="mt-2 text-xs text-zinc-500">
+                Likely a promotion — occupancy alone can&apos;t tell Q/R/B/N
+                apart.
+              </div>
+            </>
+          )}
+
+          {inferResult.kind === "none" && (
+            <>
+              <div className="mb-1 text-xs uppercase tracking-wider text-rose-300">
+                No legal move matches the observed diff
+              </div>
+              <div className="mb-2 text-xs text-zinc-400">
+                {inferResult.diff.length === 0
+                  ? "Predicted occupancy is identical to the previous position."
+                  : `Squares that changed: ${inferResult.diff
+                      .map((d) => `${d.square} (${d.before}→${d.after})`)
+                      .join(", ")}`}
+              </div>
+              <div className="text-[11px] text-zinc-500">
+                Likely cause: a misclassified square. Inspect the per-square
+                crops above — pieces with shadows or unusual lighting are
+                the most common offenders.
+              </div>
+            </>
+          )}
         </div>
       )}
     </div>
