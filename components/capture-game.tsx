@@ -656,6 +656,14 @@ export function CaptureGame() {
       baselineRef.current = null;
       previousFrameRef.current = null;
     }
+    // In test mode, photo 0 is the starting position — it was just consumed
+    // for baseline + previousFrame. Advance the pointer so the first clock
+    // tap reads photo 1 (the position after white's first half-move), not
+    // photo 0 again (which would diff against itself and produce no move).
+    if (testModeRef.current) {
+      testFrameIdxRef.current = 1;
+      setTestFrameIdx(1);
+    }
     setPhase("playing");
   }
 
@@ -1085,8 +1093,12 @@ export function CaptureGame() {
   const calibrationHint = busy
     ? "Detecting board automatically…"
     : corners.length === 4
-      ? "Drag any corner to fine-tune, then start the clock."
-      : CORNER_HINTS[corners.length];
+      ? testMode
+        ? "Starting position (photo 1). Drag any corner to fine-tune, then start the clock to feed in the rest."
+        : "Drag any corner to fine-tune, then start the clock."
+      : testMode
+        ? `Starting position (photo 1 of ${testFrames.length}). ${CORNER_HINTS[corners.length]}`
+        : CORNER_HINTS[corners.length];
 
   return (
     <div className="fixed inset-0 flex flex-col overflow-hidden bg-zinc-950 text-zinc-100 select-none">
@@ -1874,7 +1886,7 @@ function SettingsScreen({
           <div className="rounded-2xl border border-white/5 bg-white/5 p-3">
             <label className="flex items-center justify-between gap-3">
               <span className="text-[13px] font-medium text-zinc-100">
-                Use uploaded photos
+                Replay from photos
               </span>
               <input
                 type="checkbox"
@@ -1884,23 +1896,57 @@ function SettingsScreen({
               />
             </label>
             <p className="mt-1 text-[11px] leading-snug text-zinc-400">
-              Test the pipeline against still photos instead of the live
-              camera. First photo = starting position; subsequent files are
-              consumed per clock tap.
+              Skip the live camera and feed the pipeline a sequence of
+              still photos instead.
             </p>
             {testMode && (
-              <label className="mt-3 inline-flex cursor-pointer items-center justify-center gap-2 rounded-full border border-white/10 bg-white/10 px-3 py-1.5 text-[12px] text-zinc-100 hover:bg-white/15">
-                <input
-                  type="file"
-                  accept="image/*"
-                  multiple
-                  onChange={(e) => onLoadTestFrames(e.target.files)}
-                  className="hidden"
-                />
-                {testFrameCount > 0
-                  ? `Replace photos · ${testFrameCount} loaded`
-                  : "Choose photos"}
-              </label>
+              <div className="mt-3 space-y-2">
+                <ol className="space-y-1 rounded-xl bg-black/30 px-3 py-2 text-[11px] leading-snug text-zinc-300">
+                  <li>
+                    <span className="font-medium text-emerald-300">
+                      Photo 1
+                    </span>{" "}
+                    — the starting position, before any moves.
+                  </li>
+                  <li>
+                    <span className="font-medium text-emerald-300">
+                      Photos 2…N
+                    </span>{" "}
+                    — one per half-move, in order (white, black, white…).
+                    Each clock tap advances to the next photo.
+                  </li>
+                </ol>
+                <label className="inline-flex cursor-pointer items-center justify-center gap-2 rounded-full border border-white/10 bg-white/10 px-3 py-1.5 text-[12px] text-zinc-100 hover:bg-white/15">
+                  <input
+                    type="file"
+                    accept="image/*"
+                    multiple
+                    onChange={(e) => onLoadTestFrames(e.target.files)}
+                    className="hidden"
+                  />
+                  {testFrameCount > 0 ? "Replace photos" : "Choose photos"}
+                </label>
+                {testFrameCount > 0 && (
+                  <p className="text-[11px] text-zinc-400">
+                    {testFrameCount} loaded ·{" "}
+                    <span className="text-zinc-200">
+                      1 starting + {testFrameCount - 1} half-move
+                      {testFrameCount - 1 === 1 ? "" : "s"}
+                    </span>
+                    {testFrameCount >= 3 && (
+                      <>
+                        {" "}
+                        ({Math.floor((testFrameCount - 1) / 2)} full turn
+                        {Math.floor((testFrameCount - 1) / 2) === 1 ? "" : "s"}
+                        {(testFrameCount - 1) % 2 === 1
+                          ? " + white's move"
+                          : ""}
+                        )
+                      </>
+                    )}
+                  </p>
+                )}
+              </div>
             )}
           </div>
         </SettingsSection>
