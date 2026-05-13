@@ -1,4 +1,5 @@
 import type { Point } from "./homography";
+import { warpBoard } from "./board-image";
 
 export type DetectionResult = {
   /**
@@ -135,11 +136,107 @@ export function autoDetectBoardCorners(
     y: p.y / scale,
   })) as [Point, Point, Point, Point];
 
+  // The variance/gradient detector frequently latches onto the *outer*
+  // edge of the board — the printed label border, or the white paper
+  // around a vinyl mat — instead of the inner 8×8 playing surface.
+  // Iteratively shrink the corners toward the centroid and pick whichever
+  // inset maximizes light-vs-dark cell separation in the rectified output.
+  // That value snaps to the true 8×8 grid regardless of how much label
+  // border the photo includes.
+  const refined = snapCornersToGrid(source, cornersOrig);
+
   return {
-    corners: cornersOrig,
+    corners: refined,
     confidence: coverage,
     oriented: false,
   };
+}
+
+/**
+ * Iteratively inset the corners toward the polygon centroid; pick whichever
+ * inset produces the rectified output with the largest light/dark cell
+ * separation. Exported for reuse by per-frame refinement.
+ */
+export function snapCornersToGrid(
+  source: HTMLImageElement | HTMLCanvasElement,
+  initial: [Point, Point, Point, Point],
+): [Point, Point, Point, Point] {
+  const insets = [0, 0.03, 0.05, 0.07, 0.09, 0.11, 0.13, 0.15];
+  let bestCorners = initial;
+  let bestScore = scoreCheckerboardSeparation(source, initial);
+  for (let i = 1; i < insets.length; i++) {
+    const candidate = insetCorners(initial, insets[i]);
+    const score = scoreCheckerboardSeparation(source, candidate);
+    if (score > bestScore) {
+      bestScore = score;
+      bestCorners = candidate;
+    }
+  }
+  return bestCorners;
+}
+
+function insetCorners(
+  corners: [Point, Point, Point, Point],
+  factor: number,
+): [Point, Point, Point, Point] {
+  const cx = (corners[0].x + corners[1].x + corners[2].x + corners[3].x) / 4;
+  const cy = (corners[0].y + corners[1].y + corners[2].y + corners[3].y) / 4;
+  return corners.map((p) => ({
+    x: p.x + (cx - p.x) * factor,
+    y: p.y + (cy - p.y) * factor,
+  })) as [Point, Point, Point, Point];
+}
+
+/**
+ * Score the 8×8 layout produced by `corners`. Cells alternate by (rank+file)
+ * parity, so a well-cropped board has two distinct mean luminances. The
+ * larger the separation, the tighter the crop on the playing surface (and
+ * the less label/border bleed into each cell).
+ */
+function scoreCheckerboardSeparation(
+  source: HTMLImageElement | HTMLCanvasElement,
+  corners: [Point, Point, Point, Point],
+): number {
+  const SIZE = 192;
+  try {
+    const warped = warpBoard(source, corners, SIZE);
+    const ctx = warped.getContext("2d", { willReadFrequently: true });
+    if (!ctx) return -1;
+    const cellSize = SIZE / 8;
+    const innerPad = cellSize * 0.22;
+    let aSum = 0;
+    let aN = 0;
+    let bSum = 0;
+    let bN = 0;
+    for (let r = 0; r < 8; r++) {
+      for (let f = 0; f < 8; f++) {
+        const x = Math.round(f * cellSize + innerPad);
+        const y = Math.round(r * cellSize + innerPad);
+        const cw = Math.round(cellSize - 2 * innerPad);
+        const ch = Math.round(cellSize - 2 * innerPad);
+        if (cw <= 0 || ch <= 0) continue;
+        const data = ctx.getImageData(x, y, cw, ch).data;
+        let sum = 0;
+        const n = data.length / 4;
+        for (let i = 0; i < data.length; i += 4) {
+          sum +=
+            0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+        }
+        const mean = sum / n;
+        if ((r + f) % 2 === 0) {
+          aSum += mean;
+          aN++;
+        } else {
+          bSum += mean;
+          bN++;
+        }
+      }
+    }
+    if (aN === 0 || bN === 0) return -1;
+    return Math.abs(aSum / aN - bSum / bN);
+  } catch {
+    return -1;
+  }
 }
 
 function andMask(a: Uint8Array, b: Uint8Array): Uint8Array {
