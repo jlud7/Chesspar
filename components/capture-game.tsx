@@ -13,8 +13,18 @@ import { Chess } from "chess.js";
 import clsx from "clsx";
 import { extractSquareCrops, warpBoard } from "@/lib/board-image";
 import type { Point } from "@/lib/homography";
-import { classifyBoard } from "@/lib/occupancy";
+import {
+  classifyBoard,
+  classifyBoardCalibrated,
+  computeBaseline,
+  type BaselineSignature,
+} from "@/lib/occupancy";
 import { inferMove } from "@/lib/move-inference";
+import {
+  autoDetectBoardCorners,
+  rotateCorners,
+  scorePlayingOrientation,
+} from "@/lib/board-detection";
 
 type Side = "white" | "black";
 type Phase = "settings" | "calibrating" | "playing" | "paused" | "ended";
@@ -82,12 +92,20 @@ export function CaptureGame() {
   const cornersRef = useRef<Point[]>([]);
   const [videoDims, setVideoDims] = useState<VideoDims | null>(null);
 
+  const [testMode, setTestMode] = useState(false);
+  const [testFrames, setTestFrames] = useState<HTMLImageElement[]>([]);
+  const [testFrameIdx, setTestFrameIdx] = useState(0);
+  const testFramesRef = useRef<HTMLImageElement[]>([]);
+  const testFrameIdxRef = useRef(0);
+  const testFrameUrlsRef = useRef<string[]>([]);
+
   const [lastMove, setLastMove] = useState<
     { san: string; side: Side } | null
   >(null);
   const [inferring, setInferring] = useState(false);
 
   const chessRef = useRef<Chess>(new Chess());
+  const baselineRef = useRef<BaselineSignature | null>(null);
   const [pgn, setPgn] = useState<string>("");
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -100,6 +118,14 @@ export function CaptureGame() {
   useEffect(() => {
     cornersRef.current = corners;
   }, [corners]);
+
+  useEffect(() => {
+    testFramesRef.current = testFrames;
+  }, [testFrames]);
+
+  useEffect(() => {
+    testFrameIdxRef.current = testFrameIdx;
+  }, [testFrameIdx]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -200,14 +226,14 @@ export function CaptureGame() {
   }, []);
 
   useEffect(() => {
-    if (phase === "settings" || phase === "ended") {
+    if (phase === "settings" || phase === "ended" || testMode) {
       stopCamera();
       return;
     }
     if (!streamRef.current) {
       void startCamera();
     }
-  }, [phase, startCamera, stopCamera]);
+  }, [phase, testMode, startCamera, stopCamera]);
 
   useEffect(() => {
     if (phase !== "playing") return;
@@ -321,6 +347,42 @@ export function CaptureGame() {
     return c;
   }
 
+  function imageToCanvas(img: HTMLImageElement): HTMLCanvasElement | null {
+    if (!img.naturalWidth) return null;
+    const c = document.createElement("canvas");
+    c.width = img.naturalWidth;
+    c.height = img.naturalHeight;
+    const ctx = c.getContext("2d");
+    if (!ctx) return null;
+    ctx.drawImage(img, 0, 0);
+    return c;
+  }
+
+  /**
+   * Grab the next frame to feed into the pipeline.
+   * In test mode this consumes the current test image and advances the
+   * pointer; in camera mode it grabs from the live video.
+   */
+  function grabPipelineFrame(advance: boolean): HTMLCanvasElement | null {
+    if (testMode) {
+      const frames = testFramesRef.current;
+      const idx = testFrameIdxRef.current;
+      const img = frames[idx];
+      if (!img) return null;
+      const c = imageToCanvas(img);
+      if (advance) setTestFrameIdx((i) => i + 1);
+      return c;
+    }
+    return grabVideoFrame();
+  }
+
+  function previewSource(): HTMLCanvasElement | HTMLImageElement | null {
+    if (testMode) {
+      return testFramesRef.current[testFrameIdxRef.current] ?? null;
+    }
+    return grabVideoFrame();
+  }
+
   function canvasToBlobUrl(c: HTMLCanvasElement): Promise<string | null> {
     return new Promise((resolve) => {
       c.toBlob(
@@ -336,6 +398,7 @@ export function CaptureGame() {
 
   function startSession() {
     chessRef.current = new Chess();
+    baselineRef.current = null;
     captures.forEach((c) => URL.revokeObjectURL(c.url));
     setCaptures([]);
     setLastMove(null);
@@ -345,20 +408,139 @@ export function CaptureGame() {
     setBlackMs(tc.baseSeconds * 1000);
     setWinner(null);
     setPgn("");
-    if (corners.length === 4) {
+    setTestFrameIdx(0);
+    if (testMode) {
+      // In test mode the first uploaded image is the "starting position".
+      // Run auto-detection on it before the clock starts.
+      setCorners([]);
+      setPhase("calibrating");
+    } else if (corners.length === 4) {
       setPhase("playing");
     } else {
       setPhase("calibrating");
     }
   }
 
+  async function loadTestFrames(files: FileList | null) {
+    if (!files || files.length === 0) return;
+    setBusy(false);
+    setCameraError(null);
+    // Revoke any existing test frame URLs
+    testFrameUrlsRef.current.forEach((u) => URL.revokeObjectURL(u));
+    testFrameUrlsRef.current = [];
+    const loaded: HTMLImageElement[] = [];
+    const urls: string[] = [];
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      const url = URL.createObjectURL(file);
+      urls.push(url);
+      try {
+        const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+          const im = new Image();
+          im.onload = () => resolve(im);
+          im.onerror = () => reject(new Error("load failed"));
+          im.src = url;
+        });
+        loaded.push(img);
+      } catch {
+        URL.revokeObjectURL(url);
+      }
+    }
+    testFrameUrlsRef.current = urls;
+    setTestFrames(loaded);
+    setTestFrameIdx(0);
+  }
+
+  // We keep busy state for the in-calibration auto-detect spinner.
+  const [busy, setBusy] = useState(false);
+
+  const tryAutoCalibrate = useCallback(async () => {
+    if (cornersRef.current.length === 4) return;
+    const source = previewSource();
+    if (!source) return;
+    if (source instanceof HTMLImageElement && !source.naturalWidth) return;
+    if (source instanceof HTMLCanvasElement && (!source.width || !source.height)) return;
+
+    setBusy(true);
+    try {
+      // Run inside rAF so the UI repaints first
+      await new Promise<void>((r) => requestAnimationFrame(() => r()));
+      const detection = autoDetectBoardCorners(source);
+      if (!detection) {
+        setBusy(false);
+        return;
+      }
+      let bestScore = -Infinity;
+      let bestCorners: [Point, Point, Point, Point] = detection.corners;
+      for (let k = 0; k < 4; k++) {
+        const rotated = rotateCorners(detection.corners, k);
+        try {
+          const warped = warpBoard(source, rotated, 256);
+          const crops = extractSquareCrops(warped);
+          const occ = classifyBoard(crops).map((c) => c.state);
+          const score = scorePlayingOrientation(occ);
+          if (score > bestScore) {
+            bestScore = score;
+            bestCorners = rotated;
+          }
+        } catch {
+          /* skip invalid rotation */
+        }
+      }
+      setCorners(bestCorners);
+    } finally {
+      setBusy(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    if (phase !== "calibrating") return;
+    if (corners.length === 4) return;
+    void tryAutoCalibrate();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phase, videoDims, testFrames]);
+
+  useEffect(() => {
+    if (!testMode) return;
+    const img = testFrames[testFrameIdx];
+    if (img && img.naturalWidth) {
+      setVideoDims({ w: img.naturalWidth, h: img.naturalHeight });
+    }
+  }, [testMode, testFrames, testFrameIdx]);
+
+  useEffect(() => {
+    return () => {
+      testFrameUrlsRef.current.forEach((u) => URL.revokeObjectURL(u));
+    };
+  }, []);
+
   function startPlayingFromCalibration() {
     if (cornersRef.current.length !== 4) return;
+    // Learn a per-board baseline from the current rectified frame. The
+    // calibration phase is *defined* as the starting position, so the
+    // 32 empty squares + 16 white + 16 black piece squares give us
+    // labelled reference signatures.
+    try {
+      const source = previewSource();
+      if (source) {
+        const warped = warpBoard(
+          source,
+          cornersRef.current as [Point, Point, Point, Point],
+          RECTIFIED_SIZE,
+        );
+        const crops = extractSquareCrops(warped);
+        baselineRef.current = computeBaseline(crops);
+      }
+    } catch {
+      baselineRef.current = null;
+    }
     setPhase("playing");
   }
 
   function recalibrate() {
     setCorners([]);
+    baselineRef.current = null;
     setPhase("calibrating");
   }
 
@@ -401,7 +583,7 @@ export function CaptureGame() {
   async function runInferencePipeline(side: Side, moveNumber: number) {
     const cs = cornersRef.current;
     if (cs.length !== 4) {
-      const frame = grabVideoFrame();
+      const frame = grabPipelineFrame(true);
       const url = frame ? await canvasToBlobUrl(frame) : null;
       if (url) {
         setCaptures((prev) => [
@@ -418,7 +600,7 @@ export function CaptureGame() {
       return;
     }
 
-    const frame = grabVideoFrame();
+    const frame = grabPipelineFrame(true);
     if (!frame) return;
     const url = await canvasToBlobUrl(frame);
     if (!url) return;
@@ -431,7 +613,11 @@ export function CaptureGame() {
         RECTIFIED_SIZE,
       );
       const crops = extractSquareCrops(warped);
-      const occupancy = classifyBoard(crops).map((c) => c.state);
+      const occupancy = (
+        baselineRef.current
+          ? classifyBoardCalibrated(crops, baselineRef.current)
+          : classifyBoard(crops)
+      ).map((c) => c.state);
       const result = inferMove(chessRef.current.fen(), occupancy);
       if (result.kind === "matched") {
         const move = result.move;
@@ -512,10 +698,11 @@ export function CaptureGame() {
 
   const tcLabel = useMemo(() => describeTc(tc), [tc]);
 
-  const calibrationHint =
-    corners.length < 4
-      ? CORNER_HINTS[corners.length]
-      : "All four corners set. Confirm to start the clock.";
+  const calibrationHint = busy
+    ? "Detecting board automatically…"
+    : corners.length === 4
+      ? "Corners found. Confirm to start the clock."
+      : CORNER_HINTS[corners.length];
 
   return (
     <div className="fixed inset-0 flex flex-col overflow-hidden bg-zinc-950 text-zinc-100 select-none">
@@ -567,14 +754,23 @@ export function CaptureGame() {
                 : { aspectRatio: "16/9", width: 1, height: 1 }
             }
           >
-            <video
-              ref={videoRef}
-              muted
-              playsInline
-              autoPlay
-              onLoadedMetadata={onVideoMeta}
-              className="block h-full w-full bg-black"
-            />
+            {testMode && testFrames[testFrameIdx] ? (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img
+                src={testFrames[testFrameIdx].src}
+                alt={`Test frame ${testFrameIdx + 1}`}
+                className="block h-full w-full bg-black object-contain"
+              />
+            ) : (
+              <video
+                ref={videoRef}
+                muted
+                playsInline
+                autoPlay
+                onLoadedMetadata={onVideoMeta}
+                className="block h-full w-full bg-black"
+              />
+            )}
             {phase === "calibrating" && videoDims && (
               <CalibrationOverlay corners={corners} videoDims={videoDims} />
             )}
@@ -627,6 +823,15 @@ export function CaptureGame() {
             }
           }}
           cameraError={cameraError}
+          testMode={testMode}
+          onToggleTestMode={(on) => {
+            setTestMode(on);
+            if (on) {
+              setCorners([]);
+            }
+          }}
+          testFrameCount={testFrames.length}
+          onLoadTestFrames={(files) => void loadTestFrames(files)}
         />
       )}
 
@@ -897,6 +1102,10 @@ function SettingsScreen({
   hasSavedCorners,
   onClearCorners,
   cameraError,
+  testMode,
+  onToggleTestMode,
+  testFrameCount,
+  onLoadTestFrames,
 }: {
   tc: TimeControl;
   onChangeTc: (tc: TimeControl) => void;
@@ -904,6 +1113,10 @@ function SettingsScreen({
   hasSavedCorners: boolean;
   onClearCorners: () => void;
   cameraError: string | null;
+  testMode: boolean;
+  onToggleTestMode: (on: boolean) => void;
+  testFrameCount: number;
+  onLoadTestFrames: (files: FileList | null) => void;
 }) {
   return (
     <div className="relative flex flex-1 flex-col overflow-y-auto px-6 py-10">
@@ -947,7 +1160,7 @@ function SettingsScreen({
 
         <CustomTcEditor tc={tc} onChange={onChangeTc} />
 
-        {hasSavedCorners && (
+        {hasSavedCorners && !testMode && (
           <div className="mt-4 flex items-center justify-between rounded-md border border-zinc-800 bg-zinc-900/60 px-3 py-2 text-xs text-zinc-300">
             <span>Board corners saved from last session.</span>
             <button
@@ -959,17 +1172,59 @@ function SettingsScreen({
           </div>
         )}
 
+        <div className="mt-4 rounded-lg border border-zinc-800 bg-zinc-900/60 p-3">
+          <label className="flex items-center justify-between gap-3">
+            <span className="text-xs uppercase tracking-wider text-zinc-300">
+              Test mode · use uploaded photos
+            </span>
+            <input
+              type="checkbox"
+              checked={testMode}
+              onChange={(e) => onToggleTestMode(e.target.checked)}
+              className="h-4 w-4 cursor-pointer accent-emerald-500"
+            />
+          </label>
+          {testMode && (
+            <div className="mt-3 flex flex-col gap-2">
+              <label className="inline-flex cursor-pointer items-center justify-center gap-2 rounded-md border border-zinc-700 bg-zinc-800 px-3 py-1.5 text-xs text-zinc-200 hover:bg-zinc-700">
+                <input
+                  type="file"
+                  accept="image/*"
+                  multiple
+                  onChange={(e) => onLoadTestFrames(e.target.files)}
+                  className="hidden"
+                />
+                {testFrameCount > 0
+                  ? `Replace photos · ${testFrameCount} loaded`
+                  : "Choose test photos (first = starting position)"}
+              </label>
+              <p className="text-[11px] text-zinc-500">
+                The first photo is used as the starting position. Each
+                subsequent photo is consumed when the active player taps
+                their clock. Camera is disabled.
+              </p>
+            </div>
+          )}
+        </div>
+
         <button
           onClick={onStart}
-          className="mt-6 w-full rounded-md border border-emerald-500/50 bg-emerald-500/20 px-4 py-3 text-base font-medium text-emerald-100 hover:bg-emerald-500/30"
+          disabled={testMode && testFrameCount === 0}
+          className="mt-6 w-full rounded-md border border-emerald-500/50 bg-emerald-500/20 px-4 py-3 text-base font-medium text-emerald-100 hover:bg-emerald-500/30 disabled:cursor-not-allowed disabled:opacity-40"
         >
-          {hasSavedCorners ? "Start game" : "Calibrate & start"}
+          {testMode
+            ? "Start (test mode)"
+            : hasSavedCorners
+              ? "Start game"
+              : "Calibrate & start"}
         </button>
 
-        <p className="mt-3 text-center text-[11px] text-zinc-500">
-          You&apos;ll be asked for camera permission so we can capture each
-          position.
-        </p>
+        {!testMode && (
+          <p className="mt-3 text-center text-[11px] text-zinc-500">
+            You&apos;ll be asked for camera permission so we can capture each
+            position.
+          </p>
+        )}
 
         {cameraError && (
           <div className="mt-4 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
