@@ -9,24 +9,35 @@ import {
   type ReactNode,
 } from "react";
 import Link from "next/link";
+import { Chess } from "chess.js";
 import clsx from "clsx";
+import { extractSquareCrops, warpBoard } from "@/lib/board-image";
+import type { Point } from "@/lib/homography";
+import { classifyBoard } from "@/lib/occupancy";
+import { inferMove } from "@/lib/move-inference";
 
 type Side = "white" | "black";
-type Phase = "settings" | "playing" | "paused" | "ended";
+type Phase = "settings" | "calibrating" | "playing" | "paused" | "ended";
 
-type TimeControl = {
-  baseSeconds: number;
-  incrementSeconds: number;
-};
+type TimeControl = { baseSeconds: number; incrementSeconds: number };
+
+type CaptureInference =
+  | { kind: "matched"; san: string; from: string; to: string; fen: string }
+  | { kind: "ambiguous"; sans: string[] }
+  | { kind: "unmatched"; diff: string[] }
+  | { kind: "skipped"; reason: string };
 
 type Capture = {
   side: Side;
   moveNumber: number;
   url: string;
   timestamp: number;
+  inference: CaptureInference;
 };
 
 type WakeLock = { release: () => Promise<void> };
+
+type VideoDims = { w: number; h: number };
 
 const PRESETS: { label: string; tc: TimeControl }[] = [
   { label: "1 min · Bullet", tc: { baseSeconds: 60, incrementSeconds: 0 } },
@@ -39,7 +50,16 @@ const PRESETS: { label: string; tc: TimeControl }[] = [
 ];
 
 const DEFAULT_TC = PRESETS[2].tc;
-const STORAGE_KEY = "chesspar:capture-tc-v1";
+const TC_STORAGE = "chesspar:capture-tc-v1";
+const CORNERS_STORAGE = "chesspar:capture-corners-v1";
+const RECTIFIED_SIZE = 384;
+const CORNER_LABELS = ["a8", "h8", "h1", "a1"] as const;
+const CORNER_HINTS = [
+  "Tap the a8 corner — Black's queenside-rook corner",
+  "Tap the h8 corner — Black's kingside-rook corner",
+  "Tap the h1 corner — White's kingside-rook corner",
+  "Tap the a1 corner — White's queenside-rook corner",
+];
 
 export function CaptureGame() {
   const [phase, setPhase] = useState<Phase>("settings");
@@ -58,6 +78,18 @@ export function CaptureGame() {
   const [winner, setWinner] = useState<Side | null>(null);
   const [hydrated, setHydrated] = useState(false);
 
+  const [corners, setCorners] = useState<Point[]>([]);
+  const cornersRef = useRef<Point[]>([]);
+  const [videoDims, setVideoDims] = useState<VideoDims | null>(null);
+
+  const [lastMove, setLastMove] = useState<
+    { san: string; side: Side } | null
+  >(null);
+  const [inferring, setInferring] = useState(false);
+
+  const chessRef = useRef<Chess>(new Chess());
+  const [pgn, setPgn] = useState<string>("");
+
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const wakeLockRef = useRef<WakeLock | null>(null);
@@ -66,14 +98,18 @@ export function CaptureGame() {
   const [flashing, setFlashing] = useState<Side | null>(null);
 
   useEffect(() => {
+    cornersRef.current = corners;
+  }, [corners]);
+
+  useEffect(() => {
     if (typeof window === "undefined") {
       setHydrated(true);
       return;
     }
     try {
-      const raw = window.localStorage.getItem(STORAGE_KEY);
-      if (raw) {
-        const parsed = JSON.parse(raw) as Partial<TimeControl>;
+      const rawTc = window.localStorage.getItem(TC_STORAGE);
+      if (rawTc) {
+        const parsed = JSON.parse(rawTc) as Partial<TimeControl>;
         if (
           typeof parsed.baseSeconds === "number" &&
           typeof parsed.incrementSeconds === "number" &&
@@ -85,6 +121,13 @@ export function CaptureGame() {
           });
         }
       }
+      const rawCorners = window.localStorage.getItem(CORNERS_STORAGE);
+      if (rawCorners) {
+        const parsed = JSON.parse(rawCorners) as Point[];
+        if (Array.isArray(parsed) && parsed.length === 4) {
+          setCorners(parsed);
+        }
+      }
     } catch {
       /* ignore */
     }
@@ -94,11 +137,22 @@ export function CaptureGame() {
   useEffect(() => {
     if (!hydrated || typeof window === "undefined") return;
     try {
-      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(tc));
+      window.localStorage.setItem(TC_STORAGE, JSON.stringify(tc));
     } catch {
-      /* ignore quota */
+      /* ignore */
     }
   }, [tc, hydrated]);
+
+  useEffect(() => {
+    if (!hydrated || typeof window === "undefined") return;
+    try {
+      if (corners.length === 4) {
+        window.localStorage.setItem(CORNERS_STORAGE, JSON.stringify(corners));
+      }
+    } catch {
+      /* ignore */
+    }
+  }, [corners, hydrated]);
 
   useEffect(() => {
     if (phase === "settings") {
@@ -207,20 +261,13 @@ export function CaptureGame() {
     if (whiteMs <= 0) {
       setPhase("ended");
       setWinner("black");
+      setPgn(chessRef.current.pgn());
     } else if (blackMs <= 0) {
       setPhase("ended");
       setWinner("white");
+      setPgn(chessRef.current.pgn());
     }
   }, [phase, whiteMs, blackMs]);
-
-  useEffect(() => {
-    return () => {
-      stopCamera();
-      if (flashTimeoutRef.current) {
-        window.clearTimeout(flashTimeoutRef.current);
-      }
-    };
-  }, [stopCamera]);
 
   const capturedUrlsRef = useRef<string[]>([]);
   useEffect(() => {
@@ -230,8 +277,12 @@ export function CaptureGame() {
   useEffect(() => {
     return () => {
       capturedUrlsRef.current.forEach((u) => URL.revokeObjectURL(u));
+      stopCamera();
+      if (flashTimeoutRef.current) {
+        window.clearTimeout(flashTimeoutRef.current);
+      }
     };
-  }, []);
+  }, [stopCamera]);
 
   const playTickSound = useCallback(() => {
     if (!soundOn) return;
@@ -258,41 +309,57 @@ export function CaptureGame() {
     }
   }, [soundOn]);
 
-  const captureFrame = useCallback(
-    (side: Side, moveNumber: number) => {
-      const v = videoRef.current;
-      if (!v || !v.videoWidth) return;
-      const c = document.createElement("canvas");
-      c.width = v.videoWidth;
-      c.height = v.videoHeight;
-      const ctx = c.getContext("2d");
-      if (!ctx) return;
-      ctx.drawImage(v, 0, 0);
+  function grabVideoFrame(): HTMLCanvasElement | null {
+    const v = videoRef.current;
+    if (!v || !v.videoWidth) return null;
+    const c = document.createElement("canvas");
+    c.width = v.videoWidth;
+    c.height = v.videoHeight;
+    const ctx = c.getContext("2d");
+    if (!ctx) return null;
+    ctx.drawImage(v, 0, 0);
+    return c;
+  }
+
+  function canvasToBlobUrl(c: HTMLCanvasElement): Promise<string | null> {
+    return new Promise((resolve) => {
       c.toBlob(
         (blob) => {
-          if (!blob) return;
-          const url = URL.createObjectURL(blob);
-          setCaptures((prev) => [
-            ...prev,
-            { side, moveNumber, url, timestamp: Date.now() },
-          ]);
+          if (!blob) return resolve(null);
+          resolve(URL.createObjectURL(blob));
         },
         "image/jpeg",
         0.85,
       );
-    },
-    [],
-  );
+    });
+  }
 
-  function start() {
-    setWhiteMs(tc.baseSeconds * 1000);
-    setBlackMs(tc.baseSeconds * 1000);
-    setActive("white");
-    setMoves({ white: 0, black: 0 });
+  function startSession() {
+    chessRef.current = new Chess();
     captures.forEach((c) => URL.revokeObjectURL(c.url));
     setCaptures([]);
+    setLastMove(null);
+    setMoves({ white: 0, black: 0 });
+    setActive("white");
+    setWhiteMs(tc.baseSeconds * 1000);
+    setBlackMs(tc.baseSeconds * 1000);
     setWinner(null);
+    setPgn("");
+    if (corners.length === 4) {
+      setPhase("playing");
+    } else {
+      setPhase("calibrating");
+    }
+  }
+
+  function startPlayingFromCalibration() {
+    if (cornersRef.current.length !== 4) return;
     setPhase("playing");
+  }
+
+  function recalibrate() {
+    setCorners([]);
+    setPhase("calibrating");
   }
 
   function backToSettings() {
@@ -301,7 +368,119 @@ export function CaptureGame() {
   }
 
   function togglePause() {
-    setPhase((p) => (p === "playing" ? "paused" : p === "paused" ? "playing" : p));
+    setPhase((p) =>
+      p === "playing" ? "paused" : p === "paused" ? "playing" : p,
+    );
+  }
+
+  const onVideoMeta = useCallback(() => {
+    const v = videoRef.current;
+    if (!v) return;
+    if (v.videoWidth > 0 && v.videoHeight > 0) {
+      setVideoDims({ w: v.videoWidth, h: v.videoHeight });
+    }
+  }, []);
+
+  function onCalibrationTap(e: React.PointerEvent<HTMLDivElement>) {
+    if (corners.length >= 4 || !videoDims) return;
+    const target = e.currentTarget;
+    const rect = target.getBoundingClientRect();
+    const x = ((e.clientX - rect.left) / rect.width) * videoDims.w;
+    const y = ((e.clientY - rect.top) / rect.height) * videoDims.h;
+    setCorners((c) => [...c, { x, y }]);
+  }
+
+  function undoCorner() {
+    setCorners((c) => c.slice(0, -1));
+  }
+
+  function resetCorners() {
+    setCorners([]);
+  }
+
+  async function runInferencePipeline(side: Side, moveNumber: number) {
+    const cs = cornersRef.current;
+    if (cs.length !== 4) {
+      const frame = grabVideoFrame();
+      const url = frame ? await canvasToBlobUrl(frame) : null;
+      if (url) {
+        setCaptures((prev) => [
+          ...prev,
+          {
+            side,
+            moveNumber,
+            url,
+            timestamp: Date.now(),
+            inference: { kind: "skipped", reason: "no calibration" },
+          },
+        ]);
+      }
+      return;
+    }
+
+    const frame = grabVideoFrame();
+    if (!frame) return;
+    const url = await canvasToBlobUrl(frame);
+    if (!url) return;
+
+    let inference: CaptureInference;
+    try {
+      const warped = warpBoard(
+        frame,
+        cs as [Point, Point, Point, Point],
+        RECTIFIED_SIZE,
+      );
+      const crops = extractSquareCrops(warped);
+      const occupancy = classifyBoard(crops).map((c) => c.state);
+      const result = inferMove(chessRef.current.fen(), occupancy);
+      if (result.kind === "matched") {
+        const move = result.move;
+        chessRef.current.move({
+          from: move.from,
+          to: move.to,
+          promotion: move.promotion ?? "q",
+        });
+        inference = {
+          kind: "matched",
+          san: move.san,
+          from: move.from,
+          to: move.to,
+          fen: result.updatedFen,
+        };
+        setLastMove({ san: move.san, side });
+      } else if (result.kind === "ambiguous") {
+        // Default to queen-promotion; user can adjust later.
+        const queen = result.candidates.find((m) => m.promotion === "q");
+        const pick = queen ?? result.candidates[0];
+        chessRef.current.move({
+          from: pick.from,
+          to: pick.to,
+          promotion: pick.promotion ?? "q",
+        });
+        inference = {
+          kind: "ambiguous",
+          sans: result.candidates.map((m) => m.san),
+        };
+        setLastMove({ san: pick.san, side });
+      } else {
+        inference = {
+          kind: "unmatched",
+          diff: result.diff.map(
+            (d) => `${d.square}:${d.before[0]}→${d.after[0]}`,
+          ),
+        };
+      }
+    } catch (e) {
+      inference = {
+        kind: "unmatched",
+        diff: [e instanceof Error ? e.message : String(e)],
+      };
+    }
+
+    setCaptures((prev) => [
+      ...prev,
+      { side, moveNumber, url, timestamp: Date.now(), inference },
+    ]);
   }
 
   function endTurn(side: Side) {
@@ -311,29 +490,142 @@ export function CaptureGame() {
       if (isWhite) setWhiteMs((ms) => ms + tc.incrementSeconds * 1000);
       else setBlackMs((ms) => ms + tc.incrementSeconds * 1000);
     }
-    setMoves((m) => {
-      const next = { ...m, [side]: m[side] + 1 };
-      captureFrame(side, next.white + next.black);
-      return next;
-    });
+    const nextMoves = { ...moves, [side]: moves[side] + 1 };
+    setMoves(nextMoves);
     setActive(isWhite ? "black" : "white");
     playTickSound();
     setFlashing(side);
     if (flashTimeoutRef.current) window.clearTimeout(flashTimeoutRef.current);
     flashTimeoutRef.current = window.setTimeout(() => setFlashing(null), 180);
+
+    const totalMoves = nextMoves.white + nextMoves.black;
+    setInferring(true);
+    void runInferencePipeline(side, totalMoves).finally(() =>
+      setInferring(false),
+    );
+  }
+
+  function endGame() {
+    setPgn(chessRef.current.pgn());
+    setPhase("ended");
   }
 
   const tcLabel = useMemo(() => describeTc(tc), [tc]);
 
+  const calibrationHint =
+    corners.length < 4
+      ? CORNER_HINTS[corners.length]
+      : "All four corners set. Confirm to start the clock.";
+
   return (
     <div className="fixed inset-0 flex flex-col overflow-hidden bg-zinc-950 text-zinc-100 select-none">
-      <video ref={videoRef} muted playsInline className="hidden" />
+      {/*
+        The video element stays mounted across phases so the MediaStream keeps
+        flowing into a DOM-attached video (some browsers pause display:none
+        videos). During calibration the wrapper expands to fill the screen;
+        otherwise it collapses to a tiny invisible corner.
+      */}
+      <div
+        className={clsx(
+          "flex flex-col",
+          phase === "calibrating"
+            ? "flex-1"
+            : "pointer-events-none absolute h-1 w-1 overflow-hidden opacity-0",
+        )}
+      >
+        {phase === "calibrating" && (
+          <div className="flex shrink-0 items-start gap-2 px-3 py-2 text-xs">
+            <button
+              onClick={backToSettings}
+              className="shrink-0 rounded-md border border-zinc-700 bg-zinc-900 px-2.5 py-1 text-zinc-200 hover:bg-zinc-800"
+            >
+              ← Back
+            </button>
+            <div className="flex-1 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-1 text-emerald-100">
+              {calibrationHint}
+            </div>
+          </div>
+        )}
+        <div
+          className={clsx(
+            "flex flex-1 items-center justify-center bg-black",
+            phase === "calibrating" ? "p-2" : "",
+          )}
+        >
+          <div
+            onPointerDown={
+              phase === "calibrating" ? onCalibrationTap : undefined
+            }
+            className="relative overflow-hidden rounded-md border border-zinc-800 bg-zinc-950"
+            style={
+              videoDims
+                ? {
+                    aspectRatio: `${videoDims.w}/${videoDims.h}`,
+                    maxWidth: "100%",
+                    maxHeight: "100%",
+                  }
+                : { aspectRatio: "16/9", width: 1, height: 1 }
+            }
+          >
+            <video
+              ref={videoRef}
+              muted
+              playsInline
+              autoPlay
+              onLoadedMetadata={onVideoMeta}
+              className="block h-full w-full bg-black"
+            />
+            {phase === "calibrating" && videoDims && (
+              <CalibrationOverlay corners={corners} videoDims={videoDims} />
+            )}
+          </div>
+        </div>
+        {phase === "calibrating" && (
+          <div className="flex shrink-0 items-center justify-center gap-2 bg-black/95 px-3 py-3">
+            <button
+              onClick={undoCorner}
+              disabled={corners.length === 0}
+              className="rounded-md border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm text-zinc-200 hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              Undo
+            </button>
+            <button
+              onClick={resetCorners}
+              disabled={corners.length === 0}
+              className="rounded-md border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm text-zinc-200 hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              Reset
+            </button>
+            <button
+              onClick={startPlayingFromCalibration}
+              disabled={corners.length !== 4}
+              className="rounded-md border border-emerald-500/50 bg-emerald-500/20 px-4 py-2 text-sm font-medium text-emerald-100 hover:bg-emerald-500/30 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              Start clock
+            </button>
+          </div>
+        )}
+        {phase === "calibrating" && cameraError && (
+          <div className="mx-3 mb-3 shrink-0 rounded-md border border-amber-500/40 bg-amber-500/15 px-3 py-2 text-xs text-amber-100">
+            Camera unavailable: {cameraError}
+          </div>
+        )}
+      </div>
 
       {phase === "settings" && (
         <SettingsScreen
           tc={tc}
           onChangeTc={setTc}
-          onStart={start}
+          onStart={startSession}
+          hasSavedCorners={corners.length === 4}
+          onClearCorners={() => {
+            setCorners([]);
+            try {
+              window.localStorage.removeItem(CORNERS_STORAGE);
+            } catch {
+              /* ignore */
+            }
+          }}
           cameraError={cameraError}
         />
       )}
@@ -355,10 +647,13 @@ export function CaptureGame() {
             phase={phase}
             soundOn={soundOn}
             captureCount={captures.length}
+            lastMove={lastMove}
+            inferring={inferring}
             onTogglePause={togglePause}
             onReset={backToSettings}
             onToggleSound={() => setSoundOn((s) => !s)}
             onShowCaptures={() => setShowCaptures(true)}
+            onEndGame={endGame}
           />
           <PlayerPanel
             side="white"
@@ -380,7 +675,9 @@ export function CaptureGame() {
           winner={winner}
           captureCount={captures.length}
           moves={moves}
+          pgn={pgn}
           onNewGame={backToSettings}
+          onRecalibrate={recalibrate}
           onViewCaptures={() => setShowCaptures(true)}
         />
       )}
@@ -454,41 +751,67 @@ function CenterBar({
   phase,
   soundOn,
   captureCount,
+  lastMove,
+  inferring,
   onTogglePause,
   onReset,
   onToggleSound,
   onShowCaptures,
+  onEndGame,
 }: {
   phase: Phase;
   soundOn: boolean;
   captureCount: number;
+  lastMove: { san: string; side: Side } | null;
+  inferring: boolean;
   onTogglePause: () => void;
   onReset: () => void;
   onToggleSound: () => void;
   onShowCaptures: () => void;
+  onEndGame: () => void;
 }) {
   return (
-    <div className="flex h-16 shrink-0 items-center justify-around bg-black/95 px-2">
-      <IconBtn onClick={onReset} label="Back to settings">
-        <ResetIcon />
-      </IconBtn>
-      <IconBtn
-        onClick={onTogglePause}
-        label={phase === "paused" ? "Resume" : "Pause"}
-      >
-        {phase === "paused" ? <PlayIcon /> : <PauseIcon />}
-      </IconBtn>
-      <IconBtn onClick={onShowCaptures} label="Captures">
-        <CamIcon />
-        {captureCount > 0 && (
-          <span className="absolute -right-1 -top-1 inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-emerald-500 px-1 text-[10px] font-bold text-emerald-950">
-            {captureCount}
+    <div className="flex shrink-0 flex-col bg-black/95">
+      <div className="flex h-7 items-center justify-center px-3 text-[11px] text-zinc-500">
+        {inferring ? (
+          <span className="text-emerald-300">Inferring…</span>
+        ) : lastMove ? (
+          <span>
+            Last move ·{" "}
+            <span className="font-mono text-zinc-200">{lastMove.san}</span>{" "}
+            <span className="text-zinc-500">
+              ({lastMove.side === "white" ? "W" : "B"})
+            </span>
           </span>
+        ) : (
+          <span className="text-zinc-600">No moves yet</span>
         )}
-      </IconBtn>
-      <IconBtn onClick={onToggleSound} label={soundOn ? "Mute" : "Unmute"}>
-        {soundOn ? <SoundOnIcon /> : <SoundOffIcon />}
-      </IconBtn>
+      </div>
+      <div className="flex h-14 items-center justify-around px-2">
+        <IconBtn onClick={onReset} label="Back to settings">
+          <ResetIcon />
+        </IconBtn>
+        <IconBtn
+          onClick={onTogglePause}
+          label={phase === "paused" ? "Resume" : "Pause"}
+        >
+          {phase === "paused" ? <PlayIcon /> : <PauseIcon />}
+        </IconBtn>
+        <IconBtn onClick={onShowCaptures} label="Captures">
+          <CamIcon />
+          {captureCount > 0 && (
+            <span className="absolute -right-1 -top-1 inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-emerald-500 px-1 text-[10px] font-bold text-emerald-950">
+              {captureCount}
+            </span>
+          )}
+        </IconBtn>
+        <IconBtn onClick={onEndGame} label="End game">
+          <FlagIcon />
+        </IconBtn>
+        <IconBtn onClick={onToggleSound} label={soundOn ? "Mute" : "Unmute"}>
+          {soundOn ? <SoundOnIcon /> : <SoundOffIcon />}
+        </IconBtn>
+      </div>
     </div>
   );
 }
@@ -506,15 +829,80 @@ function PausedOverlay({ onResume }: { onResume: () => void }) {
   );
 }
 
+function CalibrationOverlay({
+  corners,
+  videoDims,
+}: {
+  corners: Point[];
+  videoDims: VideoDims;
+}) {
+  const stroke = Math.max(2, videoDims.w / 400);
+  const dotR = Math.max(8, videoDims.w / 100);
+  const fontSize = Math.max(16, videoDims.w / 35);
+  const labelOffset = dotR * 2.2;
+  return (
+    <svg
+      viewBox={`0 0 ${videoDims.w} ${videoDims.h}`}
+      className="pointer-events-none absolute inset-0 h-full w-full"
+    >
+      {corners.length >= 2 && corners.length < 4 && (
+        <polyline
+          points={corners.map((p) => `${p.x},${p.y}`).join(" ")}
+          fill="none"
+          stroke="rgba(74,222,128,0.9)"
+          strokeWidth={stroke}
+        />
+      )}
+      {corners.length === 4 && (
+        <polygon
+          points={corners.map((p) => `${p.x},${p.y}`).join(" ")}
+          fill="rgba(74,222,128,0.18)"
+          stroke="rgba(74,222,128,0.95)"
+          strokeWidth={stroke}
+        />
+      )}
+      {corners.map((p, i) => (
+        <g key={i}>
+          <circle
+            cx={p.x}
+            cy={p.y}
+            r={dotR}
+            fill="rgba(16,185,129,0.95)"
+            stroke="white"
+            strokeWidth={stroke * 0.6}
+          />
+          <text
+            x={p.x}
+            y={p.y - labelOffset}
+            fill="white"
+            stroke="rgba(0,0,0,0.7)"
+            strokeWidth={stroke * 0.6}
+            paintOrder="stroke"
+            fontSize={fontSize}
+            fontWeight="bold"
+            textAnchor="middle"
+          >
+            {CORNER_LABELS[i]}
+          </text>
+        </g>
+      ))}
+    </svg>
+  );
+}
+
 function SettingsScreen({
   tc,
   onChangeTc,
   onStart,
+  hasSavedCorners,
+  onClearCorners,
   cameraError,
 }: {
   tc: TimeControl;
   onChangeTc: (tc: TimeControl) => void;
   onStart: () => void;
+  hasSavedCorners: boolean;
+  onClearCorners: () => void;
   cameraError: string | null;
 }) {
   return (
@@ -528,8 +916,8 @@ function SettingsScreen({
       <div className="mx-auto w-full max-w-md">
         <h1 className="mb-2 mt-6 text-2xl font-semibold">Live game</h1>
         <p className="mb-6 text-sm text-zinc-400">
-          Pick a time control. Each tap of your clock captures a photo of the
-          board for move inference.
+          Pick a time control, calibrate the board corners once, then each
+          tap captures + infers the move that just happened.
         </p>
 
         <div className="mb-3 text-xs uppercase tracking-wider text-zinc-500">
@@ -559,11 +947,23 @@ function SettingsScreen({
 
         <CustomTcEditor tc={tc} onChange={onChangeTc} />
 
+        {hasSavedCorners && (
+          <div className="mt-4 flex items-center justify-between rounded-md border border-zinc-800 bg-zinc-900/60 px-3 py-2 text-xs text-zinc-300">
+            <span>Board corners saved from last session.</span>
+            <button
+              onClick={onClearCorners}
+              className="rounded border border-zinc-700 px-2 py-0.5 text-zinc-300 hover:bg-zinc-800"
+            >
+              Recalibrate
+            </button>
+          </div>
+        )}
+
         <button
           onClick={onStart}
           className="mt-6 w-full rounded-md border border-emerald-500/50 bg-emerald-500/20 px-4 py-3 text-base font-medium text-emerald-100 hover:bg-emerald-500/30"
         >
-          Start game
+          {hasSavedCorners ? "Start game" : "Calibrate & start"}
         </button>
 
         <p className="mt-3 text-center text-[11px] text-zinc-500">
@@ -586,7 +986,7 @@ function SettingsScreen({
           <Link href="/detect" className="text-emerald-300 underline">
             /detect
           </Link>{" "}
-          to test the board rectifier on a still photo before playing.
+          to test the rectifier + classifier on a still photo first.
         </div>
       </div>
     </div>
@@ -651,21 +1051,37 @@ function EndScreen({
   winner,
   captureCount,
   moves,
+  pgn,
   onNewGame,
+  onRecalibrate,
   onViewCaptures,
 }: {
   winner: Side | null;
   captureCount: number;
   moves: { white: number; black: number };
+  pgn: string;
   onNewGame: () => void;
+  onRecalibrate: () => void;
   onViewCaptures: () => void;
 }) {
+  const [copied, setCopied] = useState(false);
   const title = winner
     ? `${winner === "white" ? "White" : "Black"} wins on time`
     : "Game ended";
+
+  async function copyPgn() {
+    try {
+      await navigator.clipboard.writeText(pgn || "");
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    } catch {
+      /* clipboard blocked */
+    }
+  }
+
   return (
-    <div className="flex flex-1 flex-col items-center justify-center px-6">
-      <div className="w-full max-w-md text-center">
+    <div className="flex flex-1 flex-col overflow-y-auto px-6 py-8">
+      <div className="mx-auto w-full max-w-md">
         <div className="mb-2 text-xs uppercase tracking-widest text-zinc-500">
           Game over
         </div>
@@ -687,6 +1103,26 @@ function EndScreen({
         <div className="mb-6 rounded-md border border-zinc-800 bg-zinc-900/60 px-4 py-3 text-sm text-zinc-300">
           {captureCount} position{captureCount === 1 ? "" : "s"} captured.
         </div>
+
+        {pgn && (
+          <div className="mb-6 rounded-md border border-zinc-800 bg-zinc-950 p-3">
+            <div className="mb-2 flex items-center justify-between">
+              <div className="text-xs uppercase tracking-widest text-zinc-500">
+                PGN
+              </div>
+              <button
+                onClick={copyPgn}
+                className="rounded border border-zinc-700 bg-zinc-800 px-2 py-0.5 text-xs text-zinc-200 hover:bg-zinc-700"
+              >
+                {copied ? "Copied" : "Copy"}
+              </button>
+            </div>
+            <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] text-zinc-300">
+              {pgn}
+            </pre>
+          </div>
+        )}
+
         <div className="flex flex-col gap-2">
           <button
             onClick={onViewCaptures}
@@ -701,9 +1137,15 @@ function EndScreen({
           >
             New game
           </button>
+          <button
+            onClick={onRecalibrate}
+            className="rounded-md border border-zinc-800 bg-zinc-900 px-4 py-2 text-sm text-zinc-300 hover:bg-zinc-800"
+          >
+            Recalibrate corners
+          </button>
           <Link
             href="/"
-            className="mt-2 text-xs uppercase tracking-wider text-zinc-500 hover:text-zinc-300"
+            className="mt-2 text-center text-xs uppercase tracking-wider text-zinc-500 hover:text-zinc-300"
           >
             Back to home
           </Link>
@@ -741,24 +1183,54 @@ function CapturesDrawer({
         ) : (
           <div className="grid grid-cols-2 gap-2 pb-6 sm:grid-cols-3 md:grid-cols-4">
             {captures.map((c, i) => (
-              <div
-                key={i}
-                className="overflow-hidden rounded-md border border-zinc-800 bg-zinc-900"
-              >
-                {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img
-                  src={c.url}
-                  alt={`Move ${c.moveNumber}`}
-                  className="block w-full"
-                />
-                <div className="flex items-center justify-between px-2 py-1 text-[10px] uppercase tracking-wider text-zinc-400">
-                  <span>#{c.moveNumber}</span>
-                  <span>after {c.side === "white" ? "W" : "B"}</span>
-                </div>
-              </div>
+              <CaptureCard key={i} capture={c} />
             ))}
           </div>
         )}
+      </div>
+    </div>
+  );
+}
+
+function CaptureCard({ capture }: { capture: Capture }) {
+  const inf = capture.inference;
+  const badgeText =
+    inf.kind === "matched"
+      ? inf.san
+      : inf.kind === "ambiguous"
+        ? "?"
+        : inf.kind === "unmatched"
+          ? "—"
+          : "·";
+  const badgeTone =
+    inf.kind === "matched"
+      ? "bg-emerald-500/25 text-emerald-100"
+      : inf.kind === "ambiguous"
+        ? "bg-amber-500/25 text-amber-100"
+        : inf.kind === "unmatched"
+          ? "bg-rose-500/25 text-rose-100"
+          : "bg-zinc-700/50 text-zinc-300";
+  return (
+    <div className="overflow-hidden rounded-md border border-zinc-800 bg-zinc-900">
+      <div className="relative">
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        <img
+          src={capture.url}
+          alt={`Move ${capture.moveNumber}`}
+          className="block w-full"
+        />
+        <div
+          className={clsx(
+            "absolute left-1 top-1 rounded px-1.5 py-0.5 text-[10px] font-mono font-semibold",
+            badgeTone,
+          )}
+        >
+          {badgeText}
+        </div>
+      </div>
+      <div className="flex items-center justify-between px-2 py-1 text-[10px] uppercase tracking-wider text-zinc-400">
+        <span>#{capture.moveNumber}</span>
+        <span>after {capture.side === "white" ? "W" : "B"}</span>
       </div>
     </div>
   );
@@ -777,7 +1249,7 @@ function IconBtn({
     <button
       onClick={onClick}
       aria-label={label}
-      className="relative flex h-12 w-12 items-center justify-center rounded-full text-zinc-300 transition-colors hover:bg-zinc-800 hover:text-white"
+      className="relative flex h-11 w-11 items-center justify-center rounded-full text-zinc-300 transition-colors hover:bg-zinc-800 hover:text-white"
     >
       {children}
     </button>
@@ -857,6 +1329,25 @@ function CamIcon() {
     >
       <path d="M3 7h3l2-3h8l2 3h3v13H3z" />
       <circle cx="12" cy="13" r="4" />
+    </svg>
+  );
+}
+
+function FlagIcon() {
+  return (
+    <svg
+      width="22"
+      height="22"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden
+    >
+      <path d="M5 21V4" />
+      <path d="M5 4h11l-1.5 3.5L16 11H5" />
     </svg>
   );
 }
