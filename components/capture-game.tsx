@@ -23,6 +23,7 @@ import { makeVerifier, type VlmProvider, type VlmVerifyResult } from "@/lib/vlm"
 import { inferMove } from "@/lib/move-inference";
 import {
   autoDetectBoardCorners,
+  refineCornersForFrame,
   rotateCorners,
   scorePlayingOrientation,
 } from "@/lib/board-detection";
@@ -128,6 +129,9 @@ export function CaptureGame() {
 
   const [vlmConfig, setVlmConfig] = useState<VlmConfig | null>(null);
   const vlmConfigRef = useRef<VlmConfig | null>(null);
+
+  const [calibrationPreviewUrl, setCalibrationPreviewUrl] = useState<string | null>(null);
+  const [moveLog, setMoveLog] = useState<{ san: string; viaVlm: boolean }[]>([]);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -459,6 +463,7 @@ export function CaptureGame() {
     setLastMove(null);
     setMoves({ white: 0, black: 0 });
     setActive("white");
+    setMoveLog([]);
     setWhiteMs(tc.baseSeconds * 1000);
     setBlackMs(tc.baseSeconds * 1000);
     setWinner(null);
@@ -565,6 +570,34 @@ export function CaptureGame() {
   }, [testMode, testFrames, testFrameIdx]);
 
   useEffect(() => {
+    if (phase !== "calibrating" || corners.length !== 4) {
+      setCalibrationPreviewUrl(null);
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      await new Promise<void>((r) => requestAnimationFrame(() => r()));
+      if (cancelled) return;
+      try {
+        const source = previewSource();
+        if (!source) return;
+        const warped = warpBoard(
+          source,
+          corners as [Point, Point, Point, Point],
+          256,
+        );
+        setCalibrationPreviewUrl(warped.toDataURL("image/jpeg", 0.88));
+      } catch {
+        setCalibrationPreviewUrl(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phase, corners, testMode, testFrames, testFrameIdx, videoDims]);
+
+  useEffect(() => {
     return () => {
       testFrameUrlsRef.current.forEach((u) => URL.revokeObjectURL(u));
     };
@@ -662,11 +695,21 @@ export function CaptureGame() {
 
     let inference: CaptureInference;
     try {
-      const warped = warpBoard(
-        frame,
-        cs as [Point, Point, Point, Point],
-        RECTIFIED_SIZE,
-      );
+      // Per-frame corner refinement: re-detect the board on this frame and
+      // snap our saved corners to it when the camera has drifted slightly.
+      // Falls back to the saved corners on any failure or large drift.
+      let activeCorners = cs as [Point, Point, Point, Point];
+      try {
+        const refined = refineCornersForFrame(frame, activeCorners);
+        if (refined.drifted) {
+          activeCorners = refined.corners;
+          cornersRef.current = refined.corners;
+          setCorners(refined.corners);
+        }
+      } catch {
+        /* keep saved corners on failure */
+      }
+      const warped = warpBoard(frame, activeCorners, RECTIFIED_SIZE);
       const crops = extractSquareCrops(warped);
       const occupancy = (
         baselineRef.current
@@ -689,6 +732,7 @@ export function CaptureGame() {
           fen: result.updatedFen,
         };
         setLastMove({ san: move.san, side });
+        setMoveLog((log) => [...log, { san: move.san, viaVlm: false }]);
       } else if (result.kind === "ambiguous") {
         // Default to queen-promotion; user can adjust later.
         const queen = result.candidates.find((m) => m.promotion === "q");
@@ -703,6 +747,7 @@ export function CaptureGame() {
           sans: result.candidates.map((m) => m.san),
         };
         setLastMove({ san: pick.san, side });
+        setMoveLog((log) => [...log, { san: pick.san, viaVlm: false }]);
       } else {
         // No legal move matches the diff. If a VLM verifier is configured,
         // hand it the rectified board + previous FEN + legal-move list and
@@ -775,6 +820,7 @@ export function CaptureGame() {
       san: applied.san,
       side: applied.color === "w" ? "white" : "black",
     });
+    setMoveLog((log) => [...log, { san: applied.san, viaVlm: true }]);
     return {
       kind: "vlm-matched",
       san: applied.san,
@@ -892,6 +938,25 @@ export function CaptureGame() {
             )}
           </div>
         </div>
+        {phase === "calibrating" && calibrationPreviewUrl && (
+          <div className="flex shrink-0 items-center justify-center gap-3 border-t border-zinc-800 bg-black/95 px-3 py-2">
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img
+              src={calibrationPreviewUrl}
+              alt="Rectified board preview"
+              className="h-24 w-24 rounded-md border border-zinc-700 object-cover"
+            />
+            <div className="min-w-0 text-xs text-zinc-300">
+              <div className="font-medium text-emerald-200">
+                Rectified preview
+              </div>
+              <div className="mt-1 leading-snug text-zinc-400">
+                White&apos;s pieces should sit at the bottom. If the
+                orientation looks wrong, hit Reset and try again.
+              </div>
+            </div>
+          </div>
+        )}
         {phase === "calibrating" && (
           <div className="flex shrink-0 items-center justify-center gap-2 bg-black/95 px-3 py-3">
             <button
@@ -970,7 +1035,7 @@ export function CaptureGame() {
             phase={phase}
             soundOn={soundOn}
             captureCount={captures.length}
-            lastMove={lastMove}
+            moveLog={moveLog}
             inferring={inferring}
             onTogglePause={togglePause}
             onReset={backToSettings}
@@ -1074,7 +1139,7 @@ function CenterBar({
   phase,
   soundOn,
   captureCount,
-  lastMove,
+  moveLog,
   inferring,
   onTogglePause,
   onReset,
@@ -1085,7 +1150,7 @@ function CenterBar({
   phase: Phase;
   soundOn: boolean;
   captureCount: number;
-  lastMove: { san: string; side: Side } | null;
+  moveLog: { san: string; viaVlm: boolean }[];
   inferring: boolean;
   onTogglePause: () => void;
   onReset: () => void;
@@ -1095,21 +1160,7 @@ function CenterBar({
 }) {
   return (
     <div className="flex shrink-0 flex-col bg-black/95">
-      <div className="flex h-7 items-center justify-center px-3 text-[11px] text-zinc-500">
-        {inferring ? (
-          <span className="text-emerald-300">Inferring…</span>
-        ) : lastMove ? (
-          <span>
-            Last move ·{" "}
-            <span className="font-mono text-zinc-200">{lastMove.san}</span>{" "}
-            <span className="text-zinc-500">
-              ({lastMove.side === "white" ? "W" : "B"})
-            </span>
-          </span>
-        ) : (
-          <span className="text-zinc-600">No moves yet</span>
-        )}
-      </div>
+      <MoveLogStrip moveLog={moveLog} inferring={inferring} />
       <div className="flex h-14 items-center justify-around px-2">
         <IconBtn onClick={onReset} label="Back to settings">
           <ResetIcon />
@@ -1135,6 +1186,76 @@ function CenterBar({
           {soundOn ? <SoundOnIcon /> : <SoundOffIcon />}
         </IconBtn>
       </div>
+    </div>
+  );
+}
+
+function MoveLogStrip({
+  moveLog,
+  inferring,
+}: {
+  moveLog: { san: string; viaVlm: boolean }[];
+  inferring: boolean;
+}) {
+  const ref = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const el = ref.current;
+    if (el) el.scrollLeft = el.scrollWidth;
+  }, [moveLog.length]);
+  return (
+    <div className="flex h-8 shrink-0 items-center gap-2 border-b border-zinc-900 px-2">
+      <div
+        ref={ref}
+        className="flex flex-1 items-center gap-1 overflow-x-auto whitespace-nowrap scroll-smooth py-0.5"
+        style={{ scrollbarWidth: "none" }}
+      >
+        {moveLog.length === 0 ? (
+          <span className="px-1 text-[11px] text-zinc-600">
+            {inferring ? "Inferring first move…" : "No moves yet · tap a clock to begin"}
+          </span>
+        ) : (
+          moveLog.map((m, i) => {
+            const moveNum = Math.floor(i / 2) + 1;
+            const isWhite = i % 2 === 0;
+            const isLast = i === moveLog.length - 1;
+            return (
+              <span
+                key={i}
+                className="inline-flex items-baseline gap-1 text-[11px] tabular-nums"
+              >
+                {isWhite && (
+                  <span className="text-zinc-600">{moveNum}.</span>
+                )}
+                <span
+                  className={clsx(
+                    "rounded-md px-1.5 py-0.5 font-mono",
+                    isLast
+                      ? m.viaVlm
+                        ? "bg-sky-500/25 text-sky-100"
+                        : "bg-emerald-500/25 text-emerald-100"
+                      : m.viaVlm
+                        ? "text-sky-300"
+                        : "text-zinc-200",
+                  )}
+                  title={m.viaVlm ? "Resolved by VLM" : undefined}
+                >
+                  {m.san}
+                  {m.viaVlm && (
+                    <span className="ml-1 text-[9px] uppercase tracking-wider opacity-70">
+                      vlm
+                    </span>
+                  )}
+                </span>
+              </span>
+            );
+          })
+        )}
+      </div>
+      {inferring && moveLog.length > 0 && (
+        <span className="shrink-0 rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] uppercase tracking-wider text-emerald-200">
+          Inferring…
+        </span>
+      )}
     </div>
   );
 }
