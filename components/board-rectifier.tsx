@@ -275,7 +275,7 @@ export function BoardRectifier() {
       <UploadCard onFileChange={onFileChange} hasImage={Boolean(imageUrl)} />
 
       {imageUrl && (
-        <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 p-4">
+        <div className="rounded-3xl border border-white/5 bg-white/5 p-5">
           <div
             className={clsx(
               "mb-3 flex items-start gap-3 rounded-md border px-3 py-2 text-sm",
@@ -378,7 +378,7 @@ export function BoardRectifier() {
       )}
 
       {warpedUrl && (
-        <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 p-4">
+        <div className="rounded-3xl border border-white/5 bg-white/5 p-5">
           <div className="mb-2 text-xs uppercase tracking-wider text-zinc-400">
             Rectified board · always oriented with White at the bottom
           </div>
@@ -392,7 +392,7 @@ export function BoardRectifier() {
       )}
 
       {squareUrls.length === 64 && (
-        <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 p-4">
+        <div className="rounded-3xl border border-white/5 bg-white/5 p-5">
           <div className="mb-3 flex flex-wrap items-baseline justify-between gap-2">
             <div className="text-xs uppercase tracking-wider text-zinc-400">
               Per-square crops + predicted occupancy
@@ -504,15 +504,15 @@ function InferencePanel({
   calibrated: boolean;
 }) {
   return (
-    <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 p-4">
-      <div className="mb-2 flex flex-wrap items-baseline justify-between gap-2">
+    <div className="rounded-3xl border border-white/5 bg-white/5 p-5">
+      <div className="mb-3 flex flex-wrap items-baseline justify-between gap-2">
         <div className="flex items-center gap-2">
-          <div className="text-xs uppercase tracking-wider text-zinc-400">
+          <div className="text-[10px] font-semibold uppercase tracking-[0.3em] text-zinc-400">
             Move inference
           </div>
           {calibrated && (
             <span
-              className="rounded-full border border-emerald-500/40 bg-emerald-500/15 px-2 py-0.5 text-[10px] uppercase tracking-wider text-emerald-200"
+              className="rounded-full border border-emerald-400/40 bg-emerald-500/20 px-2.5 py-0.5 text-[10px] font-semibold uppercase tracking-widest text-emerald-100"
               title="Per-board baseline learned from a starting-position frame"
             >
               Calibrated
@@ -521,18 +521,17 @@ function InferencePanel({
         </div>
         <button
           onClick={onReset}
-          className="text-[10px] uppercase tracking-wider text-zinc-500 hover:text-zinc-300"
+          className="text-[10px] uppercase tracking-widest text-zinc-500 hover:text-zinc-300"
         >
           Reset session
         </button>
       </div>
-      <p className="mb-3 text-xs text-zinc-400">
-        Diff the predicted occupancy against the previous FEN, then pick the
-        unique legal move that matches. Accept to chain into the next
-        uploaded photo.
+      <p className="mb-3 text-[12px] leading-snug text-zinc-400">
+        Diff predicted occupancy against the previous FEN, then pick the
+        unique legal move that matches.
       </p>
       <label className="mb-3 block">
-        <span className="mb-1 block text-[10px] uppercase tracking-wider text-zinc-500">
+        <span className="mb-1 block text-[10px] uppercase tracking-widest text-zinc-500">
           Previous FEN
         </span>
         <input
@@ -540,63 +539,63 @@ function InferencePanel({
           value={prevFen}
           onChange={(e) => onChangePrevFen(e.target.value)}
           spellCheck={false}
-          className="w-full rounded border border-zinc-700 bg-zinc-950 px-2 py-1 font-mono text-xs text-zinc-100"
+          className="w-full rounded-xl border border-white/10 bg-zinc-950 px-3 py-2 font-mono text-[12px] text-zinc-100"
         />
       </label>
       <button
         onClick={onInfer}
-        className="rounded-md border border-emerald-500/40 bg-emerald-500/15 px-3 py-1.5 text-sm font-medium text-emerald-200 hover:bg-emerald-500/25"
+        className="rounded-full bg-emerald-500/90 px-4 py-2 text-sm font-semibold text-emerald-950 transition hover:bg-emerald-400"
       >
         Infer move
       </button>
 
       {pgn && (
-        <div className="mt-4 rounded-md border border-zinc-800 bg-zinc-950 p-3">
-          <div className="mb-1 text-[10px] uppercase tracking-wider text-zinc-500">
+        <div className="mt-4 rounded-2xl border border-white/5 bg-zinc-950/60 p-3">
+          <div className="mb-1 text-[10px] uppercase tracking-widest text-zinc-500">
             PGN so far
           </div>
-          <pre className="max-h-32 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] text-zinc-300">
+          <pre className="max-h-32 overflow-auto whitespace-pre-wrap break-words font-mono text-[12px] leading-relaxed text-zinc-300">
             {pgn}
           </pre>
         </div>
       )}
 
       {inferResult && (
-        <div className="mt-4 rounded-md border border-zinc-800 bg-zinc-950/60 p-3 text-sm">
+        <div className="mt-4 rounded-2xl border border-white/5 bg-zinc-950/60 p-4 text-sm">
           {inferResult.kind === "matched" && (
             <>
-              <div className="mb-1 text-xs uppercase tracking-wider text-emerald-300">
+              <div className="mb-1 text-[10px] uppercase tracking-widest text-emerald-300">
                 Matched
               </div>
-              <div className="mb-2 text-base">
-                <span className="font-mono text-emerald-200">
+              <div className="mb-2 text-lg">
+                <span className="font-mono font-semibold text-emerald-200">
                   {inferResult.move.san}
                 </span>{" "}
                 <span className="text-zinc-500">
                   ({inferResult.move.from} → {inferResult.move.to})
                 </span>
               </div>
-              <div className="mb-2 font-mono text-[11px] text-zinc-400 break-all">
+              <div className="mb-3 font-mono text-[11px] text-zinc-400 break-all">
                 {inferResult.updatedFen}
               </div>
               <button
                 onClick={onAccept}
-                className="rounded-md border border-emerald-500/40 bg-emerald-500/15 px-2.5 py-1 text-xs text-emerald-200 hover:bg-emerald-500/25"
+                className="rounded-full bg-emerald-500/90 px-3 py-1.5 text-xs font-semibold text-emerald-950 transition hover:bg-emerald-400"
               >
-                Accept · use as next previous FEN
+                Accept · advance to next photo
               </button>
             </>
           )}
 
           {inferResult.kind === "ambiguous" && (
             <>
-              <div className="mb-1 text-xs uppercase tracking-wider text-amber-300">
+              <div className="mb-1 text-[10px] uppercase tracking-widest text-amber-300">
                 Ambiguous · {inferResult.candidates.length} candidates
               </div>
-              <div className="text-zinc-300">
+              <div className="text-zinc-200">
                 {inferResult.candidates.map((m) => m.san).join(" · ")}
               </div>
-              <div className="mt-2 text-xs text-zinc-500">
+              <div className="mt-2 text-[11px] text-zinc-500">
                 Likely a promotion — occupancy alone can&apos;t tell Q/R/B/N
                 apart.
               </div>
@@ -605,7 +604,7 @@ function InferencePanel({
 
           {inferResult.kind === "none" && (
             <>
-              <div className="mb-1 text-xs uppercase tracking-wider text-rose-300">
+              <div className="mb-1 text-[10px] uppercase tracking-widest text-rose-300">
                 No legal move matches the observed diff
               </div>
               <div className="mb-2 text-xs text-zinc-400">
@@ -636,15 +635,21 @@ function UploadCard({
   hasImage: boolean;
 }) {
   return (
-    <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 p-4">
+    <div className="rounded-3xl border border-white/5 bg-white/5 p-5">
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="text-sm text-zinc-300">
-          <span className="mr-2 inline-block rounded-full bg-emerald-500/15 px-2 py-0.5 text-xs uppercase tracking-wider text-emerald-200">
+        <div className="text-sm text-zinc-200">
+          <div className="text-[10px] font-semibold uppercase tracking-[0.3em] text-emerald-300">
             Step 1
-          </span>
-          Upload or capture a photo of the board.
+          </div>
+          <div className="mt-0.5 text-[15px] font-medium text-zinc-100">
+            Pick a board photo
+          </div>
+          <p className="mt-0.5 text-[12px] text-zinc-400">
+            Use the camera or pick from your library. Any phone-friendly
+            angle works.
+          </p>
         </div>
-        <label className="inline-flex cursor-pointer items-center gap-2 rounded-md border border-emerald-500/40 bg-emerald-500/15 px-3 py-1.5 text-sm font-medium text-emerald-200 hover:bg-emerald-500/25">
+        <label className="inline-flex cursor-pointer items-center gap-2 rounded-full bg-emerald-500/90 px-4 py-2 text-sm font-semibold text-emerald-950 transition hover:bg-emerald-400">
           <input
             type="file"
             accept="image/*"
@@ -652,7 +657,7 @@ function UploadCard({
             className="hidden"
             onChange={onFileChange}
           />
-          {hasImage ? "Choose another photo" : "Choose photo"}
+          {hasImage ? "Replace" : "Choose photo"}
         </label>
       </div>
     </div>
