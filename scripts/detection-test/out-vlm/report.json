@@ -1,0 +1,198 @@
+[
+  {
+    "idx": 1,
+    "expected": "e4",
+    "topK": [
+      "e4",
+      "f4",
+      "e3",
+      "f3",
+      "h4"
+    ],
+    "vlm": "e4",
+    "ok": true,
+    "vlmRaw": "e4"
+  },
+  {
+    "idx": 2,
+    "expected": "e5",
+    "topK": [
+      "e5",
+      "f5",
+      "e6",
+      "f6",
+      "Nf6"
+    ],
+    "vlm": "e5",
+    "ok": true,
+    "vlmRaw": "e5"
+  },
+  {
+    "idx": 3,
+    "expected": "Nf3",
+    "topK": [
+      "Nf3",
+      "g3",
+      "Nh3",
+      "Ne2",
+      "f3"
+    ],
+    "vlm": "Nf3",
+    "ok": true,
+    "vlmRaw": "Nf3"
+  },
+  {
+    "idx": 4,
+    "expected": "Nc6",
+    "topK": [
+      "Nc6",
+      "c6",
+      "b5",
+      "Na6",
+      "c5"
+    ],
+    "vlm": "Nc6",
+    "ok": true,
+    "vlmRaw": "Nc6"
+  },
+  {
+    "idx": 5,
+    "expected": "Nc3",
+    "topK": [
+      "Nc3",
+      "c3",
+      "Na3",
+      "c4",
+      "Bb5"
+    ],
+    "vlm": "Bb5",
+    "ok": false,
+    "vlmRaw": "Bb5"
+  },
+  {
+    "idx": 6,
+    "expected": "d6",
+    "topK": [
+      "d6",
+      "d5",
+      "Na5",
+      "Bd6",
+      "Nb4"
+    ],
+    "vlm": "d6",
+    "ok": true,
+    "vlmRaw": "d6"
+  },
+  {
+    "idx": 7,
+    "expected": "b3",
+    "topK": [
+      "b3",
+      "b4",
+      "Nc3",
+      "c3",
+      "Na3"
+    ],
+    "vlm": "c3",
+    "ok": false,
+    "vlmRaw": "c3"
+  },
+  {
+    "idx": 8,
+    "expected": "Be7",
+    "topK": [
+      "Ne7",
+      "Nf6",
+      "Nh6",
+      "Be7",
+      "f5"
+    ],
+    "vlm": "Nf6",
+    "ok": false,
+    "vlmRaw": "Nf6"
+  },
+  {
+    "idx": 9,
+    "expected": "Ba3",
+    "topK": [
+      "Na3",
+      "a3",
+      "b3",
+      "b4",
+      "Qb3"
+    ],
+    "vlm": "b4",
+    "ok": false,
+    "vlmRaw": "b4"
+  },
+  {
+    "idx": 10,
+    "expected": "Nf6",
+    "topK": [
+      "g6",
+      "Ng8",
+      "Rg8",
+      "g5",
+      "Nd7"
+    ],
+    "vlm": "g6",
+    "ok": false,
+    "vlmRaw": "g6"
+  },
+  {
+    "idx": 11,
+    "expected": "Nd5",
+    "topK": [
+      "c4",
+      "Nxe5",
+      "Bc4",
+      "a3",
+      "Qb3"
+    ],
+    "vlm": "Nxe5",
+    "ok": false,
+    "vlmRaw": "Nxe5"
+  },
+  {
+    "idx": 12,
+    "expected": "Nxd5",
+    "topK": [
+      "Nd5",
+      "d5",
+      "dxe5",
+      "Nxe4",
+      "g5"
+    ],
+    "vlm": "dxe5",
+    "ok": false,
+    "vlmRaw": "dxe5"
+  },
+  {
+    "idx": 13,
+    "expected": "exd5",
+    "topK": [
+      "f4",
+      "d4",
+      "c4",
+      "Bc4",
+      "Bxc6+"
+    ],
+    "vlm": "Bxc6+",
+    "ok": false,
+    "vlmRaw": "Bxc6+"
+  },
+  {
+    "idx": 14,
+    "expected": "b6",
+    "topK": [
+      "bxc6",
+      "Bd7",
+      "Qd7",
+      "Nd7",
+      "Ke7"
+    ],
+    "vlm": "Bd7",
+    "ok": false,
+    "vlmRaw": "Bd7"
+  }
+]

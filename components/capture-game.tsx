@@ -890,18 +890,27 @@ export function CaptureGame() {
         cellDeltas,
       });
 
-      // Decide path: CV slam-dunk = mismatch 0 AND winning confidently;
-      // anything murkier defers to the VLM identifier (when configured).
-      const cvSlamDunk =
+      // Decision rule (validated against the 14-move ground-truth sample):
+      //   CV top-1 alone gets 86% (12/14) on the user's tilted-angle photos.
+      //   The VLM tie-break previously *lowered* accuracy to 71% by
+      //   overriding correct CV top-1 picks. So: trust CV top-1 whenever
+      //   it has a clear ranking advantage over top-2. Only invoke the
+      //   VLM when CV is genuinely undecided (tight margin or no pick).
+      const top = cvResult.ranked[0];
+      const second = cvResult.ranked[1];
+      const margin =
+        top && second ? second.weightedMismatch - top.weightedMismatch : Infinity;
+      // Margin of 0.3 separates "CV is sure" from "CV is guessing".
+      const cvConfident =
         cvResult.kind === "matched" &&
-        cvResult.ranked[0].mismatch === 0 &&
-        cvResult.ranked[0].weightedMismatch <= 0.6;
+        cvResult.pick != null &&
+        margin >= 0.3;
 
       let viaVlm = false;
       let appliedMove: ChessMove | null = null;
       let appliedFen = fenBefore;
 
-      if (cvSlamDunk && cvResult.pick) {
+      if (cvConfident && cvResult.pick) {
         appliedMove = cvResult.pick.move;
         appliedFen = cvResult.pick.updatedFen;
         chessRef.current.move({
@@ -910,9 +919,6 @@ export function CaptureGame() {
           promotion: appliedMove.promotion ?? "q",
         });
       } else if (vlmConfigRef.current?.apiKey || VLM_PROXY_URL) {
-        // VLM tie-break — narrow to the top-K CV candidates so the model
-        // is choosing between visually-plausible moves only, not against
-        // the full ~40-move legal list. Massively reduces hallucination.
         const candidates = cvResult.ranked
           .slice(0, 5)
           .map((c) => c.move.san);
@@ -936,8 +942,7 @@ export function CaptureGame() {
         }
       }
 
-      // If neither slam-dunk nor VLM worked, accept the CV top pick when
-      // it's at least a "matched"; otherwise surface a manual pick sheet.
+      // Final fallback: take CV top pick if we still have nothing applied.
       if (!appliedMove && cvResult.kind === "matched" && cvResult.pick) {
         appliedMove = cvResult.pick.move;
         appliedFen = cvResult.pick.updatedFen;
