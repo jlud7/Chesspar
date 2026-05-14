@@ -28,7 +28,7 @@ const WORKER_URL =
   process.env.WORKER_URL ?? "https://chesspar-vlm.jamesleoluddy.workers.dev";
 const ORIGIN = process.env.ORIGIN ?? "https://jlud7.github.io";
 const MODEL = process.env.MODEL ?? "claude-opus-4-7";
-const TOP_K = Number(process.env.TOP_K ?? "6");
+const TOP_K = Number(process.env.TOP_K ?? "10");
 const ROTATE_QUARTERS = Number(process.env.ROTATE_QUARTERS ?? "1");
 const CROP_LEFT = Number(process.env.CROP_LEFT ?? "0.22");
 // CV-confidence margin: if CV's top-1 weightedMismatch is at least this much
@@ -86,63 +86,34 @@ function canvasToBase64(canvas) {
   return comma >= 0 ? url.slice(comma + 1) : url;
 }
 
-// Free-function dispatcher to the worker proxy. Mirrors what
-// verifyByCellTiles does internally for the browser path, but routes
-// through the same /verify proxy as the existing offline scripts so we
-// don't need to plumb keys into Node.
+// Dispatch a cell-tile verification call through the worker proxy. Reuses
+// the library's prompt builder + response parser (which includes the
+// deterministic observation-vs-candidate matcher) so the offline runner
+// exercises EXACTLY the same logic that ships in capture-game.tsx.
 async function cellTileViaProxy(afterWarped, prevFen, candidatesSan) {
   const disputed = cellVerify.findDisputedSquares(prevFen, candidatesSan);
   if (disputed.length === 0) {
-    return { matched: candidatesSan[0], raw: "(no disputed squares)", disputed };
+    return {
+      result: {
+        kind: "matched",
+        san: candidatesSan[0],
+        raw: "(no disputed squares)",
+        observations: [],
+        via: "deterministic",
+      },
+      disputed,
+      rotationDeg: 0,
+    };
   }
   const { oriented: afterOriented, rotationDeg } =
-    boardImage.ensureWhiteAtBottom(afterWarped);
-  if (rotationDeg !== 0) {
-    console.log(`     [orientation] rotated rectified board by ${rotationDeg}° before VLM call`);
-  }
+    boardImage.ensureWhiteAtBottom(afterWarped, prevFen);
+
   const tiles = disputed.map((sq) => ({
     square: sq,
     canvas: cellVerify.renderTile(afterOriented, sq),
   }));
 
-  const candidateSummary = candidatesSan
-    .map((san, i) => {
-      const sim = new Chess(prevFen);
-      let m;
-      try { m = sim.move(san); } catch { /* */ }
-      if (!m) return `  ${i + 1}. ${san}`;
-      const color = m.color === "w" ? "white" : "black";
-      const piece = ({ p: "pawn", n: "knight", b: "bishop", r: "rook", q: "queen", k: "king" })[m.piece] ?? m.piece;
-      const cap = m.captured ? ` (captures ${m.captured})` : "";
-      return `  ${i + 1}. ${san}  → ${color} ${piece} ${m.from}→${m.to}${cap}; expect ${m.to}=${color}-${piece}, ${m.from}=empty`;
-    })
-    .join("\n");
-
-  const prompt = `You are identifying a chess move by checking specific squares on the AFTER-move board.
-
-PREVIOUS POSITION (piece placement FEN): ${prevFen}
-
-I will show you ${disputed.length} close-up tile${disputed.length === 1 ? "" : "s"}, each a small region of the AFTER-the-move board with ONE square OUTLINED IN RED. The red-outlined square is the one you must identify. The other squares in the tile are just context (immediate neighbours).
-
-Tiles, in order: ${disputed.join(", ")}.
-
-CANDIDATE MOVES (exactly ONE was played, ranked best-first by the upstream classifier):
-${candidateSummary}
-
-Your task:
-  Step 1. For each tile, look ONLY at the red-outlined square and write a one-line observation in the form
-            "${disputed[0]}: <empty | white-pawn | white-knight | white-bishop | white-rook | white-queen | white-king | black-pawn | black-knight | black-bishop | black-rook | black-queen | black-king>"
-          If you cannot tell the piece type but can tell the colour, write "white-piece" or "black-piece". If a piece's TOP extends above the red square from an adjacent rank (3D piece-top bleed), do not count it — only what is *based* on the red square counts.
-
-  Step 2. Cross-reference observations with each candidate's predicted after-state. Eliminate candidates that disagree.
-
-  Step 3. Output the SAN of the surviving move.
-
-Format your final line EXACTLY as:
-ANSWER: <san>
-
-The SAN must be one of the candidates above, written exactly as listed.`;
-
+  const prompt = cellVerify.buildPrompt(prevFen, candidatesSan, disputed);
   const content = [];
   for (const tile of tiles) {
     content.push({
@@ -170,35 +141,21 @@ The SAN must be one of the candidates above, written exactly as listed.`;
   });
   if (!resp.ok) {
     return {
-      error: `HTTP ${resp.status}: ${(await resp.text()).slice(0, 200)}`,
+      result: {
+        kind: "error",
+        reason: `HTTP ${resp.status}: ${(await resp.text()).slice(0, 200)}`,
+      },
       disputed,
+      rotationDeg,
     };
   }
   const data = await resp.json();
   const raw = data.content?.find((c) => c.type === "text")?.text ?? "";
-
-  // Parse ANSWER line, fall back to last-line / longest-SAN match.
-  const m = raw.match(/ANSWER\s*[:=]\s*([A-Za-z0-9+#=\-]+)/i);
-  if (m) {
-    const guess = m[1];
-    for (const san of candidatesSan) {
-      if (san === guess || san.replace(/[+#]+$/, "") === guess.replace(/[+#]+$/, "")) {
-        return { matched: san, raw, disputed };
-      }
-    }
-  }
-  const lines = raw.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-  const last = lines[lines.length - 1] ?? "";
-  const sorted = [...candidatesSan].sort((a, b) => b.length - a.length);
-  for (const san of sorted) {
-    const re = new RegExp(`(^|[^A-Za-z0-9])${san.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}([^A-Za-z0-9]|$)`);
-    if (re.test(last)) return { matched: san, raw, disputed };
-  }
-  for (const san of sorted) {
-    const re = new RegExp(`(^|[^A-Za-z0-9])${san.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}([^A-Za-z0-9]|$)`);
-    if (re.test(raw)) return { matched: san, raw, disputed };
-  }
-  return { raw, disputed };
+  return {
+    result: cellVerify.parseResponse(raw, candidatesSan, prevFen),
+    disputed,
+    rotationDeg,
+  };
 }
 
 console.log(`Model: ${MODEL}, TOP_K: ${TOP_K}, CV_MARGIN: ${CV_MARGIN}`);
@@ -267,20 +224,30 @@ for (let i = 0; i < GROUND_TRUTH.length; i++) {
   let final;
   let pickedBy;
   let raw = "";
+  let observations = [];
+  let via = null;
+  let matchDetails = null;
+  let rotationDeg = 0;
   if (cvFullyConfident) {
     final = topK[0];
     pickedBy = `CV top-1 (margin ${margin.toFixed(2)}, disputed=0)`;
   } else if (topK.length > 0) {
     try {
       const r = await cellTileViaProxy(wAfter, prevFen, topK);
-      if (r.matched) {
-        final = r.matched;
-        pickedBy = `cell-tile VLM (margin ${margin.toFixed(2)}, disputed=${disputed.length}: ${disputed.join(",")})`;
-        raw = r.raw ?? "";
+      raw = r.result.raw ?? r.result.reason ?? "";
+      observations = r.result.observations ?? [];
+      rotationDeg = r.rotationDeg;
+      if (r.result.kind === "matched") {
+        final = r.result.san;
+        via = r.result.via;
+        matchDetails = r.result.matchDetails;
+        const dets = matchDetails
+          ? ` matches=${matchDetails.matches} conflicts=${matchDetails.conflicts} margin=${matchDetails.margin}`
+          : "";
+        pickedBy = `cell-tile VLM[${via}]${dets} (cv-margin=${margin.toFixed(2)}, disputed=${disputed.length}: ${disputed.join(",")})`;
       } else {
         final = topK[0] ?? "?";
-        pickedBy = `cell-VLM failed → CV fallback (disputed=${disputed.length})`;
-        raw = r.raw ?? r.error ?? "";
+        pickedBy = `cell-VLM ${r.result.kind} → CV fallback (disputed=${disputed.length})`;
       }
     } catch (e) {
       final = topK[0] ?? "?";
@@ -297,8 +264,28 @@ for (let i = 0; i < GROUND_TRUTH.length; i++) {
   console.log(
     `[${(i + 1).toString().padStart(2)}] expected=${expected.padEnd(6)} cv_top=[${topK.join(",")}] ${pickedBy} → ${final.padEnd(6)} ${ok ? "✓" : "✗"}`,
   );
-  if (!ok && raw) console.log(`     raw: ${raw.slice(0, 400).replace(/\n/g, " | ")}`);
-  detail.push({ idx: i + 1, expected, topK, pickedBy, final, ok, raw });
+  if (rotationDeg !== 0) {
+    console.log(`     [orientation] rotated rectified board by ${rotationDeg}° (FEN-aware) before VLM`);
+  }
+  if (observations.length > 0) {
+    const fmt = observations.map((o) => `${o.square}=${o.piece}`).join(", ");
+    console.log(`     obs: ${fmt}`);
+  }
+  if (!ok && raw) console.log(`     raw: ${raw.slice(0, 500).replace(/\n/g, " | ")}`);
+  detail.push({
+    idx: i + 1,
+    expected,
+    topK,
+    pickedBy,
+    final,
+    ok,
+    raw,
+    observations,
+    via,
+    matchDetails,
+    rotationDeg,
+    disputed,
+  });
   reference.move(expected);
 }
 

@@ -48,7 +48,15 @@ export type CellVerifyArgs = {
 };
 
 export type CellVerifyResult =
-  | { kind: "matched"; san: string; raw: string; observations: CellObservation[] }
+  | {
+      kind: "matched";
+      san: string;
+      raw: string;
+      observations: CellObservation[];
+      via: "deterministic" | "answer-line" | "san-search";
+      /** Match details when via === "deterministic". */
+      matchDetails?: { matches: number; conflicts: number; margin: number };
+    }
   | { kind: "rejected"; raw: string; reason: string; observations: CellObservation[] }
   | { kind: "error"; reason: string };
 
@@ -74,6 +82,7 @@ export async function verifyByCellTiles(
       san: args.candidatesSan[0],
       raw: "(single candidate — no VLM call needed)",
       observations: [],
+      via: "deterministic",
     };
   }
 
@@ -84,18 +93,19 @@ export async function verifyByCellTiles(
       san: args.candidatesSan[0],
       raw: "(no disputed squares — candidates agree on after-state)",
       observations: [],
+      via: "deterministic",
     };
   }
 
   // CRITICAL: Re-orient the rectified board to white-at-bottom BEFORE
   // cropping any tiles. VLMs are far more reliable on the canonical
   // chess viewing orientation; tiles cropped from a sideways/upside-down
-  // warped board produce confidently wrong piece identifications.
-  // Mis-calibrated corners (board captured at 90° from the player's
-  // perspective, or tapped in the wrong order) would otherwise leak
-  // through to the API call.
+  // warped board produce confidently wrong piece identifications. Pass
+  // `prevFen` so the orientation check uses the FEN's actual piece
+  // distribution rather than a generic luminance heuristic.
   const { oriented: afterOriented, rotationDeg } = ensureWhiteAtBottom(
     args.afterWarped,
+    args.prevFen,
   );
   if (rotationDeg !== 0 && typeof console !== "undefined") {
     console.warn(
@@ -111,20 +121,27 @@ export async function verifyByCellTiles(
   const prompt = buildPrompt(args.prevFen, args.candidatesSan, disputed);
   const dispatch = pickDispatch(args);
   const raw = await dispatch(prompt, tiles);
-  return parseResponse(raw, args.candidatesSan);
+  return parseResponse(raw, args.candidatesSan, args.prevFen);
 }
 
 /**
- * Squares where at least two candidates disagree about piece occupancy
- * in the AFTER state (using piece type, not just colour). Also includes
- * each candidate's source/destination cells so the VLM sees every action
- * square. Capped at 8 to keep the prompt + payload bounded.
+ * Squares where the candidates' predicted after-states actually disagree
+ * (by piece type — empty vs occupied, or knight vs bishop, etc.).
+ *
+ * We deliberately exclude squares all candidates agree on, even when
+ * they're a candidate's source or destination — asking the VLM about
+ * uncontested cells just wastes tokens and risks the model saying
+ * something contradictory that pulls a clean pick into ambiguity.
+ *
+ * Ordering: cells where the most candidates disagree (highest cardinality
+ * of distinct predicted piece-types) come first, so if we hit the cap the
+ * most informative tiles survive. Cap is 8 — empirically enough to
+ * decide every back-rank confusion case in the 14-move test set.
  */
 export function findDisputedSquares(
   prevFen: string,
   candidatesSan: string[],
 ): string[] {
-  const interesting = new Set<number>();
   const perCandidateBoards: ((string | null)[])[] = [];
   for (const san of candidatesSan) {
     const sim = new Chess(prevFen);
@@ -135,23 +152,21 @@ export function findDisputedSquares(
       continue;
     }
     if (!move) continue;
-    interesting.add(sanToIdx(move.from));
-    interesting.add(sanToIdx(move.to));
-    if (move.captured && move.flags.includes("e")) {
-      // En-passant: capture square differs from `to`.
-      const capRank = move.color === "w" ? "5" : "4";
-      interesting.add(sanToIdx(move.to[0] + capRank));
-    }
     perCandidateBoards.push(fenToBoardWithTypes(sim.fen()));
   }
-  if (perCandidateBoards.length > 1) {
-    for (let i = 0; i < 64; i++) {
-      const seen = new Set<string | null>();
-      for (const b of perCandidateBoards) seen.add(b[i]);
-      if (seen.size > 1) interesting.add(i);
-    }
+  if (perCandidateBoards.length < 2) return [];
+
+  const cellScore = new Map<number, number>();
+  for (let i = 0; i < 64; i++) {
+    const seen = new Set<string | null>();
+    for (const b of perCandidateBoards) seen.add(b[i]);
+    if (seen.size > 1) cellScore.set(i, seen.size);
   }
-  return [...interesting].slice(0, 8).map(idxToSan);
+  const sorted = [...cellScore.entries()].sort((a, b) => {
+    if (b[1] !== a[1]) return b[1] - a[1];
+    return a[0] - b[0];
+  });
+  return sorted.slice(0, 8).map(([idx]) => idxToSan(idx));
 }
 
 /** Render a 3x3-cell context tile around `square`, target cell outlined. */
@@ -198,7 +213,7 @@ export function renderTile(
   return out;
 }
 
-function buildPrompt(
+export function buildPrompt(
   prevFen: string,
   candidatesSan: string[],
   disputed: string[],
@@ -206,30 +221,46 @@ function buildPrompt(
   const candidateSummary = candidatesSan
     .map((san, i) => `  ${i + 1}. ${san}  → ${describeMove(prevFen, san)}`)
     .join("\n");
-  return `You are identifying a chess move by checking specific squares on the AFTER-move board.
+  const exampleObs = disputed
+    .slice(0, 2)
+    .map((sq, i) => `  ${sq}: ${i === 0 ? "black-bishop" : "empty"}`)
+    .join("\n");
+  return `You are identifying a chess move by reading specific squares on the AFTER-move board.
 
 PREVIOUS POSITION (piece placement FEN): ${prevFen}
 
-I will show you ${disputed.length} close-up tile${disputed.length === 1 ? "" : "s"}, each a small region of the AFTER-the-move board with one square OUTLINED IN RED. The red-outlined square is the one you must identify. The other squares in the tile are just context (the immediate neighbours of the target square).
+I will show you ${disputed.length} close-up tile${disputed.length === 1 ? "" : "s"}, each a small region of the AFTER-the-move board with ONE square OUTLINED IN RED. The red-outlined square is the one you must identify. The other 8 surrounding squares in the tile are just CONTEXT — do NOT report on them.
 
 Tiles, in order: ${disputed.join(", ")}.
 
-CANDIDATE MOVES (exactly ONE of these was played, ranked best-first by the upstream classifier):
+CANDIDATE MOVES (exactly ONE was played, ranked best-first):
 ${candidateSummary}
 
-Your task:
-  Step 1. For each tile, look ONLY at the red-outlined square and write a one-line observation in the form
-            "${disputed[0]}: <empty | white-pawn | white-knight | white-bishop | white-rook | white-queen | white-king | black-pawn | black-knight | black-bishop | black-rook | black-queen | black-king>"
-          If you cannot tell the exact piece type but can tell the colour, write "white-piece" or "black-piece". If a piece's top extends above the red square from an adjacent rank (3D piece-top bleed), do not count it — only what is *based* on the red square counts.
+OUTPUT FORMAT — follow this STRICTLY:
 
-  Step 2. Cross-reference your observations with each candidate's predicted after-state. Eliminate any candidate whose prediction disagrees with what you saw.
+For each tile, output EXACTLY one line in this form:
+  <square>: <label>
 
-  Step 3. Output the SAN of the surviving move.
+Where <label> is EXACTLY one of:
+  empty
+  white-pawn, white-knight, white-bishop, white-rook, white-queen, white-king
+  black-pawn, black-knight, black-bishop, black-rook, black-queen, black-king
 
-Format your final line EXACTLY as:
-ANSWER: <san>
+If you are confident in the colour but not the piece type, use:
+  white-piece  or  black-piece
 
-The SAN must be one of the candidates above, written exactly as listed.`;
+Examples for two tiles:
+${exampleObs}
+
+IMPORTANT RULES for what counts as "on" the red square:
+  - Only what is BASED on the red square counts. A piece's tall top may extend above the red square from the rank behind — DO NOT count that piece as being on the red square; the base of the piece tells you which square it sits on.
+  - Look at where the bottom/base of each piece touches the board.
+  - The red outline marks the EXACT cell of interest; ignore neighbouring pieces unless their base is INSIDE the outline.
+
+After all ${disputed.length} observation lines, output exactly one final line:
+  ANSWER: <san>
+
+Where <san> is one of the candidates above written exactly as listed.`;
 }
 
 function describeMove(prevFen: string, san: string): string {
@@ -389,43 +420,208 @@ function openAiDispatch(
   };
 }
 
-function parseResponse(
+/**
+ * Parse VLM output and pick the matching candidate DETERMINISTICALLY from
+ * its per-square observations. The model's job is the easy part (identify
+ * what's on each red-outlined square); we do the candidate-matching in
+ * code. This decouples vision from decision: the model can identify
+ * pieces correctly but pick the wrong SAN — happens often enough on tight
+ * candidate sets — and our code still arrives at the right answer.
+ *
+ * Fallback hierarchy:
+ *   1. Match candidates to per-square observations (preferred).
+ *   2. Honour the VLM's explicit ANSWER line (when 1 is inconclusive).
+ *   3. Last-resort: search for any candidate SAN in the response text.
+ */
+export function parseResponse(
   raw: string,
   candidatesSan: string[],
+  prevFen: string,
 ): CellVerifyResult {
   const trimmed = raw.trim();
-  const observations: CellObservation[] = [];
-  for (const line of trimmed.split(/\r?\n/)) {
-    const m = line.match(/^\s*([a-h][1-8])\s*[:=]\s*(.+?)\s*$/i);
-    if (m) observations.push({ square: m[1].toLowerCase(), piece: m[2].trim() });
+  const observations = parseObservations(trimmed);
+
+  // --- Path 1: deterministic match from observations -------------------
+  const deterministic = pickByObservations(observations, candidatesSan, prevFen);
+  if (deterministic) {
+    return {
+      kind: "matched",
+      san: deterministic.san,
+      raw,
+      observations,
+      via: "deterministic",
+      matchDetails: {
+        matches: deterministic.matches,
+        conflicts: deterministic.conflicts,
+        margin: deterministic.margin,
+      },
+    };
   }
+
+  // --- Path 2: ANSWER: <san> line --------------------------------------
   const answerMatch = trimmed.match(/ANSWER\s*[:=]\s*([A-Za-z0-9+#=\-]+)/i);
   if (answerMatch) {
     const guess = answerMatch[1];
     for (const san of candidatesSan) {
-      if (san === guess) return { kind: "matched", san, raw, observations };
+      if (san === guess) {
+        return { kind: "matched", san, raw, observations, via: "answer-line" };
+      }
       if (san.replace(/[+#]+$/, "") === guess.replace(/[+#]+$/, "")) {
-        return { kind: "matched", san, raw, observations };
+        return { kind: "matched", san, raw, observations, via: "answer-line" };
       }
     }
   }
-  // Fallback: search for any candidate SAN on the last non-empty line.
+
+  // --- Path 3: any candidate SAN appears anywhere ----------------------
   const lines = trimmed.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
   const last = lines[lines.length - 1] ?? "";
   const byLength = [...candidatesSan].sort((a, b) => b.length - a.length);
   for (const san of byLength) {
     const re = new RegExp(`(^|[^A-Za-z0-9])${escapeRegExp(san)}([^A-Za-z0-9]|$)`);
-    if (re.test(last)) return { kind: "matched", san, raw, observations };
+    if (re.test(last)) {
+      return { kind: "matched", san, raw, observations, via: "san-search" };
+    }
   }
   for (const san of byLength) {
     const re = new RegExp(`(^|[^A-Za-z0-9])${escapeRegExp(san)}([^A-Za-z0-9]|$)`);
-    if (re.test(trimmed)) return { kind: "matched", san, raw, observations };
+    if (re.test(trimmed)) {
+      return { kind: "matched", san, raw, observations, via: "san-search" };
+    }
   }
   return {
     kind: "rejected",
     raw,
     reason: "response did not match any candidate",
     observations,
+  };
+}
+
+/**
+ * Pull per-square observations out of a VLM response. Tolerant to wrappers
+ * like "Square e7: ..." or " - e7 = black bishop." — we just scan each
+ * line for a `<file><rank> <separator> <description>` pattern.
+ */
+function parseObservations(raw: string): CellObservation[] {
+  const observations: CellObservation[] = [];
+  const seen = new Set<string>();
+  for (const line of raw.split(/\r?\n/)) {
+    const m = line.match(
+      /\b([a-h])([1-8])\b\s*[:=\-—]+\s*([A-Za-z][A-Za-z0-9 \-_/]+?)(?:[.,;]|$)/i,
+    );
+    if (!m) continue;
+    const sq = (m[1] + m[2]).toLowerCase();
+    if (seen.has(sq)) continue; // first mention wins
+    seen.add(sq);
+    observations.push({ square: sq, piece: m[3].trim() });
+  }
+  return observations;
+}
+
+type ParsedPiece =
+  | { kind: "empty" }
+  | { kind: "exact"; color: "w" | "b"; type: "p" | "n" | "b" | "r" | "q" | "k" }
+  | { kind: "color"; color: "w" | "b" };
+
+function parsePieceObservation(s: string): ParsedPiece | undefined {
+  const t = s.toLowerCase().trim().replace(/[_/]+/g, "-");
+  if (/^(empty|none|nothing|vacant|no\s*piece|blank)$/.test(t)) {
+    return { kind: "empty" };
+  }
+  const colorMatch = t.match(/\b(white|black)\b/);
+  if (!colorMatch) return undefined;
+  const color = colorMatch[1] === "white" ? "w" : "b";
+  const pieceMatch = t.match(/\b(pawn|knight|bishop|rook|queen|king)\b/);
+  if (pieceMatch) {
+    const map: Record<string, "p" | "n" | "b" | "r" | "q" | "k"> = {
+      pawn: "p",
+      knight: "n",
+      bishop: "b",
+      rook: "r",
+      queen: "q",
+      king: "k",
+    };
+    return { kind: "exact", color, type: map[pieceMatch[1]] };
+  }
+  return { kind: "color", color };
+}
+
+function pieceMatches(predicted: string | null, observed: ParsedPiece): boolean {
+  if (observed.kind === "empty") return predicted === null;
+  if (predicted === null) return false;
+  if (observed.kind === "color") return predicted[0] === observed.color;
+  return predicted[0] === observed.color && predicted[1] === observed.type;
+}
+
+/**
+ * For each candidate, score how many observed squares its predicted
+ * after-state matches. Returns the candidate with the highest net score
+ * (matches − conflicts) when there's a CLEAR winner.
+ *
+ * A clear winner means:
+ *   - at least 2 observed squares match its prediction, AND
+ *   - matches > conflicts (more right than wrong), AND
+ *   - score advantage over the runner-up is at least 2.
+ *
+ * The margin requirement is deliberately conservative: this matcher only
+ * fires when it can override the upstream CV pick with high confidence.
+ * Anything murkier falls through to the ANSWER-line and SAN-search paths.
+ *
+ * Why 2 for both: each observation that disagrees moves the score by 2
+ * (one less match, one more conflict). A margin of 2 ≈ "off by one
+ * observation" — robust to a single mis-ID by the VLM.
+ */
+function pickByObservations(
+  observations: CellObservation[],
+  candidatesSan: string[],
+  prevFen: string,
+): {
+  san: string;
+  matches: number;
+  conflicts: number;
+  margin: number;
+} | null {
+  if (observations.length === 0) return null;
+  const parsed = new Map<string, ParsedPiece>();
+  for (const obs of observations) {
+    const p = parsePieceObservation(obs.piece);
+    if (p) parsed.set(obs.square, p);
+  }
+  if (parsed.size === 0) return null;
+
+  const scored: { san: string; score: number; matches: number; conflicts: number }[] = [];
+  for (const san of candidatesSan) {
+    const sim = new Chess(prevFen);
+    let m;
+    try {
+      m = sim.move(san);
+    } catch {
+      continue;
+    }
+    if (!m) continue;
+    const board = fenToBoardWithTypes(sim.fen());
+    let matches = 0;
+    let conflicts = 0;
+    for (const [sq, observed] of parsed) {
+      const idx = sanToIdx(sq);
+      const predicted = board[idx];
+      if (pieceMatches(predicted, observed)) matches++;
+      else conflicts++;
+    }
+    scored.push({ san, score: matches - conflicts, matches, conflicts });
+  }
+  if (scored.length === 0) return null;
+  scored.sort((a, b) => b.score - a.score);
+  const best = scored[0];
+  const next = scored[1];
+  const margin = next ? best.score - next.score : Infinity;
+  if (best.matches < 2) return null;
+  if (best.matches <= best.conflicts) return null;
+  if (margin < 2) return null;
+  return {
+    san: best.san,
+    matches: best.matches,
+    conflicts: best.conflicts,
+    margin,
   };
 }
 

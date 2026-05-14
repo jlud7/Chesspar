@@ -86,9 +86,13 @@ export function makeGeminiVerifier(
         // API call. Mis-calibrated corners can leak a rotated rectified
         // board into the VLM, which then identifies pieces against an
         // unfamiliar orientation and produces confidently wrong picks.
-        const { oriented: orientedAfter } = ensureWhiteAtBottom(boardImage);
+        // Pass `previousFen` so the FEN-aware orientation check fires.
+        const { oriented: orientedAfter } = ensureWhiteAtBottom(
+          boardImage,
+          previousFen,
+        );
         const orientedBefore = previousBoardImage
-          ? ensureWhiteAtBottom(previousBoardImage).oriented
+          ? ensureWhiteAtBottom(previousBoardImage, previousFen).oriented
           : undefined;
         const afterB64 = canvasToBase64(orientedAfter);
         const beforeB64 = orientedBefore
@@ -171,9 +175,13 @@ function makeOpenAiVerifierFromCall(args: OpenAiCallArgs): VlmVerifier {
         // API call. Mis-calibrated corners can leak a rotated rectified
         // board into the VLM, which then identifies pieces against an
         // unfamiliar orientation and produces confidently wrong picks.
-        const { oriented: orientedAfter } = ensureWhiteAtBottom(boardImage);
+        // Pass `previousFen` so the FEN-aware orientation check fires.
+        const { oriented: orientedAfter } = ensureWhiteAtBottom(
+          boardImage,
+          previousFen,
+        );
         const orientedBefore = previousBoardImage
-          ? ensureWhiteAtBottom(previousBoardImage).oriented
+          ? ensureWhiteAtBottom(previousBoardImage, previousFen).oriented
           : undefined;
         const afterB64 = canvasToBase64(orientedAfter);
         const beforeB64 = orientedBefore
@@ -261,9 +269,13 @@ export function makeAnthropicVerifier(
         // API call. Mis-calibrated corners can leak a rotated rectified
         // board into the VLM, which then identifies pieces against an
         // unfamiliar orientation and produces confidently wrong picks.
-        const { oriented: orientedAfter } = ensureWhiteAtBottom(boardImage);
+        // Pass `previousFen` so the FEN-aware orientation check fires.
+        const { oriented: orientedAfter } = ensureWhiteAtBottom(
+          boardImage,
+          previousFen,
+        );
         const orientedBefore = previousBoardImage
-          ? ensureWhiteAtBottom(previousBoardImage).oriented
+          ? ensureWhiteAtBottom(previousBoardImage, previousFen).oriented
           : undefined;
         const afterB64 = canvasToBase64(orientedAfter);
         const beforeB64 = orientedBefore
@@ -367,9 +379,13 @@ export function makeAnthropicProxyVerifier(
         // API call. Mis-calibrated corners can leak a rotated rectified
         // board into the VLM, which then identifies pieces against an
         // unfamiliar orientation and produces confidently wrong picks.
-        const { oriented: orientedAfter } = ensureWhiteAtBottom(boardImage);
+        // Pass `previousFen` so the FEN-aware orientation check fires.
+        const { oriented: orientedAfter } = ensureWhiteAtBottom(
+          boardImage,
+          previousFen,
+        );
         const orientedBefore = previousBoardImage
-          ? ensureWhiteAtBottom(previousBoardImage).oriented
+          ? ensureWhiteAtBottom(previousBoardImage, previousFen).oriented
           : undefined;
         const afterB64 = canvasToBase64(orientedAfter);
         const beforeB64 = orientedBefore

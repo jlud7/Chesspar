@@ -910,8 +910,13 @@ export function CaptureGame() {
       const second = cvResult.ranked[1];
       const margin =
         top && second ? second.weightedMismatch - top.weightedMismatch : Infinity;
+      // top-K = 10 is intentionally wide. The cell-tile verifier only
+      // asks about disputed squares, so adding candidates is cheap as
+      // long as they bring NEW information. A wider window guarantees
+      // the correct move is in the list even when CV's ranking is off
+      // — the back-rank confusion misses had the right move at rank 4+.
       const topKCandidates = cvResult.ranked
-        .slice(0, 6)
+        .slice(0, 10)
         .map((c) => c.move.san);
       const disputedSquares = findDisputedSquares(fenBefore, topKCandidates);
       // CV is fully unambiguous only when NO disputed squares remain
@@ -958,7 +963,7 @@ export function CaptureGame() {
               before: prev?.warped,
               after: warped,
               previousFen: fenBefore,
-              candidatesSan: topKCandidates.slice(0, 5),
+              candidatesSan: topKCandidates.slice(0, 8),
             });
             if (fullPicked) {
               appliedMove = fullPicked.move;
@@ -1096,12 +1101,30 @@ export function CaptureGame() {
       });
       if (result.kind !== "matched") {
         if (result.kind === "rejected") {
-          console.warn("cell-tile VLM rejected:", result.reason, result.raw);
+          console.warn(
+            "cell-tile VLM rejected:",
+            result.reason,
+            "observations:",
+            result.observations,
+            "raw:",
+            result.raw,
+          );
         } else {
           console.warn("cell-tile VLM error:", result.reason);
         }
         return null;
       }
+      // Trace which path produced the match. "deterministic" means the
+      // observation-vs-candidate match in code; "answer-line" / "san-search"
+      // are weaker fallbacks that trust the model's stated SAN. Surfacing
+      // this in logs makes it easy to spot when the model's vision is
+      // good but its reasoning is off (or vice versa).
+      console.info(
+        `cell-tile VLM matched ${result.san} via ${result.via}`,
+        result.matchDetails ?? "",
+        "observations:",
+        result.observations,
+      );
       let applied;
       try {
         applied = chessRef.current.move(result.san);
