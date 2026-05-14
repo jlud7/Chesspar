@@ -2027,6 +2027,13 @@ function SettingsScreen({
   vlmConfig: VlmConfig | null;
   onChangeVlmConfig: (next: VlmConfig | null) => void;
 }) {
+  const startLabel = testMode
+    ? testFrameCount > 0
+      ? "Start replay"
+      : "Choose photos to begin"
+    : "Start game";
+  const startDisabled = testMode && testFrameCount === 0;
+
   return (
     <div className="relative flex flex-1 flex-col overflow-y-auto px-5 py-8">
       <Link
@@ -2035,19 +2042,25 @@ function SettingsScreen({
       >
         ← Home
       </Link>
-      <div className="mx-auto w-full max-w-md">
-        <div className="mb-1 mt-6 text-[11px] uppercase tracking-[0.3em] text-emerald-300">
-          New game
+      <div className="mx-auto flex w-full max-w-md flex-col gap-6">
+        <div className="mt-6">
+          <div className="text-[11px] uppercase tracking-[0.3em] text-emerald-300">
+            New game
+          </div>
+          <h1 className="mt-1 text-[2rem] font-semibold tracking-tight">
+            {testMode ? "Replay from photos" : "Ready to play"}
+          </h1>
+          <p className="mt-1 text-[14px] leading-snug text-zinc-400">
+            {testMode
+              ? "Load a sequence of board photos — we'll step through them as if you were tapping a clock."
+              : "Pick a time control. The board lines itself up the moment you start."}
+          </p>
         </div>
-        <h1 className="mb-2 text-[2rem] font-semibold tracking-tight">
-          Set up the board
-        </h1>
-        <p className="mb-7 text-[15px] leading-snug text-zinc-400">
-          Pick a time control. We&apos;ll calibrate the camera once and then
-          watch the board between each tap of your clock.
-        </p>
 
-        <SettingsSection title="Time control">
+        <div>
+          <div className="mb-2 text-[10px] font-semibold uppercase tracking-[0.3em] text-zinc-400">
+            Time control
+          </div>
           <div className="grid grid-cols-2 gap-2">
             {PRESETS.map((p) => {
               const selected =
@@ -2069,219 +2082,173 @@ function SettingsScreen({
               );
             })}
           </div>
-          <div className="mt-3">
-            <CustomTcEditor tc={tc} onChange={onChangeTc} />
-          </div>
-        </SettingsSection>
-
-        <SettingsSection title="Source">
-          {hasSavedCorners && !testMode && (
-            <div className="mb-3 flex items-center justify-between rounded-2xl border border-white/5 bg-white/5 px-3 py-2 text-[13px] text-zinc-300">
-              <span>Board corners saved from last session.</span>
-              <button
-                onClick={onClearCorners}
-                className="rounded-full border border-white/10 bg-white/5 px-2.5 py-0.5 text-[11px] text-zinc-200 hover:bg-white/10"
-              >
-                Recalibrate
-              </button>
+          <details className="mt-3 rounded-2xl border border-white/5 bg-white/5 px-3 py-2">
+            <summary className="cursor-pointer text-[12px] font-medium tracking-wide text-zinc-200">
+              Custom time control
+            </summary>
+            <div className="mt-2">
+              <CustomTcEditor tc={tc} onChange={onChangeTc} />
             </div>
-          )}
-          <div className="rounded-2xl border border-white/5 bg-white/5 p-3">
-            <label className="flex items-center justify-between gap-3">
-              <span className="text-[13px] font-medium text-zinc-100">
-                Replay from photos
-              </span>
-              <input
-                type="checkbox"
-                checked={testMode}
-                onChange={(e) => onToggleTestMode(e.target.checked)}
-                className="h-5 w-5 cursor-pointer accent-emerald-500"
-              />
-            </label>
-            <p className="mt-1 text-[11px] leading-snug text-zinc-400">
-              Skip the live camera and feed the pipeline a sequence of
-              still photos instead.
-            </p>
-            {testMode && (
-              <div className="mt-3 space-y-2">
-                <ol className="space-y-1 rounded-xl bg-black/30 px-3 py-2 text-[11px] leading-snug text-zinc-300">
-                  <li>
-                    <span className="font-medium text-emerald-300">
-                      Photo 1
-                    </span>{" "}
-                    — the starting position, before any moves.
-                  </li>
-                  <li>
-                    <span className="font-medium text-emerald-300">
-                      Photos 2…N
-                    </span>{" "}
-                    — one per half-move, in order (white, black, white…).
-                    Each clock tap advances to the next photo.
-                  </li>
-                </ol>
-                <label className="inline-flex cursor-pointer items-center justify-center gap-2 rounded-full border border-white/10 bg-white/10 px-3 py-1.5 text-[12px] text-zinc-100 hover:bg-white/15">
-                  <input
-                    type="file"
-                    accept="image/*"
-                    multiple
-                    onChange={(e) => onLoadTestFrames(e.target.files)}
-                    className="hidden"
-                  />
-                  {testFrameCount > 0 ? "Replace photos" : "Choose photos"}
-                </label>
-                {testFrameCount > 0 && (
-                  <>
-                    <p className="text-[11px] text-zinc-400">
-                      {testFrameCount} loaded ·{" "}
-                      <span className="text-zinc-200">
-                        1 starting + {testFrameCount - 1} half-move
-                        {testFrameCount - 1 === 1 ? "" : "s"}
-                      </span>
-                      {testFrameCount >= 3 && (
-                        <>
-                          {" "}
-                          ({Math.floor((testFrameCount - 1) / 2)} full turn
-                          {Math.floor((testFrameCount - 1) / 2) === 1
-                            ? ""
-                            : "s"}
-                          {(testFrameCount - 1) % 2 === 1
-                            ? " + white's move"
-                            : ""}
-                          )
-                        </>
-                      )}
-                    </p>
-                    <div className="flex gap-1.5 overflow-x-auto pb-1">
-                      {testFrameSrcs.map((src, i) => (
-                        <div
-                          key={`${src}-${i}`}
-                          className="relative shrink-0"
-                          title={
-                            i === 0
-                              ? "Photo 1 — starting position"
-                              : `Photo ${i + 1} — half-move ${i} (${
-                                  i % 2 === 1 ? "white" : "black"
-                                })`
-                          }
-                        >
-                          {/* eslint-disable-next-line @next/next/no-img-element */}
-                          <img
-                            src={src}
-                            alt={`Photo ${i + 1}`}
-                            className={clsx(
-                              "h-12 w-12 rounded-md object-cover ring-1",
-                              i === 0
-                                ? "ring-emerald-400/70"
-                                : "ring-white/10",
-                            )}
-                          />
-                          <span
-                            className={clsx(
-                              "absolute bottom-0.5 right-0.5 rounded-sm px-1 text-[9px] font-semibold leading-tight tabular-nums",
-                              i === 0
-                                ? "bg-emerald-500/90 text-emerald-950"
-                                : "bg-black/70 text-zinc-100",
-                            )}
-                          >
-                            {i === 0 ? "start" : i}
-                          </span>
-                        </div>
-                      ))}
-                    </div>
-                    <p className="text-[10px] text-zinc-500">
-                      Confirm the order looks right — first should be the
-                      starting position, then each half-move in sequence.
-                    </p>
-                  </>
-                )}
-              </div>
-            )}
-          </div>
-        </SettingsSection>
-
-        <SettingsSection title="Vision-LM fallback">
-          {VLM_PROXY_URL ? (
-            <div className="rounded-2xl border border-emerald-500/30 bg-emerald-500/10 p-3 text-[12px] text-emerald-100">
-              <div className="font-medium">
-                {VLM_PROXY_PROVIDER === "openai" ? "GPT-5" : "Claude"} is
-                enabled by default.
-              </div>
-              <div className="mt-1 text-[11px] text-emerald-200/80">
-                Photo identification runs through the bundled proxy — no
-                key needed. Paste your own key below to override.
-              </div>
-              <details className="mt-2 text-[11px] text-emerald-100/80">
-                <summary className="cursor-pointer">Override with your own key</summary>
-                <div className="mt-2">
-                  <VlmConfigEditor
-                    config={vlmConfig}
-                    onChange={onChangeVlmConfig}
-                  />
-                </div>
-              </details>
-            </div>
-          ) : (
-            <VlmConfigEditor config={vlmConfig} onChange={onChangeVlmConfig} />
-          )}
-        </SettingsSection>
+          </details>
+        </div>
 
         <button
           onClick={onStart}
-          disabled={testMode && testFrameCount === 0}
-          className="mt-2 block w-full rounded-2xl bg-emerald-500/90 px-4 py-3.5 text-base font-semibold text-emerald-950 transition hover:bg-emerald-400 disabled:cursor-not-allowed disabled:bg-zinc-800 disabled:text-zinc-500"
+          disabled={startDisabled}
+          className="rounded-2xl bg-emerald-500/95 px-4 py-4 text-base font-semibold text-emerald-950 shadow-lg shadow-emerald-500/15 transition hover:bg-emerald-400 disabled:cursor-not-allowed disabled:bg-zinc-800 disabled:text-zinc-500 disabled:shadow-none"
         >
-          {testMode
-            ? "Start with test photos"
-            : hasSavedCorners
-              ? "Start game"
-              : "Calibrate & start"}
+          {startLabel}
         </button>
 
-        {!testMode && (
-          <p className="mt-3 text-center text-[11px] tracking-wide text-zinc-500">
-            We&apos;ll ask for camera permission once.
-          </p>
-        )}
-
-        {cameraError && (
-          <div className="mt-4 rounded-2xl border border-amber-400/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-100">
-            Camera unavailable: {cameraError}. The clock will still work; no
-            photos will be saved.
+        {hasSavedCorners && !testMode && (
+          <div className="-mt-3 flex items-center justify-between rounded-full border border-emerald-400/30 bg-emerald-500/10 px-4 py-1.5 text-[11px] text-emerald-100">
+            <span className="inline-flex items-center gap-2">
+              <span className="inline-block h-1.5 w-1.5 rounded-full bg-emerald-400" />
+              Board calibrated from last session
+            </span>
+            <button
+              onClick={onClearCorners}
+              className="text-[10px] uppercase tracking-widest text-emerald-200 hover:text-emerald-50"
+            >
+              Forget
+            </button>
           </div>
         )}
 
-        <div className="mt-8 rounded-2xl border border-white/5 bg-white/5 px-4 py-3 text-[12px] text-zinc-400">
-          <div className="mb-1 text-[10px] font-semibold uppercase tracking-[0.3em] text-zinc-300">
-            Tip
+        {cameraError && !testMode && (
+          <div className="rounded-2xl border border-amber-400/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-100">
+            Camera unavailable: {cameraError}. Clock still works; no photos
+            will be saved.
           </div>
-          Visit{" "}
-          <Link
-            href="/detect"
-            className="font-medium text-emerald-300 underline-offset-2 hover:underline"
-          >
-            /detect
-          </Link>{" "}
-          to test the rectifier + classifier on a still photo first.
-        </div>
+        )}
+
+        <details className="rounded-2xl border border-white/5 bg-white/5">
+          <summary className="cursor-pointer list-none px-4 py-3 text-[12px] font-semibold uppercase tracking-[0.3em] text-zinc-300">
+            <span className="float-right text-zinc-500">▾</span>
+            Advanced
+          </summary>
+          <div className="space-y-4 border-t border-white/5 px-4 py-4">
+            <div>
+              <label className="flex items-center justify-between gap-3">
+                <span className="text-[13px] font-medium text-zinc-100">
+                  Replay from photos
+                </span>
+                <input
+                  type="checkbox"
+                  checked={testMode}
+                  onChange={(e) => onToggleTestMode(e.target.checked)}
+                  className="h-5 w-5 cursor-pointer accent-emerald-500"
+                />
+              </label>
+              <p className="mt-1 text-[11px] leading-snug text-zinc-400">
+                Feed a sequence of still photos through the pipeline instead
+                of the live camera. Useful for debugging or testing.
+              </p>
+              {testMode && (
+                <div className="mt-3 space-y-2">
+                  <label className="inline-flex cursor-pointer items-center justify-center gap-2 rounded-full border border-white/10 bg-white/10 px-3 py-1.5 text-[12px] text-zinc-100 hover:bg-white/15">
+                    <input
+                      type="file"
+                      accept="image/*"
+                      multiple
+                      onChange={(e) => onLoadTestFrames(e.target.files)}
+                      className="hidden"
+                    />
+                    {testFrameCount > 0 ? "Replace photos" : "Choose photos"}
+                  </label>
+                  {testFrameCount > 0 && (
+                    <>
+                      <p className="text-[11px] text-zinc-400">
+                        {testFrameCount} loaded ·{" "}
+                        <span className="text-zinc-200">
+                          1 starting + {testFrameCount - 1} half-move
+                          {testFrameCount - 1 === 1 ? "" : "s"}
+                        </span>
+                      </p>
+                      <div className="flex gap-1.5 overflow-x-auto pb-1">
+                        {testFrameSrcs.map((src, i) => (
+                          <div
+                            key={`${src}-${i}`}
+                            className="relative shrink-0"
+                            title={
+                              i === 0
+                                ? "Photo 1 — starting position"
+                                : `Photo ${i + 1} — half-move ${i}`
+                            }
+                          >
+                            {/* eslint-disable-next-line @next/next/no-img-element */}
+                            <img
+                              src={src}
+                              alt={`Photo ${i + 1}`}
+                              className={clsx(
+                                "h-12 w-12 rounded-md object-cover ring-1",
+                                i === 0
+                                  ? "ring-emerald-400/70"
+                                  : "ring-white/10",
+                              )}
+                            />
+                            <span
+                              className={clsx(
+                                "absolute bottom-0.5 right-0.5 rounded-sm px-1 text-[9px] font-semibold leading-tight tabular-nums",
+                                i === 0
+                                  ? "bg-emerald-500/90 text-emerald-950"
+                                  : "bg-black/70 text-zinc-100",
+                              )}
+                            >
+                              {i === 0 ? "start" : i}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </>
+                  )}
+                </div>
+              )}
+            </div>
+
+            <div>
+              <div className="mb-1.5 text-[10px] font-semibold uppercase tracking-[0.3em] text-zinc-400">
+                Vision model fallback
+              </div>
+              {VLM_PROXY_URL ? (
+                <div className="rounded-xl border border-emerald-500/30 bg-emerald-500/10 p-3 text-[12px] text-emerald-100">
+                  <div className="font-medium">
+                    {VLM_PROXY_PROVIDER === "openai" ? "GPT-5" : "Claude"} is
+                    enabled by default.
+                  </div>
+                  <details className="mt-2 text-[11px] text-emerald-100/80">
+                    <summary className="cursor-pointer">
+                      Override with your own key
+                    </summary>
+                    <div className="mt-2">
+                      <VlmConfigEditor
+                        config={vlmConfig}
+                        onChange={onChangeVlmConfig}
+                      />
+                    </div>
+                  </details>
+                </div>
+              ) : (
+                <VlmConfigEditor
+                  config={vlmConfig}
+                  onChange={onChangeVlmConfig}
+                />
+              )}
+            </div>
+
+            <div className="text-[11px] text-zinc-500">
+              Want to try the rectifier on a still photo first?{" "}
+              <Link
+                href="/detect"
+                className="font-medium text-emerald-300 underline-offset-2 hover:underline"
+              >
+                /detect
+              </Link>
+            </div>
+          </div>
+        </details>
       </div>
     </div>
-  );
-}
-
-function SettingsSection({
-  title,
-  children,
-}: {
-  title: string;
-  children: ReactNode;
-}) {
-  return (
-    <section className="mb-5">
-      <div className="mb-2 text-[10px] font-semibold uppercase tracking-[0.3em] text-zinc-500">
-        {title}
-      </div>
-      {children}
-    </section>
   );
 }
 
