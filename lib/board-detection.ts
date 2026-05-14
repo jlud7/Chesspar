@@ -626,13 +626,24 @@ export function scorePlayingOrientation(
  * picking whichever cyclic rotation has the smallest total point-distance,
  * then accept the refined corners only if they're close enough to the
  * saved ones (i.e. the camera was nudged, not entirely re-pointed).
+ *
+ * Detection wobbles by ~0.5–1 square width across frames as pieces move
+ * and partially occlude the dark squares — their centroids shift toward
+ * the still-visible pixels. We treat that as noise rather than camera
+ * motion: `drifted` only flips true once drift exceeds ~3% of the image
+ * diagonal (≈50 px on an iPhone shot), which is larger than detector
+ * wobble but smaller than any real re-aim of the camera.
  */
 export function refineCornersForFrame(
   frame: HTMLImageElement | HTMLCanvasElement,
   saved: [Point, Point, Point, Point],
-  options: { maxAvgDriftFraction?: number } = {},
+  options: {
+    maxAvgDriftFraction?: number;
+    minDriftToTriggerSwap?: number;
+  } = {},
 ): { corners: [Point, Point, Point, Point]; drifted: boolean } {
   const maxAvgDriftFraction = options.maxAvgDriftFraction ?? 0.1;
+  const minDriftToTriggerSwap = options.minDriftToTriggerSwap ?? 0.03;
   const detected = detectBoardViaRedness(frame);
   if (!detected) return { corners: saved, drifted: false };
   const w =
@@ -663,7 +674,14 @@ export function refineCornersForFrame(
   if (driftFraction > maxAvgDriftFraction) {
     return { corners: saved, drifted: false };
   }
-  return { corners: bestAligned, drifted: driftFraction > 0.005 };
+  // Below the swap threshold the detection is treated as noise and the
+  // saved corners are kept verbatim. Returning `saved` (rather than the
+  // wobbly `bestAligned`) keeps the warp stable across frames so the
+  // occupancy-diff move matcher doesn't see ghost square changes.
+  if (driftFraction <= minDriftToTriggerSwap) {
+    return { corners: saved, drifted: false };
+  }
+  return { corners: bestAligned, drifted: true };
 }
 
 /**
