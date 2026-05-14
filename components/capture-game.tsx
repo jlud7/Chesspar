@@ -951,6 +951,7 @@ export function CaptureGame() {
             after: warped,
             previousFen: fenBefore,
             candidatesSan: topKCandidates,
+            cvTopSan: cvResult.pick?.move.san ?? topKCandidates[0] ?? null,
           });
           if (cellPicked) {
             appliedMove = cellPicked.move;
@@ -1083,6 +1084,15 @@ export function CaptureGame() {
     after: HTMLCanvasElement;
     previousFen: string;
     candidatesSan: string[];
+    /**
+     * CV's top pick — the cell verifier may only OVERRIDE this when its
+     * decision came from the deterministic observation-match path. Picks
+     * arrived at via the weaker ANSWER-line / SAN-search fallbacks are
+     * only honoured when they AGREE with CV. This is the lesson learnt
+     * from the previous "VLM tie-break dropped accuracy 86%→71%" round:
+     * weak VLM signals must never overrule CV.
+     */
+    cvTopSan: string | null;
   }): Promise<{ move: ChessMove; fen: string } | null> {
     const config = vlmConfigRef.current;
     if (!config?.apiKey && !VLM_PROXY_URL) return null;
@@ -1114,11 +1124,23 @@ export function CaptureGame() {
         }
         return null;
       }
-      // Trace which path produced the match. "deterministic" means the
-      // observation-vs-candidate match in code; "answer-line" / "san-search"
-      // are weaker fallbacks that trust the model's stated SAN. Surfacing
-      // this in logs makes it easy to spot when the model's vision is
-      // good but its reasoning is off (or vice versa).
+      // Trust gate: only let the VLM override CV when the match came
+      // from the deterministic observation-vs-candidate matcher. Weak
+      // paths (answer-line / san-search) may only confirm CV — if they
+      // disagree, we don't trust them, because that's exactly the
+      // hallucination mode that hurt accuracy in the previous round.
+      const overridesCv =
+        args.cvTopSan != null && result.san !== args.cvTopSan;
+      if (overridesCv && result.via !== "deterministic") {
+        console.warn(
+          `cell-tile VLM weak path (${result.via}) tried to override CV top-1 (${args.cvTopSan} → ${result.san}); ignoring`,
+          "observations:",
+          result.observations,
+          "raw:",
+          result.raw,
+        );
+        return null;
+      }
       console.info(
         `cell-tile VLM matched ${result.san} via ${result.via}`,
         result.matchDetails ?? "",

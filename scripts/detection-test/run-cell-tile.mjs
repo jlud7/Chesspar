@@ -238,13 +238,21 @@ for (let i = 0; i < GROUND_TRUTH.length; i++) {
       observations = r.result.observations ?? [];
       rotationDeg = r.rotationDeg;
       if (r.result.kind === "matched") {
-        final = r.result.san;
+        const cvTop = topK[0];
         via = r.result.via;
         matchDetails = r.result.matchDetails;
-        const dets = matchDetails
-          ? ` matches=${matchDetails.matches} conflicts=${matchDetails.conflicts} margin=${matchDetails.margin}`
-          : "";
-        pickedBy = `cell-tile VLM[${via}]${dets} (cv-margin=${margin.toFixed(2)}, disputed=${disputed.length}: ${disputed.join(",")})`;
+        const overridesCv = r.result.san !== cvTop;
+        if (overridesCv && via !== "deterministic") {
+          // Weak VLM signal trying to override CV — ignore, fall back to CV top-1.
+          final = cvTop;
+          pickedBy = `cell-tile VLM[${via}] disagreed with CV top-1 (${cvTop}), trust gate ignored VLM → ${cvTop}`;
+        } else {
+          final = r.result.san;
+          const dets = matchDetails
+            ? ` matches=${matchDetails.matches} conflicts=${matchDetails.conflicts} margin=${matchDetails.margin}`
+            : "";
+          pickedBy = `cell-tile VLM[${via}]${dets} (cv-margin=${margin.toFixed(2)}, disputed=${disputed.length}: ${disputed.join(",")})`;
+        }
       } else {
         final = topK[0] ?? "?";
         pickedBy = `cell-VLM ${r.result.kind} → CV fallback (disputed=${disputed.length})`;
