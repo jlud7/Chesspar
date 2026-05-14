@@ -132,3 +132,93 @@ function sourceToCanvas(src: HTMLImageElement | HTMLCanvasElement): HTMLCanvasEl
   ctx.drawImage(src, 0, 0);
   return c;
 }
+
+export type Rotation = 0 | 90 | 180 | 270;
+
+/**
+ * Rotate a canvas by 0/90/180/270 degrees clockwise. Returns the input
+ * untouched on 0; allocates a fresh canvas otherwise.
+ */
+export function rotateCanvas(
+  canvas: HTMLCanvasElement,
+  degrees: Rotation,
+): HTMLCanvasElement {
+  if (degrees === 0) return canvas;
+  const out = document.createElement("canvas");
+  if (degrees === 90 || degrees === 270) {
+    out.width = canvas.height;
+    out.height = canvas.width;
+  } else {
+    out.width = canvas.width;
+    out.height = canvas.height;
+  }
+  const ctx = out.getContext("2d");
+  if (!ctx) throw new Error("rotateCanvas: failed to get 2D context");
+  ctx.save();
+  ctx.translate(out.width / 2, out.height / 2);
+  ctx.rotate((degrees * Math.PI) / 180);
+  ctx.drawImage(canvas, -canvas.width / 2, -canvas.height / 2);
+  ctx.restore();
+  return out;
+}
+
+/**
+ * Detect the rotation that puts WHITE PIECES at the bottom of the
+ * rectified board, and apply it. Returns the (possibly identical)
+ * canvas plus the rotation that was applied.
+ *
+ * Heuristic: white pieces are markedly brighter than black pieces, so
+ * the back-rank slice with white's pieces is the brightest of the four
+ * board edges. We sample the mean luminance of the outermost 2 ranks on
+ * each side (top / bottom / left / right) and rotate so that the
+ * brightest side ends up at the bottom of the canvas.
+ *
+ * This is a defence-in-depth check: the corner-ordering contract in
+ * warpBoard already produces "a8 top-left → white at bottom" output
+ * when corners are passed correctly, but mis-calibrated corners (board
+ * captured sideways, or rotated 180° by manual taps) would otherwise
+ * leak a wrong-orientation board into the VLM, which produces
+ * confidently-wrong piece identifications. White-at-bottom matches what
+ * VLMs have seen the most of during training.
+ */
+export function ensureWhiteAtBottom(
+  warped: HTMLCanvasElement,
+): { oriented: HTMLCanvasElement; rotationDeg: Rotation } {
+  const size = warped.width;
+  if (warped.height !== size) {
+    return { oriented: warped, rotationDeg: 0 };
+  }
+  const ctx = warped.getContext("2d", { willReadFrequently: true });
+  if (!ctx) return { oriented: warped, rotationDeg: 0 };
+  const cell = size / 8;
+  const strip = Math.max(2, Math.round(cell * 2));
+
+  function meanLum(x0: number, y0: number, w: number, h: number): number {
+    if (w <= 0 || h <= 0) return 0;
+    const data = ctx!.getImageData(x0, y0, w, h).data;
+    let s = 0;
+    const n = data.length / 4;
+    for (let i = 0; i < data.length; i += 4) {
+      s += 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+    }
+    return s / n;
+  }
+
+  const top = meanLum(0, 0, size, strip);
+  const bottom = meanLum(0, size - strip, size, strip);
+  const left = meanLum(0, 0, strip, size);
+  const right = meanLum(size - strip, 0, strip, size);
+
+  // Each entry says: "if we rotate by R, this side becomes the new bottom".
+  // CW rotation: original right → new bottom; 180 → top → new bottom; 270 (=90 CCW) → left → new bottom.
+  const candidates: { rot: Rotation; lum: number }[] = [
+    { rot: 0, lum: bottom },
+    { rot: 90, lum: right },
+    { rot: 180, lum: top },
+    { rot: 270, lum: left },
+  ];
+  candidates.sort((a, b) => b.lum - a.lum);
+  const best = candidates[0];
+  if (best.rot === 0) return { oriented: warped, rotationDeg: 0 };
+  return { oriented: rotateCanvas(warped, best.rot), rotationDeg: best.rot };
+}

@@ -28,6 +28,10 @@ import {
   type VlmVerifier,
   type VlmVerifyResult,
 } from "@/lib/vlm";
+import {
+  findDisputedSquares,
+  verifyByCellTiles,
+} from "@/lib/vlm-cell-verify";
 
 /**
  * If a VLM proxy URL is baked in at build time (Cloudflare Worker holding
@@ -890,27 +894,41 @@ export function CaptureGame() {
         cellDeltas,
       });
 
-      // Decision rule (validated against the 14-move ground-truth sample):
-      //   CV top-1 alone gets 86% (12/14) on the user's tilted-angle photos.
-      //   The VLM tie-break previously *lowered* accuracy to 71% by
-      //   overriding correct CV top-1 picks. So: trust CV top-1 whenever
-      //   it has a clear ranking advantage over top-2. Only invoke the
-      //   VLM when CV is genuinely undecided (tight margin or no pick).
+      // Decision rule:
+      //   1. If the top-K candidates AGREE on after-state (no piece-type
+      //      ambiguity) AND CV has a clear margin, trust CV top-1.
+      //   2. If there's any piece-type ambiguity in the top-K (the
+      //      Be7-vs-Ne7 case — multiple candidates predict different
+      //      pieces on overlapping squares), run the per-CELL VLM
+      //      verifier: it crops just the squares where candidates
+      //      disagree from the rectified board and asks the VLM what's
+      //      on each highlighted square. Much more reliable than the
+      //      full-photo path which hallucinates on tilted-angle shots.
+      //   3. Full-photo VLM remains as a final fallback if the cell
+      //      path errors out.
       const top = cvResult.ranked[0];
       const second = cvResult.ranked[1];
       const margin =
         top && second ? second.weightedMismatch - top.weightedMismatch : Infinity;
-      // Margin of 0.3 separates "CV is sure" from "CV is guessing".
-      const cvConfident =
+      const topKCandidates = cvResult.ranked
+        .slice(0, 6)
+        .map((c) => c.move.san);
+      const disputedSquares = findDisputedSquares(fenBefore, topKCandidates);
+      // CV is fully unambiguous only when NO disputed squares remain
+      // across the top-K AND the margin to the next candidate is wide.
+      const cvFullyConfident =
         cvResult.kind === "matched" &&
         cvResult.pick != null &&
+        disputedSquares.length === 0 &&
         margin >= 0.3;
 
       let viaVlm = false;
       let appliedMove: ChessMove | null = null;
       let appliedFen = fenBefore;
 
-      if (cvConfident && cvResult.pick) {
+      const hasVlmAccess = !!(vlmConfigRef.current?.apiKey || VLM_PROXY_URL);
+
+      if (cvFullyConfident && cvResult.pick) {
         appliedMove = cvResult.pick.move;
         appliedFen = cvResult.pick.updatedFen;
         chessRef.current.move({
@@ -918,27 +936,38 @@ export function CaptureGame() {
           to: appliedMove.to,
           promotion: appliedMove.promotion ?? "q",
         });
-      } else if (vlmConfigRef.current?.apiKey || VLM_PROXY_URL) {
-        const candidates = cvResult.ranked
-          .slice(0, 5)
-          .map((c) => c.move.san);
-        if (candidates.length > 0) {
-          setVlmActive(true);
-          try {
-            const vlmPicked = await runVlmIdentifier({
+      } else if (hasVlmAccess && topKCandidates.length > 0) {
+        setVlmActive(true);
+        try {
+          // Primary: per-cell tile verifier. Tiles are rectified, focused,
+          // and constrained — the VLM identifies what's on each disputed
+          // square rather than reading the whole tilted-angle photo.
+          const cellPicked = await runCellTileVerifier({
+            after: warped,
+            previousFen: fenBefore,
+            candidatesSan: topKCandidates,
+          });
+          if (cellPicked) {
+            appliedMove = cellPicked.move;
+            appliedFen = cellPicked.fen;
+            viaVlm = true;
+          } else {
+            // Fallback: full-photo path (legacy). Only kicks in if the
+            // cell verifier returned no match.
+            const fullPicked = await runVlmIdentifier({
               before: prev?.warped,
               after: warped,
               previousFen: fenBefore,
-              candidatesSan: candidates,
+              candidatesSan: topKCandidates.slice(0, 5),
             });
-            if (vlmPicked) {
-              appliedMove = vlmPicked.move;
-              appliedFen = vlmPicked.fen;
+            if (fullPicked) {
+              appliedMove = fullPicked.move;
+              appliedFen = fullPicked.fen;
               viaVlm = true;
             }
-          } finally {
-            setVlmActive(false);
           }
+        } finally {
+          setVlmActive(false);
         }
       }
 
@@ -1028,6 +1057,63 @@ export function CaptureGame() {
       }
       return next;
     });
+  }
+
+  /**
+   * Per-cell tile VLM verifier — the primary VLM path now. Crops the
+   * rectified AFTER-board around just the squares where the top-K
+   * candidates disagree on piece type, draws a red outline around each
+   * target cell, and asks the model to identify what's on the highlighted
+   * square. Then picks the candidate whose after-state matches the
+   * observations. Far more reliable than the full-photo path because the
+   * input is rectified (no tilt) and the question is constrained to
+   * per-square classification.
+   *
+   * Orientation safety: `verifyByCellTiles` internally runs
+   * `ensureWhiteAtBottom` on the rectified board before cropping tiles,
+   * so a mis-calibrated capture still produces canonically-oriented
+   * tiles for the API call.
+   */
+  async function runCellTileVerifier(args: {
+    after: HTMLCanvasElement;
+    previousFen: string;
+    candidatesSan: string[];
+  }): Promise<{ move: ChessMove; fen: string } | null> {
+    const config = vlmConfigRef.current;
+    if (!config?.apiKey && !VLM_PROXY_URL) return null;
+    if (args.candidatesSan.length === 0) return null;
+    const provider: VlmProvider = config?.apiKey
+      ? config.provider
+      : (VLM_PROXY_PROVIDER as VlmProvider);
+    try {
+      const result = await verifyByCellTiles({
+        afterWarped: args.after,
+        prevFen: args.previousFen,
+        candidatesSan: args.candidatesSan,
+        provider,
+        apiKey: config?.apiKey ?? undefined,
+        proxyUrl: VLM_PROXY_URL || undefined,
+      });
+      if (result.kind !== "matched") {
+        if (result.kind === "rejected") {
+          console.warn("cell-tile VLM rejected:", result.reason, result.raw);
+        } else {
+          console.warn("cell-tile VLM error:", result.reason);
+        }
+        return null;
+      }
+      let applied;
+      try {
+        applied = chessRef.current.move(result.san);
+      } catch {
+        return null;
+      }
+      if (!applied) return null;
+      return { move: applied as ChessMove, fen: chessRef.current.fen() };
+    } catch (e) {
+      console.warn("cell-tile VLM threw", e);
+      return null;
+    }
   }
 
   /**

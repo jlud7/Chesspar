@@ -10,7 +10,15 @@
  *
  * All callers go through the swappable `VlmVerifier` shape so we can
  * A/B different providers on the same input.
+ *
+ * Every verifier funnels its rectified board through `ensureWhiteAtBottom`
+ * before serialising to base64. Mis-calibrated corners (board rotated in
+ * the camera frame, or four-tap done in the wrong order) would otherwise
+ * leak a non-canonical orientation into the model, which is the single
+ * worst input we can give it.
  */
+
+import { ensureWhiteAtBottom } from "./board-image";
 
 export type VlmVerifyInput = {
   previousFen: string;
@@ -74,9 +82,17 @@ export function makeGeminiVerifier(
     provider: "gemini",
     async verify({ previousFen, legalMovesSan, boardImage, previousBoardImage }) {
       try {
-        const afterB64 = canvasToBase64(boardImage);
-        const beforeB64 = previousBoardImage
-          ? canvasToBase64(previousBoardImage)
+        // Force the canonical chess view (white at bottom) before the
+        // API call. Mis-calibrated corners can leak a rotated rectified
+        // board into the VLM, which then identifies pieces against an
+        // unfamiliar orientation and produces confidently wrong picks.
+        const { oriented: orientedAfter } = ensureWhiteAtBottom(boardImage);
+        const orientedBefore = previousBoardImage
+          ? ensureWhiteAtBottom(previousBoardImage).oriented
+          : undefined;
+        const afterB64 = canvasToBase64(orientedAfter);
+        const beforeB64 = orientedBefore
+          ? canvasToBase64(orientedBefore)
           : null;
         const prompt = beforeB64
           ? TWO_FRAME_PROMPT(previousFen, legalMovesSan)
@@ -151,9 +167,17 @@ function makeOpenAiVerifierFromCall(args: OpenAiCallArgs): VlmVerifier {
     provider: "openai",
     async verify({ previousFen, legalMovesSan, boardImage, previousBoardImage }) {
       try {
-        const afterB64 = canvasToBase64(boardImage);
-        const beforeB64 = previousBoardImage
-          ? canvasToBase64(previousBoardImage)
+        // Force the canonical chess view (white at bottom) before the
+        // API call. Mis-calibrated corners can leak a rotated rectified
+        // board into the VLM, which then identifies pieces against an
+        // unfamiliar orientation and produces confidently wrong picks.
+        const { oriented: orientedAfter } = ensureWhiteAtBottom(boardImage);
+        const orientedBefore = previousBoardImage
+          ? ensureWhiteAtBottom(previousBoardImage).oriented
+          : undefined;
+        const afterB64 = canvasToBase64(orientedAfter);
+        const beforeB64 = orientedBefore
+          ? canvasToBase64(orientedBefore)
           : null;
         const prompt = beforeB64
           ? TWO_FRAME_PROMPT(previousFen, legalMovesSan)
@@ -233,9 +257,17 @@ export function makeAnthropicVerifier(
     provider: "anthropic",
     async verify({ previousFen, legalMovesSan, boardImage, previousBoardImage }) {
       try {
-        const afterB64 = canvasToBase64(boardImage);
-        const beforeB64 = previousBoardImage
-          ? canvasToBase64(previousBoardImage)
+        // Force the canonical chess view (white at bottom) before the
+        // API call. Mis-calibrated corners can leak a rotated rectified
+        // board into the VLM, which then identifies pieces against an
+        // unfamiliar orientation and produces confidently wrong picks.
+        const { oriented: orientedAfter } = ensureWhiteAtBottom(boardImage);
+        const orientedBefore = previousBoardImage
+          ? ensureWhiteAtBottom(previousBoardImage).oriented
+          : undefined;
+        const afterB64 = canvasToBase64(orientedAfter);
+        const beforeB64 = orientedBefore
+          ? canvasToBase64(orientedBefore)
           : null;
         const prompt = beforeB64
           ? TWO_FRAME_PROMPT(previousFen, legalMovesSan)
@@ -331,9 +363,17 @@ export function makeAnthropicProxyVerifier(
     provider: "anthropic",
     async verify({ previousFen, legalMovesSan, boardImage, previousBoardImage }) {
       try {
-        const afterB64 = canvasToBase64(boardImage);
-        const beforeB64 = previousBoardImage
-          ? canvasToBase64(previousBoardImage)
+        // Force the canonical chess view (white at bottom) before the
+        // API call. Mis-calibrated corners can leak a rotated rectified
+        // board into the VLM, which then identifies pieces against an
+        // unfamiliar orientation and produces confidently wrong picks.
+        const { oriented: orientedAfter } = ensureWhiteAtBottom(boardImage);
+        const orientedBefore = previousBoardImage
+          ? ensureWhiteAtBottom(previousBoardImage).oriented
+          : undefined;
+        const afterB64 = canvasToBase64(orientedAfter);
+        const beforeB64 = orientedBefore
+          ? canvasToBase64(orientedBefore)
           : null;
         const prompt = beforeB64
           ? TWO_FRAME_PROMPT(previousFen, legalMovesSan)
