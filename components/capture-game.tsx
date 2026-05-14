@@ -149,8 +149,6 @@ export function CaptureGame() {
   const testFramesRef = useRef<HTMLImageElement[]>([]);
   const testFrameIdxRef = useRef(0);
   const testFrameUrlsRef = useRef<string[]>([]);
-  /** Resized "before" photo canvas for the photo→photo VLM diff. */
-  const previousFullPhotoRef = useRef<HTMLCanvasElement | null>(null);
 
   const [lastMove, setLastMove] = useState<
     { san: string; side: Side } | null
@@ -472,32 +470,7 @@ export function CaptureGame() {
   }
 
   /**
-   * Downscale an image to a canvas with max edge `maxDim`, preserving
-   * aspect ratio. iPhone photos are 24MP / 5712x4284 — way more pixels
-   * than the VLM needs and a large base64 payload over the network. A
-   * 1024px-edge JPEG is ~150KB and still resolves piece details.
-   */
-  function imageToResizedCanvas(
-    img: HTMLImageElement,
-    maxDim = 1024,
-  ): HTMLCanvasElement | null {
-    if (!img.naturalWidth) return null;
-    const scale = Math.min(
-      1,
-      maxDim / Math.max(img.naturalWidth, img.naturalHeight),
-    );
-    const c = document.createElement("canvas");
-    c.width = Math.max(1, Math.round(img.naturalWidth * scale));
-    c.height = Math.max(1, Math.round(img.naturalHeight * scale));
-    const ctx = c.getContext("2d");
-    if (!ctx) return null;
-    ctx.imageSmoothingQuality = "high";
-    ctx.drawImage(img, 0, 0, c.width, c.height);
-    return c;
-  }
-
-  /**
-   * Preprocess a photo for VLM consumption: rotate to "white at bottom"
+   * Preprocess a photo for downstream CV + VLM: rotate to "white at bottom"
    * standard chess orientation, crop the clock/hand clutter off, resize.
    *
    * - rotateQuarterTurns: integer 0..3 of 90° clockwise rotations applied
@@ -561,7 +534,12 @@ export function CaptureGame() {
       const idx = testFrameIdxRef.current;
       const img = frames[idx];
       if (!img) return null;
-      const c = imageToCanvas(img);
+      // Apply standard-view rotation + clutter crop so downstream CV
+      // (board detection, occupancy classifier) sees the board in its
+      // canonical orientation. Without this the existing CV pipeline
+      // never had a chance on these tilted iPhone shots.
+      const c =
+        imageToCroppedResizedCanvas(img, 2048, 1, 0.22) ?? imageToCanvas(img);
       if (advance) setTestFrameIdx((i) => i + 1);
       return c;
     }
@@ -570,7 +548,9 @@ export function CaptureGame() {
 
   function previewSource(): HTMLCanvasElement | HTMLImageElement | null {
     if (testModeRef.current) {
-      return testFramesRef.current[testFrameIdxRef.current] ?? null;
+      const img = testFramesRef.current[testFrameIdxRef.current];
+      if (!img) return null;
+      return imageToCroppedResizedCanvas(img, 2048, 1, 0.22) ?? img;
     }
     return grabVideoFrame();
   }
@@ -592,7 +572,6 @@ export function CaptureGame() {
     chessRef.current = new Chess();
     baselineRef.current = null;
     previousFrameRef.current = null;
-    previousFullPhotoRef.current = null;
     captures.forEach((c) => URL.revokeObjectURL(c.url));
     setCaptures([]);
     setLastMove(null);
@@ -603,20 +582,18 @@ export function CaptureGame() {
     setBlackMs(tc.baseSeconds * 1000);
     setWinner(null);
     setPgn("");
+    setTestFrameIdx(0);
     if (testMode) {
-      // Photo→FEN pipeline. Photo 0 is the starting position (we trust
-      // it's the standard chess opening and don't analyze it); photos
-      // 1..N each represent one half-move and are sent to Claude on
-      // each clock tap. No corner calibration / rectification needed.
-      testFrameIdxRef.current = 1;
-      setTestFrameIdx(1);
+      // Constrained-search pipeline: calibrate the board on photo 0
+      // (auto-detect corners + manual tweak), then on each clock tap
+      // run CV occupancy diff → narrow to top-K candidates → VLM
+      // tie-break. Photo 0 is consumed as the baseline; the off-by-one
+      // advance to photo 1 happens in startPlayingFromCalibration.
       setCorners([]);
-      setPhase("playing");
+      setPhase("calibrating");
     } else if (corners.length === 4) {
-      setTestFrameIdx(0);
       setPhase("playing");
     } else {
-      setTestFrameIdx(0);
       setPhase("calibrating");
     }
   }
@@ -933,21 +910,29 @@ export function CaptureGame() {
           promotion: appliedMove.promotion ?? "q",
         });
       } else if (vlmConfigRef.current?.apiKey || VLM_PROXY_URL) {
-        // VLM identifier — two-image diff against the legal-move list.
-        setVlmActive(true);
-        try {
-          const vlmPicked = await runVlmIdentifier({
-            before: prev?.warped,
-            after: warped,
-            previousFen: fenBefore,
-          });
-          if (vlmPicked) {
-            appliedMove = vlmPicked.move;
-            appliedFen = vlmPicked.fen;
-            viaVlm = true;
+        // VLM tie-break — narrow to the top-K CV candidates so the model
+        // is choosing between visually-plausible moves only, not against
+        // the full ~40-move legal list. Massively reduces hallucination.
+        const candidates = cvResult.ranked
+          .slice(0, 5)
+          .map((c) => c.move.san);
+        if (candidates.length > 0) {
+          setVlmActive(true);
+          try {
+            const vlmPicked = await runVlmIdentifier({
+              before: prev?.warped,
+              after: warped,
+              previousFen: fenBefore,
+              candidatesSan: candidates,
+            });
+            if (vlmPicked) {
+              appliedMove = vlmPicked.move;
+              appliedFen = vlmPicked.fen;
+              viaVlm = true;
+            }
+          } finally {
+            setVlmActive(false);
           }
-        } finally {
-          setVlmActive(false);
         }
       }
 
@@ -1041,23 +1026,21 @@ export function CaptureGame() {
   }
 
   /**
-   * Two-image vision-LM identifier. Sends the BEFORE and AFTER rectified
-   * boards plus the legal-move list; the model picks one SAN. Returns the
-   * chess.js Move + resulting FEN on success.
+   * Two-image vision-LM tie-breaker. Called only when the CV pipeline can't
+   * decide between several candidate moves. Sends the BEFORE and AFTER
+   * rectified boards plus a SHORT list of candidates ranked by CV
+   * mismatch — constrained-search architecture so the model is choosing,
+   * not hallucinating.
    */
   async function runVlmIdentifier(args: {
     before: HTMLCanvasElement | undefined;
     after: HTMLCanvasElement;
     previousFen: string;
+    candidatesSan: string[];
   }): Promise<{ move: ChessMove; fen: string } | null> {
     const config = vlmConfigRef.current;
-    // Prefer a pasted user key (lets users override with Gemini/OpenAI or
-    // their own Claude key); otherwise fall through to the proxy if one was
-    // baked in at build time.
     if (!config?.apiKey && !VLM_PROXY_URL) return null;
-    const game = new Chess(args.previousFen);
-    const legal = game.moves();
-    if (legal.length === 0) return null;
+    if (args.candidatesSan.length === 0) return null;
     const verifier = config?.apiKey
       ? makeVerifier(config.provider, config.apiKey)
       : (makeProxyVerifier() as VlmVerifier);
@@ -1065,7 +1048,7 @@ export function CaptureGame() {
     try {
       result = await verifier.verify({
         previousFen: args.previousFen,
-        legalMovesSan: legal,
+        legalMovesSan: args.candidatesSan,
         boardImage: args.after,
         previousBoardImage: args.before,
       });
@@ -1082,197 +1065,6 @@ export function CaptureGame() {
     }
     if (!applied) return null;
     return { move: applied as ChessMove, fen: chessRef.current.fen() };
-  }
-
-  /**
-   * Photo-to-photo VLM diff inference pipeline for test mode.
-   *
-   * Hands Claude the previous full photo + current full photo + list of
-   * legal moves, and asks which legal move was played. Way more robust
-   * than reading a full FEN from a single image (Claude only needs to
-   * identify what *changed*, not classify all 64 squares) and works
-   * regardless of board orientation in the photo.
-   */
-  async function runFenInferencePipeline(side: Side, moveNumber: number) {
-    const frames = testFramesRef.current;
-    const idx = testFrameIdxRef.current;
-    const img = frames[idx];
-    if (!img) {
-      setCaptures((prev) => [
-        ...prev,
-        {
-          side,
-          moveNumber,
-          url: "",
-          timestamp: Date.now(),
-          inference: {
-            kind: "skipped",
-            reason: `no photo at index ${idx} (uploaded ${frames.length} total)`,
-          },
-        },
-      ]);
-      return;
-    }
-    setTestFrameIdx((i) => i + 1);
-
-    const afterCanvas = imageToCroppedResizedCanvas(img, 1568, 1, 0.22);
-    if (!afterCanvas) {
-      setCaptures((prev) => [
-        ...prev,
-        {
-          side,
-          moveNumber,
-          url: "",
-          timestamp: Date.now(),
-          inference: { kind: "skipped", reason: "image decode failed" },
-        },
-      ]);
-      return;
-    }
-
-    // The "before" image is either the previously-processed photo's canvas
-    // (cached) or photo 0 (the starting position) for the very first move.
-    let beforeCanvas = previousFullPhotoRef.current;
-    if (!beforeCanvas) {
-      const photo0 = frames[0];
-      if (photo0) beforeCanvas = imageToCroppedResizedCanvas(photo0, 1568, 1, 0.22);
-    }
-
-    const url = await canvasToBlobUrl(afterCanvas);
-    if (!url) return;
-
-    setVlmActive(true);
-    let inference: CaptureInference;
-    let unmatchedPick:
-      | { side: Side; rectifiedUrl: string; legalMoves: ChessMove[] }
-      | null = null;
-    try {
-      const userConfig = vlmConfigRef.current;
-      const verifier = userConfig?.apiKey
-        ? makeVerifier(userConfig.provider, userConfig.apiKey)
-        : makeProxyVerifier();
-
-      if (!verifier) {
-        inference = {
-          kind: "unmatched",
-          diff: ["VLM is not configured — paste a key or enable the proxy."],
-        };
-      } else {
-        const legalMovesSan = chessRef.current.moves();
-        const previousFen = chessRef.current.fen();
-        // 3-call majority vote: VLMs are noisy on real-world chessboard
-        // photos (similar pieces, oblique angles). Asking 3x and taking
-        // the consensus rescues moves where one call picks a non-matching
-        // SAN. Offline accuracy: 64% → 71% on the user's test photos.
-        const NUM_VOTES = 3;
-        const voteResults = await Promise.all(
-          Array.from({ length: NUM_VOTES }, () =>
-            verifier
-              .verify({
-                previousFen,
-                legalMovesSan,
-                boardImage: afterCanvas,
-                previousBoardImage: beforeCanvas ?? undefined,
-              })
-              .catch((e) => ({
-                kind: "error" as const,
-                reason: e instanceof Error ? e.message : String(e),
-              })),
-          ),
-        );
-        const tally = new Map<string, number>();
-        for (const r of voteResults) {
-          if (r.kind === "matched") {
-            tally.set(r.san, (tally.get(r.san) ?? 0) + 1);
-          }
-        }
-        let winner: string | null = null;
-        let bestCount = 0;
-        for (const [san, count] of tally) {
-          if (count > bestCount) {
-            winner = san;
-            bestCount = count;
-          }
-        }
-        const result = winner
-          ? ({ kind: "matched", san: winner, raw: "" } as VlmVerifyResult)
-          : voteResults.find((r) => r.kind !== "matched") ??
-            ({ kind: "error", reason: "no votes returned" } as VlmVerifyResult);
-        if (result.kind === "matched") {
-          let applied: ChessMove | null = null;
-          try {
-            applied = chessRef.current.move(result.san) as ChessMove | null;
-          } catch {
-            applied = null;
-          }
-          if (applied) {
-            previousFullPhotoRef.current = afterCanvas;
-            inference = {
-              kind: "vlm-matched",
-              san: applied.san,
-              from: applied.from,
-              to: applied.to,
-              fen: chessRef.current.fen(),
-              provider: verifier.provider,
-            };
-            setLastMove({ san: applied.san, side });
-            setMoveLog((log) => [
-              ...log,
-              { san: applied!.san, viaVlm: true },
-            ]);
-          } else {
-            inference = {
-              kind: "unmatched",
-              diff: [`Claude picked ${result.san} but chess.js rejected it.`],
-            };
-            const legalMoves = chessRef.current.moves({
-              verbose: true,
-            }) as ChessMove[];
-            unmatchedPick = { side, rectifiedUrl: url, legalMoves };
-          }
-        } else {
-          inference = {
-            kind: "unmatched",
-            diff: [
-              result.kind === "error"
-                ? `Claude: ${result.reason}`
-                : `Rejected: ${result.reason}`,
-            ],
-          };
-          const legalMoves = chessRef.current.moves({
-            verbose: true,
-          }) as ChessMove[];
-          unmatchedPick = { side, rectifiedUrl: url, legalMoves };
-        }
-      }
-    } catch (e) {
-      inference = {
-        kind: "unmatched",
-        diff: [e instanceof Error ? e.message : String(e)],
-      };
-      const legalMoves = chessRef.current.moves({
-        verbose: true,
-      }) as ChessMove[];
-      unmatchedPick = { side, rectifiedUrl: url, legalMoves };
-    } finally {
-      setVlmActive(false);
-    }
-
-    setCaptures((prev) => {
-      const next = [
-        ...prev,
-        { side, moveNumber, url, timestamp: Date.now(), inference },
-      ];
-      if (unmatchedPick) {
-        setPendingPick({
-          captureIdx: next.length - 1,
-          side: unmatchedPick.side,
-          rectifiedUrl: unmatchedPick.rectifiedUrl,
-          legalMoves: unmatchedPick.legalMoves,
-        });
-      }
-      return next;
-    });
   }
 
   function endTurn(side: Side) {
@@ -1292,10 +1084,12 @@ export function CaptureGame() {
 
     const totalMoves = nextMoves.white + nextMoves.black;
     setInferring(true);
-    const pipeline = testModeRef.current
-      ? runFenInferencePipeline(side, totalMoves)
-      : runInferencePipeline(side, totalMoves);
-    void pipeline.finally(() => setInferring(false));
+    // Both modes go through the same CV+VLM constrained-search pipeline.
+    // Test mode just sources frames from uploaded photos instead of the
+    // live camera; grabPipelineFrame already handles that branch.
+    void runInferencePipeline(side, totalMoves).finally(() =>
+      setInferring(false),
+    );
   }
 
   function endGame() {

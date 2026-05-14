@@ -13,14 +13,26 @@ import sharp from "sharp";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const ROOT = path.resolve(__dirname, "../..");
-const PHOTO_DIR = path.join(ROOT, "test_photos");
+const PHOTO_DIR = path.join(ROOT, "Test_Photos");
 const OUT_DIR = path.join(__dirname, "out");
 
+// Match the browser pipeline's preprocessing: EXIF-rotate, then rotate to
+// "white at bottom" canonical view, then crop the clock/hand clutter.
+const ROTATE_QUARTERS = Number(process.env.ROTATE_QUARTERS ?? "1");
+const CROP_LEFT = Number(process.env.CROP_LEFT ?? "0.22");
+
 async function loadOriented(filePath) {
-  // Honour EXIF rotation the way modern browsers do — node-canvas's loadImage
-  // ignores the orientation tag, which mismatches the browser pipeline our
-  // app actually runs in.
-  const buf = await sharp(filePath).rotate().toFormat("jpeg").toBuffer();
+  let pipe = sharp(filePath).rotate();
+  if (ROTATE_QUARTERS) pipe = pipe.rotate(ROTATE_QUARTERS * 90);
+  const rotatedBuf = await pipe.toBuffer();
+  const meta = await sharp(rotatedBuf).metadata();
+  const W = meta.width;
+  const H = meta.height;
+  const left = Math.round(W * CROP_LEFT);
+  const buf = await sharp(rotatedBuf)
+    .extract({ left, top: 0, width: W - left, height: H })
+    .toFormat("jpeg")
+    .toBuffer();
   return await loadImage(buf);
 }
 
