@@ -2,10 +2,43 @@
 @tailwind components;
 @tailwind utilities;
 
+@import url("https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@300;400;500;600;700&family=JetBrains+Mono:wght@300;400;500&display=swap");
+
 :root {
   color-scheme: dark;
+  /* Editorial-dark canvas — warm near-black + off-white ink */
+  --cp-canvas: oklch(0.155 0.008 75);
+  --cp-canvas-soft: oklch(0.18 0.008 75);
+  --cp-canvas-mid: oklch(0.13 0.008 75);
+  --cp-ink: rgba(250, 247, 240, 0.95);
+  --cp-ink-2: rgba(245, 242, 235, 0.6);
+  --cp-ink-3: rgba(245, 242, 235, 0.42);
+  --cp-rule: rgba(245, 242, 235, 0.08);
+  --cp-accent: #5fc99a;
+  --cp-accent-ink: #0a2418;
+  /* Geist as the UI face, with a stack that falls back well */
+  --font-ui:
+    "Geist", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+    "Segoe UI", Roboto, sans-serif;
+  --font-serif: "Instrument Serif", ui-serif, Georgia, serif;
+  --font-mono:
+    "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
 body {
-  @apply bg-zinc-950 text-zinc-100 antialiased;
+  background: var(--cp-canvas);
+  color: var(--cp-ink);
+  font-family: var(--font-ui);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Animation primitives used across the playing screen */
+@keyframes chesspar-pulse {
+  0%, 100% { opacity: 0.55; transform: scale(0.9); }
+  50%      { opacity: 1; transform: scale(1.1); }
+}
+@keyframes chesspar-sweep {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(360%); }
 }

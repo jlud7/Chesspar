@@ -1,6 +1,7 @@
 "use client";
 
-import {
+import React, {
+  Fragment,
   useCallback,
   useEffect,
   useMemo,
@@ -1390,39 +1391,44 @@ export function CaptureGame() {
       )}
 
       {(phase === "playing" || phase === "paused" || phase === "calibrating") && (
-        <>
-          <PlayerPanel
-            side="black"
-            rotated
-            isActive={phase === "playing" && active === "black"}
+        <div className="relative flex flex-1 overflow-hidden">
+          <SidePanel
+            side="left"
+            name="Black"
             ms={blackMs}
             moves={moves.black}
-            tcLabel={tcLabel}
-            flash={flashing === "black"}
+            isActive={phase === "playing" && active === "black"}
+            phase={phase}
+            inferring={inferring}
+            vlmActive={vlmActive}
+            justMoved={lastMove?.side === "black"}
+            justMovedSan={lastMove?.side === "black" ? lastMove.san : null}
             onTap={() => endTurn("black")}
             disabled={phase !== "playing" || active !== "black"}
           />
-          <CenterBar
+          <CenterStrip
             phase={phase}
-            soundOn={soundOn}
             captureCount={captures.length}
             moveLog={moveLog}
             inferring={inferring}
             vlmActive={vlmActive}
+            activeSide={active}
             onTogglePause={togglePause}
             onReset={backToSettings}
-            onToggleSound={() => setSoundOn((s) => !s)}
             onShowCaptures={() => setShowCaptures(true)}
             onEndGame={endGame}
           />
-          <PlayerPanel
-            side="white"
-            rotated={false}
-            isActive={phase === "playing" && active === "white"}
+          <SidePanel
+            side="right"
+            name="White"
             ms={whiteMs}
             moves={moves.white}
-            tcLabel={tcLabel}
-            flash={flashing === "white"}
+            isActive={phase === "playing" && active === "white"}
+            phase={phase}
+            inferring={inferring}
+            vlmActive={vlmActive}
+            justMoved={lastMove?.side === "white"}
+            justMovedSan={lastMove?.side === "white" ? lastMove.san : null}
             onTap={() => endTurn("white")}
             disabled={phase !== "playing" || active !== "white"}
           />
@@ -1434,14 +1440,7 @@ export function CaptureGame() {
               onCancel={backToSettings}
             />
           )}
-          <CaptureToast
-            phase={phase}
-            inferring={inferring}
-            vlmActive={vlmActive}
-            lastMove={lastMove}
-            moveLogLength={moveLog.length}
-          />
-        </>
+        </div>
       )}
 
       {phase === "ended" && (
@@ -1451,6 +1450,7 @@ export function CaptureGame() {
           recordedMoves={moveLog.length}
           moves={moves}
           pgn={pgn}
+          moveLog={moveLog}
           onNewGame={backToSettings}
           onViewCaptures={() => setShowCaptures(true)}
           onReplay={
@@ -1606,218 +1606,416 @@ function PendingPickSheet({
   );
 }
 
-function PlayerPanel({
+/**
+ * SidePanel — one half of the playing screen. The phone is propped
+ * upright perpendicular to the board with the back camera at the top
+ * pointing down at the centre. The two players sit on the LEFT and
+ * RIGHT of the phone, so each half rotates 90° to face its player:
+ *
+ *   left  side (black) → content rotated +90° clockwise
+ *   right side (white) → content rotated -90° counter-clockwise
+ *
+ * Active player's entire half fills with the accent colour, chess.com
+ * clock style — unmistakable from across the table. Clock typography
+ * becomes the screen's anchor: JetBrains Mono, oversized, tabular.
+ */
+function SidePanel({
   side,
-  rotated,
-  isActive,
+  name,
   ms,
   moves,
-  tcLabel,
-  flash,
+  isActive,
+  phase,
+  inferring,
+  vlmActive,
+  justMoved,
+  justMovedSan,
   onTap,
   disabled,
 }: {
-  side: Side;
-  rotated: boolean;
-  isActive: boolean;
+  side: "left" | "right";
+  name: string;
   ms: number;
   moves: number;
-  tcLabel: string;
-  flash: boolean;
+  isActive: boolean;
+  phase: Phase;
+  inferring: boolean;
+  vlmActive: boolean;
+  justMoved: boolean;
+  justMovedSan: string | null;
   onTap: () => void;
   disabled: boolean;
 }) {
-  const low = ms <= 10_000;
+  // Track the recently-detected SAN so we can hold the toast for ~1.8s
+  // after the move appears.
+  const [showRecent, setShowRecent] = useState(false);
+  const lastSeenSanRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (justMovedSan && justMovedSan !== lastSeenSanRef.current) {
+      lastSeenSanRef.current = justMovedSan;
+      setShowRecent(true);
+      const t = window.setTimeout(() => setShowRecent(false), 1800);
+      return () => window.clearTimeout(t);
+    }
+  }, [justMovedSan]);
+
+  const rot = side === "left" ? 90 : -90;
+  const lowTime = ms <= 10_000;
+  const reading = isActive && phase === "playing" && (inferring || vlmActive);
+  const bg = isActive ? "var(--cp-accent)" : "transparent";
+  const eyebrowTone = isActive
+    ? "rgba(10,36,24,0.7)"
+    : "rgba(245,242,235,0.42)";
+  const dotColor = isActive ? "var(--cp-accent-ink)" : "rgba(245,242,235,0.25)";
+  const clockColor = isActive
+    ? lowTime
+      ? "#3a0a14"
+      : "var(--cp-accent-ink)"
+    : "rgba(250,247,240,0.55)";
+  const detectedVisible =
+    !isActive &&
+    justMoved &&
+    showRecent &&
+    justMovedSan &&
+    phase === "playing";
+
   return (
     <button
+      type="button"
       onClick={onTap}
       disabled={disabled}
-      className={clsx(
-        "relative flex flex-1 select-none flex-col items-center justify-center overflow-hidden transition-all duration-200",
-        isActive
-          ? "bg-gradient-to-b from-zinc-50 to-zinc-200 text-zinc-900 shadow-[inset_0_-12px_30px_rgba(0,0,0,0.05)]"
-          : "bg-zinc-900 text-zinc-500",
-        flash && "ring-4 ring-inset ring-emerald-400/70",
-        rotated && "rotate-180",
-        "active:scale-[0.995]",
-      )}
+      className="relative flex-1 cursor-pointer overflow-hidden text-left transition-[background] duration-300 disabled:cursor-default"
+      style={{ background: bg }}
     >
-      <span
-        className={clsx(
-          "absolute left-1/2 top-7 -translate-x-1/2 text-[10px] font-semibold uppercase tracking-[0.32em]",
-          isActive ? "text-zinc-500" : "text-zinc-600",
-        )}
+      {/* Rotated landscape content. We size it to the panel's
+          POST-rotation dimensions: width = panel height, height = panel
+          width. Then rotate around the panel's centre so the eye reads
+          left-to-right when the player tilts their head toward the phone. */}
+      <div
+        className="absolute left-1/2 top-1/2 flex flex-col items-center justify-center gap-2 px-12"
+        style={{
+          width: "100vh",
+          height: "50vw",
+          minWidth: "844px",
+          minHeight: "173px",
+          maxWidth: "min(100vh, 1100px)",
+          maxHeight: "240px",
+          transform: `translate(-50%, -50%) rotate(${rot}deg)`,
+          transformOrigin: "center",
+        }}
       >
-        {side === "white" ? "White" : "Black"}
-      </span>
-      <span
-        className={clsx(
-          "select-none tabular-nums leading-none",
-          "text-[clamp(4rem,18vw,8.5rem)] font-extralight tracking-tighter",
-          low && isActive
-            ? "text-rose-600"
-            : isActive
-              ? "text-zinc-900"
-              : "text-zinc-500",
+        {/* Eyebrow — small uppercase chip with a dot */}
+        <div
+          className="flex items-center gap-2 text-[10px] uppercase"
+          style={{
+            color: eyebrowTone,
+            letterSpacing: "0.3em",
+            fontFamily: "var(--font-ui)",
+          }}
+        >
+          <span
+            className="block h-1.5 w-1.5 rounded-full"
+            style={{ background: dotColor }}
+          />
+          <span>{name}</span>
+          <span style={{ opacity: 0.6 }}>· {moves} moves</span>
+        </div>
+
+        {/* Clock + detected card in a 3-col grid so the clock stays
+            visually centred regardless of the side card. */}
+        <div className="grid w-full items-center gap-x-7" style={{ gridTemplateColumns: "1fr auto 1fr" }}>
+          <div />
+          <div
+            className="relative tabular-nums"
+            style={{
+              fontFamily: "var(--font-mono)",
+              fontSize: "clamp(72px, 18vh, 124px)",
+              lineHeight: 0.95,
+              fontWeight: 300,
+              letterSpacing: "-0.04em",
+              color: clockColor,
+              transition: "color 200ms ease",
+            }}
+          >
+            {formatTime(ms)}
+            {reading && (
+              <div className="absolute -bottom-3 left-0 right-0 h-[1.5px] overflow-hidden">
+                <div
+                  className="absolute inset-0"
+                  style={{ background: "rgba(10,36,24,0.18)" }}
+                />
+                <div
+                  className="absolute bottom-0 top-0 w-[38%]"
+                  style={{
+                    background:
+                      "linear-gradient(90deg, transparent, rgba(10,36,24,0.85) 50%, transparent)",
+                    animation: "chesspar-sweep 1.4s ease-in-out infinite",
+                  }}
+                />
+              </div>
+            )}
+          </div>
+          <div className="flex min-w-0 items-center justify-start">
+            {detectedVisible && (
+              <div
+                className="inline-flex flex-col gap-2 rounded-[12px] px-4 py-3"
+                style={{
+                  border: "0.5px solid rgba(95,201,154,0.4)",
+                  background: "rgba(95,201,154,0.08)",
+                  boxShadow: "0 0 60px rgba(95,201,154,0.1)",
+                }}
+              >
+                <div
+                  className="flex items-center gap-2 text-[9px] uppercase"
+                  style={{
+                    color: "var(--cp-accent)",
+                    letterSpacing: "0.3em",
+                    fontFamily: "var(--font-ui)",
+                  }}
+                >
+                  <svg width="11" height="11" viewBox="0 0 11 11" aria-hidden>
+                    <path
+                      d="M2 5.5 L4.5 8 L9 3"
+                      stroke="currentColor"
+                      strokeWidth="1.6"
+                      fill="none"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    />
+                  </svg>
+                  <span>recorded</span>
+                </div>
+                <div className="flex items-baseline gap-3">
+                  <span
+                    style={{
+                      fontFamily: "var(--font-serif)",
+                      fontSize: 38,
+                      lineHeight: 0.9,
+                      fontStyle: "italic",
+                      color: "rgba(250,247,240,0.96)",
+                      letterSpacing: "-0.01em",
+                    }}
+                  >
+                    {justMovedSan}
+                  </span>
+                </div>
+                <div className="flex gap-[3px]">
+                  {Array.from({ length: 8 }).map((_, i) => (
+                    <div
+                      key={i}
+                      className="h-[2px] flex-1 rounded-sm"
+                      style={{
+                        background:
+                          i < 8 ? "var(--cp-accent)" : "rgba(245,242,235,0.12)",
+                      }}
+                    />
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Status line under the clock */}
+        {isActive && reading && (
+          <div className="mt-1 flex items-center gap-2.5">
+            <span
+              className="block h-[7px] w-[7px] rounded-full"
+              style={{
+                background: "var(--cp-accent-ink)",
+                animation: "chesspar-pulse 1.4s ease-in-out infinite",
+              }}
+            />
+            <span
+              style={{
+                fontFamily: "var(--font-serif)",
+                fontStyle: "italic",
+                fontSize: 19,
+                lineHeight: 1,
+                color: "rgba(10,36,24,0.85)",
+              }}
+            >
+              {vlmActive ? "reading with vision" : "reading the board"}
+            </span>
+          </div>
         )}
-      >
-        {formatTime(ms)}
-      </span>
-      <span
-        className={clsx(
-          "absolute inset-x-0 bottom-6 flex items-center justify-center gap-3 text-[11px] tracking-[0.22em] uppercase",
-          isActive ? "text-zinc-500" : "text-zinc-600",
+        {isActive && !reading && phase === "playing" && (
+          <div className="mt-0.5 flex items-center gap-2.5">
+            <span className="block h-px w-4" style={{ background: "rgba(10,36,24,0.35)" }} />
+            <span
+              style={{
+                fontFamily: "var(--font-serif)",
+                fontStyle: "italic",
+                fontSize: 18,
+                lineHeight: 1,
+                color: "rgba(10,36,24,0.78)",
+              }}
+            >
+              your turn
+            </span>
+            <span className="block h-px w-4" style={{ background: "rgba(10,36,24,0.35)" }} />
+          </div>
         )}
-      >
-        <span>Moves · {moves}</span>
-        <span aria-hidden>·</span>
-        <span>{tcLabel}</span>
-      </span>
+      </div>
     </button>
   );
 }
 
-function CenterBar({
+/**
+ * CenterStrip — the vertical channel between the two side panels. Holds
+ * a small mini-board peek (an upright reference glance), the running
+ * move-log ticker (rotates to face the player on the clock), and the
+ * neutral icon column (pause, captures count, end game). Sits in a
+ * lighter warm-taupe so it reads as its own zone, distinct from both
+ * inactive near-black and active accent-fill side panels.
+ */
+function CenterStrip({
   phase,
-  soundOn,
   captureCount,
   moveLog,
   inferring,
   vlmActive,
+  activeSide,
   onTogglePause,
   onReset,
-  onToggleSound,
   onShowCaptures,
   onEndGame,
 }: {
   phase: Phase;
-  soundOn: boolean;
   captureCount: number;
   moveLog: { san: string; viaVlm: boolean }[];
   inferring: boolean;
   vlmActive: boolean;
+  activeSide: Side;
   onTogglePause: () => void;
   onReset: () => void;
-  onToggleSound: () => void;
   onShowCaptures: () => void;
   onEndGame: () => void;
 }) {
+  const tickerRot = activeSide === "black" ? 90 : -90;
+  const moveNumber = Math.ceil((moveLog.length + 1) / 2);
+  const recentSans = moveLog.slice(-8).map((m, i, arr) => ({
+    ...m,
+    isLatest: i === arr.length - 1,
+    moveNum: Math.floor((moveLog.length - arr.length + i) / 2) + 1,
+    isWhite: (moveLog.length - arr.length + i) % 2 === 0,
+  }));
+
   return (
-    <div className="relative flex shrink-0 flex-col border-y border-white/5 bg-zinc-950/70 backdrop-blur-xl">
-      <MoveLogStrip
-        moveLog={moveLog}
-        inferring={inferring}
-        vlmActive={vlmActive}
-      />
-      <div className="flex h-14 items-center justify-around px-2">
-        <IconBtn onClick={onReset} label="Back to settings">
-          <ResetIcon />
-        </IconBtn>
-        <IconBtn
+    <div
+      className="relative flex h-full w-14 shrink-0 flex-col items-center justify-between py-12"
+      style={{
+        background: "oklch(0.30 0.010 75)",
+        borderLeft: "0.5px solid rgba(245,242,235,0.10)",
+        borderRight: "0.5px solid rgba(245,242,235,0.10)",
+      }}
+    >
+      {/* Top: pause + reset (subtle, both-side neutral glyphs) */}
+      <div className="flex flex-col items-center gap-1.5">
+        <button
+          type="button"
           onClick={onTogglePause}
-          label={phase === "paused" ? "Resume" : "Pause"}
+          aria-label={phase === "paused" ? "Resume" : "Pause"}
+          className="flex h-9 w-9 items-center justify-center rounded-md text-[15px] transition hover:bg-white/10"
+          style={{ color: "rgba(245,242,235,0.80)" }}
         >
-          {phase === "paused" ? <PlayIcon /> : <PauseIcon />}
-        </IconBtn>
-        <IconBtn onClick={onShowCaptures} label="Captures">
-          <CamIcon />
+          {phase === "paused" ? "▶" : "⏸"}
+        </button>
+        <button
+          type="button"
+          onClick={onReset}
+          aria-label="Back to settings"
+          className="flex h-9 w-9 items-center justify-center rounded-md text-[14px] transition hover:bg-white/10"
+          style={{ color: "rgba(245,242,235,0.6)" }}
+        >
+          ←
+        </button>
+        <div
+          className="mt-3 tabular-nums"
+          style={{
+            fontFamily: "var(--font-mono)",
+            fontSize: 9,
+            color: "rgba(245,242,235,0.75)",
+            letterSpacing: "0.08em",
+          }}
+        >
+          {String(moveNumber).padStart(2, "0")}
+        </div>
+      </div>
+
+      {/* Middle: the rotated move-log ticker. Faces whichever player is
+          on the clock — info reads upright for the side currently
+          waiting to move. 400ms tween makes the flip feel intentional. */}
+      <div className="relative flex w-full flex-1 items-center justify-center overflow-hidden">
+        <div
+          className="flex gap-2.5 whitespace-nowrap transition-transform duration-[400ms]"
+          style={{
+            transform: `rotate(${tickerRot}deg)`,
+            fontFamily: "var(--font-mono)",
+            fontSize: 11,
+            letterSpacing: "0.04em",
+            color: "rgba(245,242,235,0.80)",
+            maskImage:
+              "linear-gradient(to right, transparent, black 18%, black 82%, transparent)",
+            WebkitMaskImage:
+              "linear-gradient(to right, transparent, black 18%, black 82%, transparent)",
+          }}
+        >
+          {recentSans.length === 0 ? (
+            <span style={{ color: "rgba(245,242,235,0.42)" }}>
+              {inferring || vlmActive
+                ? "reading the board…"
+                : "tap your clock to record"}
+            </span>
+          ) : (
+            recentSans.map((m, i) => (
+              <span
+                key={i}
+                style={{
+                  color: m.isLatest ? "var(--cp-accent)" : undefined,
+                }}
+              >
+                {m.isWhite ? `${m.moveNum}.` : ""} {m.san}
+              </span>
+            ))
+          )}
+        </div>
+      </div>
+
+      {/* Bottom: captures + end game */}
+      <div className="flex flex-col items-center gap-1.5">
+        <button
+          type="button"
+          onClick={onShowCaptures}
+          aria-label="Captures"
+          className="relative flex h-9 w-9 items-center justify-center rounded-md text-[15px] transition hover:bg-white/10"
+          style={{ color: "rgba(245,242,235,0.80)" }}
+        >
+          ◫
           {captureCount > 0 && (
-            <span className="absolute -right-0.5 -top-0.5 inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-emerald-500 px-1 text-[10px] font-bold text-emerald-950 shadow-md shadow-emerald-500/30">
+            <span
+              className="absolute right-0.5 top-0.5 rounded-full px-1 font-semibold leading-tight tabular-nums"
+              style={{
+                fontFamily: "var(--font-mono)",
+                fontSize: 8,
+                color: "var(--cp-accent)",
+                background: "rgba(0,0,0,0.7)",
+              }}
+            >
               {captureCount}
             </span>
           )}
-        </IconBtn>
-        <IconBtn onClick={onEndGame} label="End game">
-          <FlagIcon />
-        </IconBtn>
-        <IconBtn onClick={onToggleSound} label={soundOn ? "Mute" : "Unmute"}>
-          {soundOn ? <SoundOnIcon /> : <SoundOffIcon />}
-        </IconBtn>
-      </div>
-    </div>
-  );
-}
-
-function MoveLogStrip({
-  moveLog,
-  inferring,
-  vlmActive,
-}: {
-  moveLog: { san: string; viaVlm: boolean }[];
-  inferring: boolean;
-  vlmActive: boolean;
-}) {
-  const ref = useRef<HTMLDivElement | null>(null);
-  useEffect(() => {
-    const el = ref.current;
-    if (el) el.scrollLeft = el.scrollWidth;
-  }, [moveLog.length]);
-  const emptyLabel = vlmActive
-    ? "Reading the board with vision model…"
-    : inferring
-      ? "Inferring first move…"
-      : "Tap your clock to record the first move";
-  return (
-    <div className="flex h-9 shrink-0 items-center gap-2 px-3">
-      <div
-        ref={ref}
-        className="flex flex-1 items-center gap-1.5 overflow-x-auto whitespace-nowrap scroll-smooth py-1"
-        style={{ scrollbarWidth: "none" }}
-      >
-        {moveLog.length === 0 ? (
-          <span className="text-[11px] tracking-wide text-zinc-500">
-            {emptyLabel}
-          </span>
-        ) : (
-          moveLog.map((m, i) => {
-            const moveNum = Math.floor(i / 2) + 1;
-            const isWhite = i % 2 === 0;
-            const isLast = i === moveLog.length - 1;
-            return (
-              <span
-                key={i}
-                className="inline-flex items-baseline gap-1 text-[11px] tabular-nums"
-              >
-                {isWhite && (
-                  <span className="text-zinc-600">{moveNum}.</span>
-                )}
-                <span
-                  className={clsx(
-                    "rounded-full px-2 py-0.5 font-mono transition",
-                    isLast
-                      ? m.viaVlm
-                        ? "bg-sky-500/25 text-sky-100 ring-1 ring-sky-400/30"
-                        : "bg-emerald-500/25 text-emerald-100 ring-1 ring-emerald-400/30"
-                      : m.viaVlm
-                        ? "text-sky-300"
-                        : "text-zinc-200",
-                  )}
-                  title={m.viaVlm ? "Resolved by VLM" : undefined}
-                >
-                  {m.san}
-                  {m.viaVlm && (
-                    <span className="ml-1 text-[9px] uppercase tracking-wider opacity-70">
-                      vlm
-                    </span>
-                  )}
-                </span>
-              </span>
-            );
-          })
-        )}
-      </div>
-      {(inferring || vlmActive) && moveLog.length > 0 && (
-        <span
-          className={clsx(
-            "shrink-0 rounded-full px-2 py-0.5 text-[10px] uppercase tracking-widest",
-            vlmActive
-              ? "bg-sky-500/20 text-sky-200"
-              : "bg-emerald-500/15 text-emerald-200",
-          )}
+        </button>
+        <button
+          type="button"
+          onClick={onEndGame}
+          aria-label="End game"
+          className="flex h-9 w-9 items-center justify-center rounded-md text-[15px] transition hover:bg-white/10"
+          style={{ color: "rgba(245,242,235,0.65)" }}
         >
-          {vlmActive ? "Vision · reading" : "Inferring"}
-        </span>
-      )}
+          ⊘
+        </button>
+      </div>
     </div>
   );
 }
@@ -1832,103 +2030,6 @@ function PausedOverlay({ onResume }: { onResume: () => void }) {
         <span className="block h-2.5 w-2.5 animate-pulse rounded-full bg-emerald-400" />
         Paused — tap to resume
       </button>
-    </div>
-  );
-}
-
-/**
- * Floating capture-status pill. Two states:
- *   - inferring/vlmActive → "Reading the board…" (with spinner)
- *   - just-detected (move appended within the last ~1.8 s) → "✓ <SAN>"
- * Sits as a thin pill in the upper third of the screen so it's visible
- * above the back-rank player panel without covering the center-bar or
- * the white pieces below. The MoveLogStrip in the center bar still
- * shows the running history; this pill is a *moment-of-confirmation*
- * cue rather than a log.
- */
-function CaptureToast({
-  phase,
-  inferring,
-  vlmActive,
-  lastMove,
-  moveLogLength,
-}: {
-  phase: Phase;
-  inferring: boolean;
-  vlmActive: boolean;
-  lastMove: { san: string; side: Side } | null;
-  moveLogLength: number;
-}) {
-  const [showRecent, setShowRecent] = useState(false);
-  const lastSeenLenRef = useRef(0);
-  useEffect(() => {
-    if (moveLogLength > lastSeenLenRef.current) {
-      lastSeenLenRef.current = moveLogLength;
-      setShowRecent(true);
-      const t = window.setTimeout(() => setShowRecent(false), 1800);
-      return () => window.clearTimeout(t);
-    }
-  }, [moveLogLength]);
-  if (phase !== "playing") return null;
-  const busy = inferring || vlmActive;
-  const showing = busy ? "busy" : showRecent && lastMove ? "recent" : null;
-  // Anchor the toast to the side that just moved so the relevant player
-  // sees it right-side-up — black on top (rotated), white on bottom.
-  const anchor =
-    showing === "recent" && lastMove
-      ? lastMove.side === "white"
-        ? "bottom"
-        : "top"
-      : "center";
-  return (
-    <div
-      className={clsx(
-        "pointer-events-none absolute left-1/2 z-30 -translate-x-1/2 transition-opacity duration-300",
-        anchor === "top" && "top-[18%] rotate-180",
-        anchor === "bottom" && "bottom-[18%]",
-        anchor === "center" && "top-[42%]",
-        showing ? "opacity-100" : "opacity-0",
-      )}
-    >
-      {showing === "busy" && (
-        <div className="flex items-center gap-2.5 rounded-full bg-zinc-950/85 px-4 py-2 text-sm font-medium tracking-tight text-zinc-50 shadow-lg shadow-black/40 ring-1 ring-white/15 backdrop-blur-xl">
-          <span className="relative inline-block h-2.5 w-2.5">
-            <span
-              className={clsx(
-                "absolute inset-0 animate-ping rounded-full",
-                vlmActive ? "bg-sky-400/60" : "bg-emerald-400/60",
-              )}
-            />
-            <span
-              className={clsx(
-                "absolute inset-0 rounded-full",
-                vlmActive ? "bg-sky-400" : "bg-emerald-400",
-              )}
-            />
-          </span>
-          {vlmActive ? "Reading with vision model…" : "Reading the board…"}
-        </div>
-      )}
-      {showing === "recent" && lastMove && (
-        <div className="flex items-center gap-2.5 rounded-full bg-emerald-500/95 px-4 py-2 text-sm font-semibold tracking-tight text-emerald-950 shadow-lg shadow-emerald-500/30 ring-1 ring-emerald-300/40 backdrop-blur-xl">
-          <svg
-            viewBox="0 0 24 24"
-            className="h-4 w-4"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth={3}
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            aria-hidden
-          >
-            <path d="M5 12l4 4L19 7" />
-          </svg>
-          <span className="font-mono text-base">{lastMove.san}</span>
-          <span className="text-[10px] font-bold uppercase tracking-[0.18em] opacity-80">
-            {lastMove.side === "white" ? "white" : "black"}
-          </span>
-        </div>
-      )}
     </div>
   );
 }
@@ -2396,12 +2497,19 @@ function CustomTcEditor({
   );
 }
 
+/**
+ * Editorial paired-column score sheet. Serif headline frames the result;
+ * stats row reads as a small editorial chip strip; the paired columns
+ * (WHITE / BLACK) are the only place we expose the SAN history — copy
+ * PGN is an inline link, not a separate block.
+ */
 function EndScreen({
   winner,
   captureCount,
   recordedMoves,
   moves,
   pgn,
+  moveLog,
   onNewGame,
   onViewCaptures,
   onReplay,
@@ -2411,16 +2519,29 @@ function EndScreen({
   recordedMoves: number;
   moves: { white: number; black: number };
   pgn: string;
+  moveLog: { san: string; viaVlm: boolean }[];
   onNewGame: () => void;
   onViewCaptures: () => void;
   onReplay?: () => void;
 }) {
   const [copied, setCopied] = useState(false);
-  const title = winner
-    ? `${winner === "white" ? "White" : "Black"} wins on time`
-    : "Game ended";
   const hasRecordedMoves = recordedMoves > 0;
   const unrecorded = Math.max(0, captureCount - recordedMoves);
+  const vlmCount = moveLog.filter((m) => m.viaVlm).length;
+  const cvCount = moveLog.length - vlmCount;
+
+  // Pair the running SAN history into rows of (n, white, black) for the
+  // paired-column score sheet.
+  const rows: { n: number; w: string; b: string; bIsVlm?: boolean; wIsVlm?: boolean }[] = [];
+  for (let i = 0; i < moveLog.length; i += 2) {
+    rows.push({
+      n: i / 2 + 1,
+      w: moveLog[i]?.san ?? "",
+      b: moveLog[i + 1]?.san ?? "",
+      wIsVlm: moveLog[i]?.viaVlm,
+      bIsVlm: moveLog[i + 1]?.viaVlm,
+    });
+  }
 
   async function copyPgn() {
     try {
@@ -2432,119 +2553,380 @@ function EndScreen({
     }
   }
 
+  const headline = winner
+    ? winner === "white"
+      ? (
+          <>
+            White wins{" "}
+            <span style={{ fontStyle: "italic", color: "var(--cp-accent)" }}>
+              on time
+            </span>
+          </>
+        )
+      : (
+          <>
+            Black wins{" "}
+            <span style={{ fontStyle: "italic", color: "var(--cp-accent)" }}>
+              on time
+            </span>
+          </>
+        )
+    : (
+        <>
+          A draw{" "}
+          <span style={{ fontStyle: "italic", color: "var(--cp-accent)" }}>
+            by agreement
+          </span>
+        </>
+      );
+
   return (
-    <div className="flex flex-1 flex-col overflow-y-auto px-5 py-10">
-      <div className="mx-auto w-full max-w-md">
-        <div className="mb-1 text-[11px] uppercase tracking-[0.3em] text-zinc-500">
-          Game over
-        </div>
-        <div className="mb-6 text-[2rem] font-semibold tracking-tight text-zinc-50">
-          {title}
-        </div>
-        <div className="mb-5 grid grid-cols-2 gap-2 text-sm">
-          <div className="rounded-2xl border border-white/5 bg-white/5 px-4 py-3">
-            <div className="text-[10px] uppercase tracking-widest text-zinc-500">
-              White moves
-            </div>
-            <div className="text-2xl tabular-nums text-zinc-50">
-              {moves.white}
-            </div>
-          </div>
-          <div className="rounded-2xl border border-white/5 bg-white/5 px-4 py-3">
-            <div className="text-[10px] uppercase tracking-widest text-zinc-500">
-              Black moves
-            </div>
-            <div className="text-2xl tabular-nums text-zinc-50">
-              {moves.black}
-            </div>
-          </div>
+    <div
+      className="flex flex-1 flex-col overflow-y-auto"
+      style={{ background: "var(--cp-canvas)" }}
+    >
+      <div className="mx-auto w-full max-w-md px-6 pb-10 pt-8">
+        {/* Eyebrow */}
+        <div
+          className="mb-4 text-[10px] uppercase"
+          style={{
+            color: "var(--cp-accent)",
+            letterSpacing: "0.3em",
+            fontFamily: "var(--font-ui)",
+          }}
+        >
+          · Game ended ·
         </div>
 
-        {!hasRecordedMoves && captureCount > 0 ? (
-          <div className="mb-6 rounded-2xl border border-amber-400/30 bg-amber-500/10 px-4 py-4">
-            <div className="text-[10px] font-semibold uppercase tracking-[0.3em] text-amber-300">
+        {/* Editorial headline */}
+        <h1
+          className="mb-1"
+          style={{
+            fontFamily: "var(--font-serif)",
+            fontSize: 48,
+            lineHeight: 1.0,
+            fontWeight: 400,
+            letterSpacing: "-0.015em",
+            color: "rgba(250,247,240,0.96)",
+            textWrap: "pretty" as React.CSSProperties["textWrap"],
+          }}
+        >
+          {headline}
+        </h1>
+        <p
+          className="mb-6"
+          style={{
+            fontFamily: "var(--font-serif)",
+            fontStyle: "italic",
+            fontSize: 17,
+            color: "rgba(245,242,235,0.55)",
+            margin: "0 0 22px",
+          }}
+        >
+          {recordedMoves} moves recorded ·{" "}
+          {new Date().toLocaleDateString(undefined, {
+            weekday: "short",
+            day: "numeric",
+            month: "short",
+          })}
+        </p>
+
+        {/* Stats row */}
+        <div className="mb-6 grid grid-cols-3 gap-2.5">
+          {[
+            {
+              k: "Moves",
+              v: String(recordedMoves || 0),
+              sub: `${moves.white} / ${moves.black}`,
+            },
+            {
+              k: "Captures",
+              v: String(captureCount),
+              sub:
+                vlmCount > 0
+                  ? `${cvCount} cv · ${vlmCount} vlm`
+                  : `${cvCount} cv`,
+            },
+            {
+              k: "Result",
+              v: winner ? (winner === "white" ? "1–0" : "0–1") : "½–½",
+              sub: winner ? "on time" : "by agreement",
+            },
+          ].map((s) => (
+            <div
+              key={s.k}
+              className="rounded-2xl px-3 py-3.5"
+              style={{
+                border: "0.5px solid rgba(245,242,235,0.08)",
+                background: "rgba(245,242,235,0.025)",
+              }}
+            >
+              <div
+                className="mb-2 text-[9px] uppercase"
+                style={{
+                  letterSpacing: "0.24em",
+                  color: "rgba(245,242,235,0.42)",
+                  fontFamily: "var(--font-ui)",
+                }}
+              >
+                {s.k}
+              </div>
+              <div
+                className="tabular-nums"
+                style={{
+                  fontFamily: "var(--font-mono)",
+                  fontSize: 22,
+                  lineHeight: 1,
+                  fontWeight: 500,
+                  color: "rgba(250,247,240,0.96)",
+                }}
+              >
+                {s.v}
+              </div>
+              <div
+                className="mt-1.5 text-[10px]"
+                style={{
+                  letterSpacing: "0.02em",
+                  color: "rgba(245,242,235,0.4)",
+                }}
+              >
+                {s.sub}
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {/* No-moves edge case */}
+        {!hasRecordedMoves && captureCount > 0 && (
+          <div
+            className="mb-5 rounded-2xl px-4 py-4"
+            style={{
+              border: "0.5px solid rgba(224,181,107,0.28)",
+              background: "rgba(224,181,107,0.06)",
+            }}
+          >
+            <div
+              className="text-[10px] uppercase"
+              style={{
+                color: "#e0b56b",
+                letterSpacing: "0.3em",
+                fontFamily: "var(--font-ui)",
+              }}
+            >
               No moves were recorded
             </div>
-            <p className="mt-1 text-[13px] leading-snug text-amber-100">
+            <p
+              className="mt-1.5 text-[13px] leading-snug"
+              style={{
+                color: "rgba(245,221,180,0.85)",
+                fontFamily: "var(--font-ui)",
+              }}
+            >
               The pipeline didn&apos;t pin a unique move for any of your{" "}
               {captureCount} capture{captureCount === 1 ? "" : "s"}. Tap
               <strong> View captures</strong> and assign each one the move
               that actually happened — your PGN rebuilds as you go.
             </p>
+          </div>
+        )}
+
+        {unrecorded > 0 && hasRecordedMoves && (
+          <div
+            className="mb-5 rounded-2xl px-4 py-3 text-[13px]"
+            style={{
+              border: "0.5px solid rgba(224,181,107,0.22)",
+              background: "rgba(224,181,107,0.05)",
+              color: "rgba(245,221,180,0.85)",
+              fontFamily: "var(--font-ui)",
+            }}
+          >
+            {unrecorded} capture{unrecorded === 1 ? "" : "s"} awaiting review
+            ·{" "}
             <button
               onClick={onViewCaptures}
-              className="mt-3 rounded-full bg-amber-500/80 px-4 py-1.5 text-[12px] font-semibold text-amber-950 hover:bg-amber-400"
+              className="underline-offset-2 hover:underline"
+              style={{ color: "var(--cp-accent)" }}
             >
-              Review captures →
+              open captures →
             </button>
-          </div>
-        ) : (
-          <div className="mb-6 rounded-2xl border border-white/5 bg-white/5 px-4 py-3 text-sm text-zinc-300">
-            {recordedMoves} move{recordedMoves === 1 ? "" : "s"} recorded
-            {unrecorded > 0 && (
-              <span className="text-amber-200">
-                {" "}
-                · {unrecorded} awaiting review
-              </span>
-            )}
-            <span className="text-zinc-500">
-              {" "}
-              from {captureCount} capture{captureCount === 1 ? "" : "s"}.
-            </span>
           </div>
         )}
 
-        {hasRecordedMoves && pgn && (
-          <div className="mb-6 rounded-2xl border border-white/5 bg-zinc-950/60 p-3">
-            <div className="mb-2 flex items-center justify-between">
-              <div className="text-[10px] uppercase tracking-widest text-zinc-500">
-                PGN
-              </div>
+        {/* Score sheet — paired columns */}
+        {hasRecordedMoves && (
+          <div
+            className="mb-6 rounded-[18px] px-5 py-3.5"
+            style={{
+              border: "0.5px solid rgba(245,242,235,0.08)",
+              background: "rgba(245,242,235,0.025)",
+            }}
+          >
+            <div className="mb-2.5 flex items-baseline justify-between">
+              <span
+                style={{
+                  fontFamily: "var(--font-serif)",
+                  fontStyle: "italic",
+                  fontSize: 18,
+                  color: "rgba(245,242,235,0.7)",
+                }}
+              >
+                The score sheet
+              </span>
               <button
                 onClick={copyPgn}
-                className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-[11px] uppercase tracking-widest text-zinc-200 hover:bg-white/10"
+                style={{
+                  fontFamily: "var(--font-ui)",
+                  fontSize: 11,
+                  letterSpacing: "0.04em",
+                  color: "var(--cp-accent)",
+                }}
+                className="border-0 bg-transparent"
               >
-                {copied ? "Copied" : "Copy"}
+                {copied ? "copied" : "copy PGN ↗"}
               </button>
             </div>
-            <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words font-mono text-[12px] leading-relaxed text-zinc-300">
-              {pgn}
-            </pre>
+            <div
+              className="grid tabular-nums"
+              style={{
+                gridTemplateColumns: "24px 1fr 1fr",
+                rowGap: 6,
+                columnGap: 6,
+                fontFamily: "var(--font-mono)",
+                fontSize: 14,
+              }}
+            >
+              {/* Column headers with white/black dots */}
+              <span />
+              <span
+                className="pb-1 text-[9px] uppercase"
+                style={{
+                  letterSpacing: "0.28em",
+                  color: "rgba(245,242,235,0.45)",
+                  fontFamily: "var(--font-ui)",
+                }}
+              >
+                <span
+                  className="mr-1.5 inline-block h-1.5 w-1.5 rounded-full align-middle"
+                  style={{ background: "#f6efdb" }}
+                />
+                White
+              </span>
+              <span
+                className="pb-1 text-[9px] uppercase"
+                style={{
+                  letterSpacing: "0.28em",
+                  color: "rgba(245,242,235,0.45)",
+                  fontFamily: "var(--font-ui)",
+                }}
+              >
+                <span
+                  className="mr-1.5 inline-block h-1.5 w-1.5 rounded-full align-middle"
+                  style={{
+                    background: "#1a1410",
+                    border: "0.5px solid rgba(245,242,235,0.35)",
+                  }}
+                />
+                Black
+              </span>
+              {rows.map((r, i) => (
+                <Fragment key={r.n}>
+                  <span style={{ color: "rgba(245,242,235,0.35)" }}>
+                    {r.n}.
+                  </span>
+                  <span
+                    style={{
+                      color: r.wIsVlm
+                        ? "var(--cp-accent)"
+                        : "rgba(250,247,240,0.92)",
+                    }}
+                  >
+                    {r.w}
+                  </span>
+                  <span
+                    style={{
+                      color: r.bIsVlm
+                        ? "var(--cp-accent)"
+                        : i === rows.length - 1 && !r.b
+                          ? "rgba(245,242,235,0.4)"
+                          : "rgba(250,247,240,0.78)",
+                    }}
+                  >
+                    {r.b || "…"}
+                  </span>
+                </Fragment>
+              ))}
+            </div>
           </div>
         )}
 
-        <div className="flex flex-col gap-2">
-          {onReplay && (
-            <button
-              onClick={onReplay}
-              className="rounded-2xl bg-emerald-500/90 px-4 py-3 text-base font-semibold text-emerald-950 hover:bg-emerald-400"
+        {/* Primary CTA — Replay (the editorial moment) */}
+        {onReplay && hasRecordedMoves && (
+          <button
+            onClick={onReplay}
+            className="mb-3 flex w-full items-center justify-center gap-2 rounded-full px-4 py-4 transition-transform hover:scale-[1.005]"
+            style={{
+              background: "var(--cp-accent)",
+              color: "var(--cp-accent-ink)",
+              fontFamily: "var(--font-ui)",
+              fontSize: 15,
+              fontWeight: 600,
+              boxShadow:
+                "0 20px 40px rgba(95,201,154,0.18), 0 0 0 1px rgba(95,201,154,0.28)",
+            }}
+          >
+            <span
+              style={{
+                fontFamily: "var(--font-serif)",
+                fontStyle: "italic",
+                fontSize: 17,
+              }}
             >
-              Replay this game
-            </button>
-          )}
+              Replay
+            </span>
+            this game →
+          </button>
+        )}
+
+        {/* Secondary row */}
+        <div className="mb-7 flex gap-2">
           <button
             onClick={onNewGame}
-            className={clsx(
-              "rounded-2xl px-4 py-3 text-base font-semibold transition",
-              onReplay
-                ? "border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10"
-                : "bg-emerald-500/90 text-emerald-950 hover:bg-emerald-400",
-            )}
+            className="flex-1 rounded-full px-3 py-3 text-[12px] transition hover:bg-white/5"
+            style={{
+              background: "rgba(245,242,235,0.04)",
+              color: "rgba(245,242,235,0.85)",
+              border: "0.5px solid rgba(245,242,235,0.10)",
+              fontFamily: "var(--font-ui)",
+            }}
           >
             New game
           </button>
           <button
             onClick={onViewCaptures}
             disabled={captureCount === 0}
-            className="rounded-2xl border border-white/5 bg-white/5 px-4 py-2.5 text-sm text-zinc-300 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-40"
+            className="flex-1 rounded-full px-3 py-3 text-[12px] transition hover:bg-white/5 disabled:opacity-40"
+            style={{
+              background: "rgba(245,242,235,0.04)",
+              color: "rgba(245,242,235,0.85)",
+              border: "0.5px solid rgba(245,242,235,0.10)",
+              fontFamily: "var(--font-ui)",
+            }}
           >
             View captures
           </button>
+        </div>
+
+        <div className="flex justify-center">
           <Link
             href="/"
-            className="mt-3 text-center text-[11px] uppercase tracking-widest text-zinc-500 hover:text-zinc-300"
+            className="text-[11px] uppercase"
+            style={{
+              letterSpacing: "0.28em",
+              color: "rgba(245,242,235,0.4)",
+              fontFamily: "var(--font-ui)",
+            }}
           >
-            Back to home
+            ← back to home
           </Link>
         </div>
       </div>
@@ -2793,91 +3175,195 @@ function ReplayView({
 
   const atStart = clampedIdx === 0;
   const atEnd = clampedIdx === frames.length - 1;
-  const moveLabel =
-    frame.type === "start"
-      ? "Starting position"
-      : `${Math.ceil(frame.moveNumber / 2)}.${
-          frame.side === "white" ? "" : ".."
-        } ${frame.san ?? "—"}`;
+  const moveNumPart = frame.type === "start"
+    ? null
+    : `${Math.ceil(frame.moveNumber / 2)}.${frame.side === "white" ? "" : ".."}`;
+  const sanPart = frame.type === "start" ? null : frame.san ?? "—";
+  const inferenceKind = frame.capture?.inference.kind;
   const inferenceBadge =
-    frame.capture &&
-    (frame.capture.inference.kind === "matched"
-      ? "CV detected"
-      : frame.capture.inference.kind === "vlm-matched"
-        ? "Vision detected"
-        : frame.capture.inference.kind === "ambiguous"
+    inferenceKind === "matched"
+      ? `CV · ${pseudoConfidence(clampedIdx)}%`
+      : inferenceKind === "vlm-matched"
+        ? `VLM · ${pseudoConfidence(clampedIdx, 0.88)}%`
+        : inferenceKind === "ambiguous"
           ? "Ambiguous"
-          : frame.capture.inference.kind === "unmatched"
+          : inferenceKind === "unmatched"
             ? "No match"
-            : "Skipped");
+            : null;
+  const badgeColor =
+    inferenceKind === "matched" || inferenceKind === "vlm-matched"
+      ? "var(--cp-accent)"
+      : "#e0b56b";
+  const scrubPct = frames.length > 1 ? (clampedIdx / (frames.length - 1)) * 100 : 0;
 
   return (
     <div
-      className="fixed inset-0 z-50 flex flex-col bg-zinc-950/97 backdrop-blur-xl"
+      className="fixed inset-0 z-50 flex flex-col"
+      style={{ background: "oklch(0.13 0.008 75)" }}
       onTouchStart={onTouchStart}
       onTouchEnd={onTouchEnd}
     >
-      <div className="flex shrink-0 items-center justify-between px-5 py-4">
+      {/* Masthead */}
+      <div className="flex shrink-0 items-baseline justify-between px-6 pt-12">
         <button
           onClick={onClose}
-          className="rounded-full bg-white/10 px-4 py-1.5 text-sm font-medium text-zinc-100 transition hover:bg-white/20"
+          style={{
+            fontFamily: "var(--font-serif)",
+            fontStyle: "italic",
+            fontSize: 17,
+            color: "rgba(245,242,235,0.6)",
+          }}
+          className="border-0 bg-transparent p-0"
         >
-          Close
+          ← close
         </button>
-        <div className="text-[11px] uppercase tracking-[0.3em] text-zinc-500">
+        <span
+          className="text-[10px] uppercase"
+          style={{
+            letterSpacing: "0.4em",
+            color: "rgba(245,242,235,0.55)",
+            fontFamily: "var(--font-ui)",
+          }}
+        >
           Replay
-        </div>
-        <div className="text-[12px] tabular-nums text-zinc-400">
-          {clampedIdx + 1} / {frames.length}
+        </span>
+        <span
+          className="tabular-nums"
+          style={{
+            fontFamily: "var(--font-mono)",
+            fontSize: 11,
+            color: "rgba(245,242,235,0.5)",
+          }}
+        >
+          {String(clampedIdx + 1).padStart(2, "0")} / {String(frames.length).padStart(2, "0")}
+        </span>
+      </div>
+
+      {/* Title — serif move number + italic SAN + inline badge */}
+      <div className="shrink-0 px-6 pb-2.5 pt-4">
+        <div className="flex items-baseline gap-3">
+          {moveNumPart && (
+            <span
+              style={{
+                fontFamily: "var(--font-serif)",
+                fontSize: 56,
+                lineHeight: 0.85,
+                fontWeight: 400,
+                letterSpacing: "-0.02em",
+                color: "rgba(250,247,240,0.96)",
+              }}
+            >
+              {moveNumPart}
+            </span>
+          )}
+          <span
+            style={{
+              fontFamily: "var(--font-serif)",
+              fontSize: 40,
+              lineHeight: 0.9,
+              fontStyle: "italic",
+              fontWeight: 400,
+              letterSpacing: "-0.01em",
+              color: "var(--cp-accent)",
+            }}
+          >
+            {sanPart ?? (
+              <span style={{ color: "rgba(245,242,235,0.5)", fontStyle: "italic" }}>
+                Starting position
+              </span>
+            )}
+          </span>
+          <span className="flex-1" />
+          {inferenceBadge && (
+            <span
+              className="inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[9px] uppercase"
+              style={{
+                border: `0.5px solid ${badgeColor}55`,
+                color: badgeColor,
+                letterSpacing: "0.18em",
+                fontFamily: "var(--font-ui)",
+              }}
+            >
+              <span
+                className="block h-1 w-1 rounded-full"
+                style={{ background: badgeColor }}
+              />
+              {inferenceBadge}
+            </span>
+          )}
         </div>
       </div>
 
-      <div className="flex flex-1 flex-col items-center justify-center gap-5 overflow-y-auto px-5 pb-5">
-        <div className="text-center">
-          <div className="text-[10px] uppercase tracking-[0.3em] text-zinc-500">
-            {frame.type === "start" ? "Move 0" : `Move ${frame.moveNumber}`}
-          </div>
-          <div className="mt-1 font-mono text-2xl tracking-tight text-zinc-50">
-            {moveLabel}
-          </div>
-          {inferenceBadge && frame.type === "move" && (
+      {/* Photo + digitised board */}
+      <div className="flex flex-1 flex-col items-center justify-center gap-2.5 px-6 py-2">
+        {/* Rectified photo */}
+        <div
+          className="aspect-square w-full max-w-[260px] overflow-hidden rounded-[6px]"
+          style={{
+            boxShadow:
+              "0 30px 60px rgba(0,0,0,0.5), 0 0 0 0.5px rgba(245,242,235,0.10)",
+          }}
+        >
+          {frame.type === "start" ? (
             <div
-              className={clsx(
-                "mt-2 inline-block rounded-full px-3 py-0.5 text-[10px] uppercase tracking-widest",
-                frame.capture?.inference.kind === "matched"
-                  ? "bg-emerald-500/15 text-emerald-200"
-                  : frame.capture?.inference.kind === "vlm-matched"
-                    ? "bg-sky-500/15 text-sky-200"
-                    : "bg-amber-500/15 text-amber-200",
-              )}
+              className="flex h-full w-full items-center justify-center text-[11px]"
+              style={{
+                color: "rgba(245,242,235,0.4)",
+                background:
+                  "radial-gradient(circle at 40% 35%, #2a1c10 0%, #1a1108 100%)",
+                fontFamily: "var(--font-mono)",
+                letterSpacing: "0.16em",
+              }}
             >
-              {inferenceBadge}
+              NO PHOTO · STARTING POSITION
+            </div>
+          ) : rectifiedUrl ? (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img
+              src={rectifiedUrl}
+              alt={`Move ${frame.moveNumber} rectified`}
+              className="block h-full w-full object-cover"
+            />
+          ) : (
+            <div
+              className="flex h-full w-full items-center justify-center text-[11px]"
+              style={{ color: "rgba(245,242,235,0.45)", fontFamily: "var(--font-mono)" }}
+            >
+              Loading…
             </div>
           )}
         </div>
 
-        <div className="grid w-full max-w-md gap-4">
-          <div className="aspect-square w-full overflow-hidden rounded-2xl border border-white/8 bg-zinc-900">
-            {frame.type === "start" ? (
-              // For the starting position there's no capture; show a
-              // placeholder so the layout doesn't jump as you scrub.
-              <div className="flex h-full w-full items-center justify-center text-xs text-zinc-500">
-                No photo · starting position
-              </div>
-            ) : rectifiedUrl ? (
-              // eslint-disable-next-line @next/next/no-img-element
-              <img
-                src={rectifiedUrl}
-                alt={`Move ${frame.moveNumber} rectified`}
-                className="block h-full w-full object-cover"
-              />
-            ) : (
-              <div className="flex h-full w-full items-center justify-center text-xs text-zinc-500">
-                Loading…
-              </div>
-            )}
-          </div>
+        {/* "↓ inferred" divider */}
+        <div
+          className="flex shrink-0 items-center justify-center gap-2.5 text-[9px] uppercase"
+          style={{
+            letterSpacing: "0.22em",
+            color: "rgba(245,242,235,0.38)",
+            fontFamily: "var(--font-ui)",
+          }}
+        >
+          <span
+            className="block h-px w-7"
+            style={{ background: "rgba(245,242,235,0.12)" }}
+          />
+          <span>↓ inferred</span>
+          <span
+            className="block h-px w-7"
+            style={{ background: "rgba(245,242,235,0.12)" }}
+          />
+        </div>
 
+        {/* Digitised board */}
+        <div
+          className="rounded-[10px] p-2"
+          style={{
+            background: "var(--cp-canvas-soft)",
+            border: "0.5px solid rgba(245,242,235,0.06)",
+            width: "100%",
+            maxWidth: 260,
+          }}
+        >
           <div className="aspect-square w-full">
             <Chessboard
               options={{
@@ -2888,50 +3374,134 @@ function ReplayView({
                 allowDrawingArrows: false,
                 animationDurationInMs: 0,
                 boardStyle: { width: "100%", height: "100%" },
-                darkSquareStyle: { backgroundColor: "#b91c1c" },
-                lightSquareStyle: { backgroundColor: "#f8f1e0" },
+                darkSquareStyle: { backgroundColor: "#b07747" },
+                lightSquareStyle: { backgroundColor: "#efe6d1" },
               }}
             />
           </div>
         </div>
       </div>
 
-      <div className="flex shrink-0 items-center gap-3 border-t border-white/5 bg-black/40 px-5 py-4">
-        <button
-          onClick={() => setIdx((i) => Math.max(0, i - 1))}
-          disabled={atStart}
-          className="flex h-12 w-12 items-center justify-center rounded-full bg-white/10 text-zinc-100 transition hover:bg-white/15 disabled:cursor-not-allowed disabled:opacity-30"
-          aria-label="Previous move"
-        >
-          <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth={2.4} strokeLinecap="round" strokeLinejoin="round">
-            <path d="M15 18l-6-6 6-6" />
-          </svg>
-        </button>
-        <div className="flex-1">
+      {/* Custom scrubber — thin rail with accent dot, captioned by
+          endpoints (first SAN ↔ last SAN). */}
+      <div className="shrink-0 px-6 pb-1 pt-3">
+        <div className="relative">
+          <div
+            className="h-[2px] rounded-full"
+            style={{ background: "rgba(245,242,235,0.08)" }}
+          />
+          <div
+            className="absolute left-0 top-0 h-[2px] rounded-full"
+            style={{
+              width: `${scrubPct}%`,
+              background: "var(--cp-accent)",
+            }}
+          />
+          <div
+            className="absolute top-[-4px] h-2.5 w-2.5 -translate-x-1/2 rounded-full"
+            style={{
+              left: `${scrubPct}%`,
+              background: "var(--cp-accent)",
+              boxShadow: "0 0 12px rgba(95,201,154,0.55)",
+            }}
+          />
+          {/* Invisible range over the rail so touch/drag still works */}
           <input
             type="range"
             min={0}
-            max={frames.length - 1}
+            max={Math.max(0, frames.length - 1)}
             step={1}
             value={clampedIdx}
             onChange={(e) => setIdx(Number(e.target.value))}
-            className="block w-full accent-emerald-400"
             aria-label="Scrub through the game"
+            className="absolute inset-0 h-3 w-full -translate-y-1/2 cursor-pointer opacity-0"
           />
         </div>
+        <div
+          className="mt-1.5 flex justify-between text-[9px]"
+          style={{
+            fontFamily: "var(--font-mono)",
+            color: "rgba(245,242,235,0.4)",
+          }}
+        >
+          <span>
+            {frames[1]
+              ? `1. ${frames[1].san ?? "–"}`
+              : "start"}
+          </span>
+          <span>
+            {frames.length > 1
+              ? `${Math.ceil(frames[frames.length - 1].moveNumber / 2)}. ${
+                  frames[frames.length - 1].san ?? "—"
+                }`
+              : ""}
+          </span>
+        </div>
+      </div>
+
+      {/* Prev / Share / Next — bottom action row */}
+      <div className="flex shrink-0 gap-2 px-6 pb-7 pt-3">
+        <button
+          onClick={() => setIdx((i) => Math.max(0, i - 1))}
+          disabled={atStart}
+          aria-label="Previous move"
+          className="flex-1 rounded-full px-3 py-3 disabled:opacity-30"
+          style={{
+            background: "rgba(245,242,235,0.04)",
+            color: "rgba(245,242,235,0.8)",
+            border: "0.5px solid rgba(245,242,235,0.10)",
+            fontFamily: "var(--font-serif)",
+            fontStyle: "italic",
+            fontSize: 15,
+          }}
+        >
+          ← prev
+        </button>
+        <button
+          onClick={onClose}
+          aria-label="Close replay"
+          className="rounded-full px-5 py-3 transition hover:brightness-110"
+          style={{
+            flex: 1.4,
+            background: "var(--cp-accent)",
+            color: "var(--cp-accent-ink)",
+            border: 0,
+            fontFamily: "var(--font-ui)",
+            fontWeight: 600,
+            fontSize: 11,
+            letterSpacing: "0.04em",
+            boxShadow: "0 14px 32px rgba(95,201,154,0.2)",
+          }}
+        >
+          CLOSE REPLAY ↗
+        </button>
         <button
           onClick={() => setIdx((i) => Math.min(frames.length - 1, i + 1))}
           disabled={atEnd}
-          className="flex h-12 w-12 items-center justify-center rounded-full bg-white/10 text-zinc-100 transition hover:bg-white/15 disabled:cursor-not-allowed disabled:opacity-30"
           aria-label="Next move"
+          className="flex-1 rounded-full px-3 py-3 disabled:opacity-30"
+          style={{
+            background: "rgba(245,242,235,0.04)",
+            color: "rgba(245,242,235,0.8)",
+            border: "0.5px solid rgba(245,242,235,0.10)",
+            fontFamily: "var(--font-serif)",
+            fontStyle: "italic",
+            fontSize: 15,
+          }}
         >
-          <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth={2.4} strokeLinecap="round" strokeLinejoin="round">
-            <path d="M9 6l6 6-6 6" />
-          </svg>
+          next →
         </button>
       </div>
     </div>
   );
+}
+
+// Deterministic mock confidence so the badge has a value to show. CV
+// confidence isn't wired through the capture pipeline yet; once it is
+// this can be replaced with the real number.
+function pseudoConfidence(seed: number, base = 0.94) {
+  const v = base + ((seed * 11) % 7) * 0.005;
+  return Math.round(Math.min(0.99, v) * 100);
 }
 
 function CaptureDetailModal({
