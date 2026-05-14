@@ -453,11 +453,11 @@ function StatusBanner({ status }: { status: Status }) {
         ? "border-amber-500/40 bg-amber-500/10 text-amber-200"
         : status.tone === "check"
           ? "border-rose-500/40 bg-rose-500/10 text-rose-200"
-          : "border-zinc-700 bg-zinc-900/60 text-zinc-200";
+          : "border-white/10 bg-white/5 text-zinc-200";
   return (
     <div
       className={clsx(
-        "rounded-lg border px-4 py-3 text-sm font-medium",
+        "rounded-2xl border px-4 py-3 text-sm font-medium",
         tone
       )}
     >
@@ -488,10 +488,10 @@ function EnginePill({
     tone = "border-emerald-500/40 bg-emerald-500/10 text-emerald-200";
   } else {
     text = "Engine idle";
-    tone = "border-zinc-700 bg-zinc-900/60 text-zinc-300";
+    tone = "border-white/10 bg-white/5 text-zinc-300";
   }
   return (
-    <div className={clsx("rounded-md border px-3 py-2 text-xs", tone)}>
+    <div className={clsx("rounded-2xl border px-3 py-2 text-xs", tone)}>
       <span className="inline-flex items-center gap-2">
         <span
           className={clsx(
@@ -572,20 +572,20 @@ function Controls({
       <div className="flex flex-wrap gap-2">
         <button
           onClick={() => onNewGame()}
-          className="rounded-md border border-emerald-500/40 bg-emerald-500/15 px-3 py-1.5 text-sm text-emerald-200 hover:bg-emerald-500/25"
+          className="rounded-full bg-emerald-500/90 px-4 py-2 text-sm font-semibold text-emerald-950 transition hover:bg-emerald-400"
         >
           New game
         </button>
         <button
           onClick={onFlip}
-          className="rounded-md border border-zinc-700 bg-zinc-800 px-3 py-1.5 text-sm text-zinc-200 hover:bg-zinc-700"
+          className="rounded-full border border-white/10 bg-white/5 px-4 py-2 text-sm text-zinc-100 transition hover:bg-white/10"
         >
           Flip board
         </button>
         <button
           onClick={onUndo}
           disabled={!canUndo}
-          className="rounded-md border border-zinc-700 bg-zinc-800 px-3 py-1.5 text-sm text-zinc-200 hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-40"
+          className="rounded-full border border-white/10 bg-white/5 px-4 py-2 text-sm text-zinc-100 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-40"
         >
           Undo
         </button>
@@ -644,16 +644,16 @@ function Segmented<T extends string>({
   onChange: (v: T) => void;
 }) {
   return (
-    <div className="inline-flex rounded-md border border-zinc-700 bg-zinc-900 p-0.5">
+    <div className="inline-flex rounded-full border border-white/10 bg-white/5 p-1">
       {options.map((opt) => (
         <button
           key={opt.value}
           onClick={() => onChange(opt.value)}
           className={clsx(
-            "rounded-sm px-3 py-1 text-sm transition",
+            "rounded-full px-3 py-1 text-sm font-medium transition",
             value === opt.value
-              ? "bg-zinc-700 text-zinc-50"
-              : "text-zinc-300 hover:bg-zinc-800"
+              ? "bg-white/15 text-zinc-50 shadow-inner shadow-white/5"
+              : "text-zinc-300 hover:text-zinc-100"
           )}
         >
           {opt.label}
@@ -772,13 +772,13 @@ function SharePanel({ game }: { game: Chess }) {
       <div className="flex flex-wrap gap-2">
         <button
           onClick={() => copy(game.fen(), "FEN")}
-          className="rounded-md border border-zinc-700 bg-zinc-800 px-3 py-1.5 text-xs text-zinc-200 hover:bg-zinc-700"
+          className="rounded-full border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-zinc-100 transition hover:bg-white/10"
         >
           {copied === "FEN" ? "FEN copied" : "Copy FEN"}
         </button>
         <button
           onClick={() => copy(game.pgn(), "PGN")}
-          className="rounded-md border border-zinc-700 bg-zinc-800 px-3 py-1.5 text-xs text-zinc-200 hover:bg-zinc-700"
+          className="rounded-full border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-zinc-100 transition hover:bg-white/10"
         >
           {copied === "PGN" ? "PGN copied" : "Copy PGN"}
         </button>
@@ -799,22 +799,22 @@ function PromotionPicker({
   const choices: PromoPiece[] = ["q", "r", "b", "n"];
   return (
     <div
-      className="fixed inset-0 z-40 flex items-center justify-center bg-black/60 px-4"
+      className="fixed inset-0 z-40 flex items-center justify-center bg-black/70 px-4 backdrop-blur-md"
       onClick={onCancel}
     >
       <div
-        className="rounded-xl border border-zinc-700 bg-zinc-900 p-5 shadow-xl"
+        className="rounded-3xl border border-white/10 bg-zinc-950/95 p-6 shadow-2xl"
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="mb-3 text-sm font-medium text-zinc-200">
-          Promote pawn to:
+        <div className="mb-4 text-[10px] font-semibold uppercase tracking-[0.3em] text-zinc-400">
+          Promote pawn to
         </div>
         <div className="flex gap-2">
           {choices.map((p) => (
             <button
               key={p}
               onClick={() => onPick(p)}
-              className="flex h-16 w-16 items-center justify-center rounded-md border border-zinc-700 bg-zinc-800 text-4xl leading-none hover:bg-zinc-700"
+              className="flex h-16 w-16 items-center justify-center rounded-2xl border border-white/10 bg-white/5 text-4xl leading-none transition hover:bg-white/10"
               style={{
                 color: color === "w" ? "#f4f4f5" : "#0a0a0a",
                 textShadow: color === "b" ? "0 0 1px #f4f4f5" : "0 0 1px #0a0a0a",
@@ -841,29 +841,29 @@ function ResultModal({
 }) {
   return (
     <div
-      className="fixed inset-0 z-30 flex items-center justify-center bg-black/60 px-4"
+      className="fixed inset-0 z-30 flex items-center justify-center bg-black/70 px-4 backdrop-blur-md"
       onClick={onClose}
     >
       <div
-        className="w-full max-w-sm rounded-xl border border-zinc-700 bg-zinc-900 p-6 shadow-xl"
+        className="w-full max-w-sm rounded-3xl border border-white/10 bg-zinc-950/95 p-6 shadow-2xl"
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="mb-1 text-xs uppercase tracking-wider text-zinc-400">
+        <div className="mb-1 text-[10px] font-semibold uppercase tracking-[0.3em] text-emerald-300">
           Game over
         </div>
-        <div className="mb-5 text-2xl font-semibold text-zinc-100">
+        <div className="mb-5 text-2xl font-semibold tracking-tight text-zinc-50">
           {status.text}
         </div>
         <div className="flex gap-2">
           <button
             onClick={onNewGame}
-            className="flex-1 rounded-md border border-emerald-500/40 bg-emerald-500/15 px-4 py-2 text-sm text-emerald-200 hover:bg-emerald-500/25"
+            className="flex-1 rounded-full bg-emerald-500/90 px-4 py-2.5 text-sm font-semibold text-emerald-950 transition hover:bg-emerald-400"
           >
             New game
           </button>
           <button
             onClick={onClose}
-            className="rounded-md border border-zinc-700 bg-zinc-800 px-4 py-2 text-sm text-zinc-200 hover:bg-zinc-700"
+            className="rounded-full border border-white/10 bg-white/5 px-4 py-2.5 text-sm text-zinc-100 transition hover:bg-white/10"
           >
             Close
           </button>

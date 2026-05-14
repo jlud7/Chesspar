@@ -776,15 +776,6 @@ export function CaptureGame() {
     setPhase("playing");
   }
 
-  function recalibrate() {
-    setCorners([]);
-    stableDetectionCountRef.current = 0;
-    lastDetectedCornersRef.current = null;
-    baselineRef.current = null;
-    previousFrameRef.current = null;
-    setPhase("calibrating");
-  }
-
   function backToSettings() {
     setPhase("settings");
     stopCamera();
@@ -1461,7 +1452,6 @@ export function CaptureGame() {
           moves={moves}
           pgn={pgn}
           onNewGame={backToSettings}
-          onRecalibrate={recalibrate}
           onViewCaptures={() => setShowCaptures(true)}
           onReplay={
             captures.length > 0 ? () => setShowReplay(true) : undefined
@@ -2413,7 +2403,6 @@ function EndScreen({
   moves,
   pgn,
   onNewGame,
-  onRecalibrate,
   onViewCaptures,
   onReplay,
 }: {
@@ -2423,7 +2412,6 @@ function EndScreen({
   moves: { white: number; black: number };
   pgn: string;
   onNewGame: () => void;
-  onRecalibrate: () => void;
   onViewCaptures: () => void;
   onReplay?: () => void;
 }) {
@@ -2552,15 +2540,9 @@ function EndScreen({
           >
             View captures
           </button>
-          <button
-            onClick={onRecalibrate}
-            className="rounded-2xl border border-white/5 bg-white/5 px-4 py-2.5 text-sm text-zinc-300 hover:bg-white/10"
-          >
-            Recalibrate corners
-          </button>
           <Link
             href="/"
-            className="mt-2 text-center text-[11px] uppercase tracking-widest text-zinc-500 hover:text-zinc-300"
+            className="mt-3 text-center text-[11px] uppercase tracking-widest text-zinc-500 hover:text-zinc-300"
           >
             Back to home
           </Link>
