@@ -117,7 +117,6 @@ const VLM_PROVIDER_COST_HINT: Record<VlmProvider, string> = {
   openai: "~$0.02 / move · ~$0.80 / 40-move game",
 };
 const RECTIFIED_SIZE = 384;
-const CORNER_LABELS = ["a8", "h8", "h1", "a1"] as const;
 
 export function CaptureGame() {
   const [phase, setPhase] = useState<Phase>("settings");
@@ -173,7 +172,6 @@ export function CaptureGame() {
   const [vlmConfig, setVlmConfig] = useState<VlmConfig | null>(null);
   const vlmConfigRef = useRef<VlmConfig | null>(null);
 
-  const [calibrationPreviewUrl, setCalibrationPreviewUrl] = useState<string | null>(null);
   const [moveLog, setMoveLog] = useState<{ san: string; viaVlm: boolean }[]>([]);
   const [selectedCaptureIdx, setSelectedCaptureIdx] = useState<number | null>(null);
   const [pendingPick, setPendingPick] = useState<{
@@ -734,34 +732,6 @@ export function CaptureGame() {
   }, [testMode, testFrames, testFrameIdx]);
 
   useEffect(() => {
-    if (phase !== "calibrating" || corners.length !== 4) {
-      setCalibrationPreviewUrl(null);
-      return;
-    }
-    let cancelled = false;
-    void (async () => {
-      await new Promise<void>((r) => requestAnimationFrame(() => r()));
-      if (cancelled) return;
-      try {
-        const source = previewSource();
-        if (!source) return;
-        const warped = warpBoard(
-          source,
-          corners as [Point, Point, Point, Point],
-          256,
-        );
-        setCalibrationPreviewUrl(warped.toDataURL("image/jpeg", 0.88));
-      } catch {
-        setCalibrationPreviewUrl(null);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [phase, corners, testMode, testFrames, testFrameIdx, videoDims]);
-
-  useEffect(() => {
     return () => {
       testFrameUrlsRef.current.forEach((u) => URL.revokeObjectURL(u));
     };
@@ -831,24 +801,6 @@ export function CaptureGame() {
       setVideoDims({ w: v.videoWidth, h: v.videoHeight });
     }
   }, []);
-
-  function onCornerDrag(idx: number, x: number, y: number) {
-    setCorners((c) => {
-      if (idx < 0 || idx >= c.length) return c;
-      const next = [...c];
-      next[idx] = { x, y };
-      return next;
-    });
-  }
-
-  /** Re-run the auto-detector from scratch. */
-  function redetectCorners() {
-    setCorners([]);
-    stableDetectionCountRef.current = 0;
-    lastDetectedCornersRef.current = null;
-    // The useEffect on phase==='calibrating' && corners.length<4 triggers
-    // tryAutoCalibrate; the next tick will pick this up.
-  }
 
   async function runInferencePipeline(side: Side, moveNumber: number) {
     const cs = cornersRef.current;
@@ -1376,133 +1328,44 @@ export function CaptureGame() {
 
   const tcLabel = useMemo(() => describeTc(tc), [tc]);
 
-  const calibrationHint = busy
-    ? "Detecting board automatically…"
-    : corners.length === 4
-      ? testMode
-        ? "Starting position detected. Launching automated capture…"
-        : "Board detected. Launching automated capture…"
-      : testMode
-        ? `Analyzing starting position (photo 1 of ${testFrames.length})…`
-        : "Searching for the board in camera view…";
-
   return (
     <div className="fixed inset-0 flex flex-col overflow-hidden bg-zinc-950 text-zinc-100 select-none">
       {/*
-        The video element stays mounted across phases so the MediaStream keeps
-        flowing into a DOM-attached video (some browsers pause display:none
-        videos). During calibration the wrapper expands to fill the screen;
-        otherwise it collapses to a tiny invisible corner.
+        The camera/test-image stays mounted across phases so the MediaStream
+        keeps flowing into a DOM-attached <video> (some browsers pause
+        display:none videos), and the auto-detector has a live frame to
+        sample. The wrapper is invisibly tiny on every phase — we never
+        take over the screen with a "calibrate this" view; detection runs
+        quietly while the player UI is already on screen.
       */}
-      <div
-        className={clsx(
-          "flex flex-col",
-          phase === "calibrating"
-            ? "flex-1"
-            : "pointer-events-none absolute h-1 w-1 overflow-hidden opacity-0",
-        )}
-      >
-        {phase === "calibrating" && (
-          <div className="flex shrink-0 items-start gap-2 px-3 py-2 text-xs">
-            <button
-              onClick={backToSettings}
-              className="shrink-0 rounded-md border border-zinc-700 bg-zinc-900 px-2.5 py-1 text-zinc-200 hover:bg-zinc-800"
-            >
-              ← Back
-            </button>
-            <div className="flex-1 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-1 text-emerald-100">
-              {calibrationHint}
-            </div>
-          </div>
-        )}
+      <div className="pointer-events-none absolute h-1 w-1 overflow-hidden opacity-0">
         <div
-          className={clsx(
-            "flex flex-1 items-center justify-center bg-black",
-            phase === "calibrating" ? "p-2" : "",
-          )}
+          className="relative overflow-hidden"
+          style={
+            videoDims
+              ? { aspectRatio: `${videoDims.w}/${videoDims.h}`, width: 1, height: 1 }
+              : { aspectRatio: "16/9", width: 1, height: 1 }
+          }
         >
-          <div
-            className="relative overflow-hidden rounded-md border border-zinc-800 bg-zinc-950"
-            style={
-              videoDims
-                ? {
-                    aspectRatio: `${videoDims.w}/${videoDims.h}`,
-                    maxWidth: "100%",
-                    maxHeight: "100%",
-                  }
-                : { aspectRatio: "16/9", width: 1, height: 1 }
-            }
-          >
-            {testMode && testFrames[testFrameIdx] ? (
-              // eslint-disable-next-line @next/next/no-img-element
-              <img
-                src={testFrames[testFrameIdx].src}
-                alt={`Test frame ${testFrameIdx + 1}`}
-                className="block h-full w-full bg-black object-contain"
-              />
-            ) : (
-              <video
-                ref={videoRef}
-                muted
-                playsInline
-                autoPlay
-                onLoadedMetadata={onVideoMeta}
-                className="block h-full w-full bg-black"
-              />
-            )}
-            {phase === "calibrating" && videoDims && (
-              <CalibrationOverlay
-                corners={corners}
-                videoDims={videoDims}
-                onDragCorner={onCornerDrag}
-              />
-            )}
-          </div>
-        </div>
-        {phase === "calibrating" && calibrationPreviewUrl && (
-          <div className="flex shrink-0 items-center justify-center gap-3 border-t border-zinc-800 bg-black/95 px-3 py-2">
-            {/* eslint-disable-next-line @next/next/no-img-element */}
+          {testMode && testFrames[testFrameIdx] ? (
+            // eslint-disable-next-line @next/next/no-img-element
             <img
-              src={calibrationPreviewUrl}
-              alt="Rectified board preview"
-              className="h-24 w-24 rounded-md border border-zinc-700 object-cover"
+              src={testFrames[testFrameIdx].src}
+              alt={`Test frame ${testFrameIdx + 1}`}
+              className="block h-full w-full bg-black object-contain"
             />
-            <div className="min-w-0 text-xs text-zinc-300">
-              <div className="font-medium text-emerald-200">
-                Rectified preview
-              </div>
-              <div className="mt-1 leading-snug text-zinc-400">
-                White&apos;s pieces should sit at the bottom. If this looks
-                wrong, tap Re-detect.
-              </div>
-            </div>
-          </div>
-        )}
-        {phase === "calibrating" && (
-          <div className="flex shrink-0 items-center justify-center gap-2 bg-black/95 px-3 py-3">
-            <button
-              onClick={redetectCorners}
-              disabled={busy}
-              className="rounded-md border border-sky-500/40 bg-sky-500/15 px-3 py-2 text-sm text-sky-100 hover:bg-sky-500/25 disabled:cursor-not-allowed disabled:opacity-40"
-            >
-              {busy ? "Detecting…" : "Re-detect"}
-            </button>
-            <button
-              onClick={startPlayingFromCalibration}
-              disabled={corners.length !== 4}
-              className="rounded-md border border-emerald-500/50 bg-emerald-500/20 px-4 py-2 text-sm font-medium text-emerald-100 hover:bg-emerald-500/30 disabled:cursor-not-allowed disabled:opacity-40"
-            >
-              Start now
-            </button>
-          </div>
-        )}
-        {phase === "calibrating" && cameraError && (
-          <div className="mx-3 mb-3 shrink-0 rounded-md border border-amber-500/40 bg-amber-500/15 px-3 py-2 text-xs text-amber-100">
-            Camera unavailable: {cameraError}
-          </div>
-        )}
+          ) : (
+            <video
+              ref={videoRef}
+              muted
+              playsInline
+              autoPlay
+              onLoadedMetadata={onVideoMeta}
+              className="block h-full w-full bg-black"
+            />
+          )}
+        </div>
       </div>
-
       {phase === "settings" && (
         <SettingsScreen
           tc={tc}
@@ -1533,7 +1396,7 @@ export function CaptureGame() {
         />
       )}
 
-      {(phase === "playing" || phase === "paused") && (
+      {(phase === "playing" || phase === "paused" || phase === "calibrating") && (
         <>
           <PlayerPanel
             side="black"
@@ -1571,6 +1434,13 @@ export function CaptureGame() {
             disabled={phase !== "playing" || active !== "white"}
           />
           {phase === "paused" && <PausedOverlay onResume={togglePause} />}
+          {phase === "calibrating" && (
+            <StartingOverlay
+              testMode={testMode}
+              cameraError={cameraError}
+              onCancel={backToSettings}
+            />
+          )}
         </>
       )}
 
@@ -1956,114 +1826,58 @@ function PausedOverlay({ onResume }: { onResume: () => void }) {
   );
 }
 
-function CalibrationOverlay({
-  corners,
-  videoDims,
-  onDragCorner,
+/**
+ * Lightweight overlay during the brief auto-detect window. Sits on top of
+ * the live player UI rather than taking over the screen — most boards
+ * detect within ~1 s and the overlay just flashes briefly. After a long
+ * delay we add a hint and a cancel-out link.
+ */
+function StartingOverlay({
+  testMode,
+  cameraError,
+  onCancel,
 }: {
-  corners: Point[];
-  videoDims: VideoDims;
-  onDragCorner?: (idx: number, x: number, y: number) => void;
+  testMode: boolean;
+  cameraError: string | null;
+  onCancel: () => void;
 }) {
-  const stroke = Math.max(2, videoDims.w / 400);
-  const dotR = Math.max(12, videoDims.w / 80);
-  const fontSize = Math.max(16, videoDims.w / 35);
-  const labelOffset = dotR * 1.8;
-  const svgRef = useRef<SVGSVGElement | null>(null);
-  const dragRef = useRef<number | null>(null);
-
-  function clientToImage(clientX: number, clientY: number): Point | null {
-    const svg = svgRef.current;
-    if (!svg) return null;
-    const rect = svg.getBoundingClientRect();
-    const x = ((clientX - rect.left) / rect.width) * videoDims.w;
-    const y = ((clientY - rect.top) / rect.height) * videoDims.h;
-    return { x, y };
-  }
-  function onPointerDown(idx: number) {
-    return (e: React.PointerEvent<SVGCircleElement>) => {
-      e.preventDefault();
-      e.stopPropagation();
-      dragRef.current = idx;
-      (e.target as SVGCircleElement).setPointerCapture(e.pointerId);
-    };
-  }
-  function onPointerMove(e: React.PointerEvent<SVGElement>) {
-    if (dragRef.current === null) return;
-    const p = clientToImage(e.clientX, e.clientY);
-    if (!p) return;
-    onDragCorner?.(dragRef.current, p.x, p.y);
-  }
-  function onPointerUp(e: React.PointerEvent<SVGElement>) {
-    if (dragRef.current === null) return;
-    (e.target as SVGElement).releasePointerCapture?.(e.pointerId);
-    dragRef.current = null;
-  }
+  const [showHint, setShowHint] = useState(false);
+  useEffect(() => {
+    const t = window.setTimeout(() => setShowHint(true), 5000);
+    return () => window.clearTimeout(t);
+  }, []);
   return (
-    <svg
-      ref={svgRef}
-      viewBox={`0 0 ${videoDims.w} ${videoDims.h}`}
-      onPointerMove={onPointerMove}
-      onPointerUp={onPointerUp}
-      onPointerCancel={onPointerUp}
-      className="absolute inset-0 h-full w-full"
-      style={{ touchAction: "none" }}
-    >
-      {corners.length >= 2 && corners.length < 4 && (
-        <polyline
-          points={corners.map((p) => `${p.x},${p.y}`).join(" ")}
-          fill="none"
-          stroke="rgba(74,222,128,0.9)"
-          strokeWidth={stroke}
-        />
-      )}
-      {corners.length === 4 && (
-        <polygon
-          points={corners.map((p) => `${p.x},${p.y}`).join(" ")}
-          fill="rgba(74,222,128,0.18)"
-          stroke="rgba(74,222,128,0.95)"
-          strokeWidth={stroke}
-        />
-      )}
-      {corners.map((p, i) => (
-        <g key={i}>
-          <circle
-            cx={p.x}
-            cy={p.y}
-            r={dotR * 2.4}
-            fill="transparent"
-            stroke="rgba(16,185,129,0.0)"
-            strokeWidth={0}
-            onPointerDown={onPointerDown(i)}
-            style={{ cursor: "grab", touchAction: "none" }}
-          />
-          <circle
-            cx={p.x}
-            cy={p.y}
-            r={dotR}
-            fill="rgba(16,185,129,0.95)"
-            stroke="white"
-            strokeWidth={stroke * 0.6}
-            onPointerDown={onPointerDown(i)}
-            style={{ cursor: "grab" }}
-          />
-          <text
-            x={p.x}
-            y={p.y - labelOffset}
-            fill="white"
-            stroke="rgba(0,0,0,0.7)"
-            strokeWidth={stroke * 0.6}
-            paintOrder="stroke"
-            fontSize={fontSize}
-            fontWeight="bold"
-            textAnchor="middle"
-            pointerEvents="none"
-          >
-            {CORNER_LABELS[i]}
-          </text>
-        </g>
-      ))}
-    </svg>
+    <div className="pointer-events-none absolute inset-0 z-30 flex items-center justify-center bg-black/55 backdrop-blur-md">
+      <div className="pointer-events-auto flex w-[min(20rem,86vw)] flex-col items-center gap-4 rounded-3xl bg-white/8 px-6 py-7 text-center ring-1 ring-white/15">
+        <span className="relative block h-8 w-8">
+          <span className="absolute inset-0 animate-ping rounded-full bg-emerald-400/40" />
+          <span className="absolute inset-1 rounded-full bg-emerald-400/90" />
+        </span>
+        <div className="space-y-1">
+          <div className="text-sm font-semibold tracking-tight text-zinc-50">
+            Finding the board…
+          </div>
+          {showHint && !cameraError && (
+            <div className="text-xs leading-snug text-zinc-300">
+              {testMode
+                ? "Photo 1 should show the starting position with all 32 pieces."
+                : "Make sure the whole board is in frame and well lit."}
+            </div>
+          )}
+          {cameraError && (
+            <div className="text-xs leading-snug text-amber-200">
+              Camera unavailable: {cameraError}
+            </div>
+          )}
+        </div>
+        <button
+          onClick={onCancel}
+          className="text-xs uppercase tracking-[0.2em] text-zinc-400 transition hover:text-zinc-200"
+        >
+          Cancel
+        </button>
+      </div>
+    </div>
   );
 }
 
