@@ -1441,6 +1441,13 @@ export function CaptureGame() {
               onCancel={backToSettings}
             />
           )}
+          <CaptureToast
+            phase={phase}
+            inferring={inferring}
+            vlmActive={vlmActive}
+            lastMove={lastMove}
+            moveLogLength={moveLog.length}
+          />
         </>
       )}
 
@@ -1822,6 +1829,103 @@ function PausedOverlay({ onResume }: { onResume: () => void }) {
         <span className="block h-2.5 w-2.5 animate-pulse rounded-full bg-emerald-400" />
         Paused — tap to resume
       </button>
+    </div>
+  );
+}
+
+/**
+ * Floating capture-status pill. Two states:
+ *   - inferring/vlmActive → "Reading the board…" (with spinner)
+ *   - just-detected (move appended within the last ~1.8 s) → "✓ <SAN>"
+ * Sits as a thin pill in the upper third of the screen so it's visible
+ * above the back-rank player panel without covering the center-bar or
+ * the white pieces below. The MoveLogStrip in the center bar still
+ * shows the running history; this pill is a *moment-of-confirmation*
+ * cue rather than a log.
+ */
+function CaptureToast({
+  phase,
+  inferring,
+  vlmActive,
+  lastMove,
+  moveLogLength,
+}: {
+  phase: Phase;
+  inferring: boolean;
+  vlmActive: boolean;
+  lastMove: { san: string; side: Side } | null;
+  moveLogLength: number;
+}) {
+  const [showRecent, setShowRecent] = useState(false);
+  const lastSeenLenRef = useRef(0);
+  useEffect(() => {
+    if (moveLogLength > lastSeenLenRef.current) {
+      lastSeenLenRef.current = moveLogLength;
+      setShowRecent(true);
+      const t = window.setTimeout(() => setShowRecent(false), 1800);
+      return () => window.clearTimeout(t);
+    }
+  }, [moveLogLength]);
+  if (phase !== "playing") return null;
+  const busy = inferring || vlmActive;
+  const showing = busy ? "busy" : showRecent && lastMove ? "recent" : null;
+  // Anchor the toast to the side that just moved so the relevant player
+  // sees it right-side-up — black on top (rotated), white on bottom.
+  const anchor =
+    showing === "recent" && lastMove
+      ? lastMove.side === "white"
+        ? "bottom"
+        : "top"
+      : "center";
+  return (
+    <div
+      className={clsx(
+        "pointer-events-none absolute left-1/2 z-30 -translate-x-1/2 transition-opacity duration-300",
+        anchor === "top" && "top-[18%] rotate-180",
+        anchor === "bottom" && "bottom-[18%]",
+        anchor === "center" && "top-[42%]",
+        showing ? "opacity-100" : "opacity-0",
+      )}
+    >
+      {showing === "busy" && (
+        <div className="flex items-center gap-2.5 rounded-full bg-zinc-950/85 px-4 py-2 text-sm font-medium tracking-tight text-zinc-50 shadow-lg shadow-black/40 ring-1 ring-white/15 backdrop-blur-xl">
+          <span className="relative inline-block h-2.5 w-2.5">
+            <span
+              className={clsx(
+                "absolute inset-0 animate-ping rounded-full",
+                vlmActive ? "bg-sky-400/60" : "bg-emerald-400/60",
+              )}
+            />
+            <span
+              className={clsx(
+                "absolute inset-0 rounded-full",
+                vlmActive ? "bg-sky-400" : "bg-emerald-400",
+              )}
+            />
+          </span>
+          {vlmActive ? "Reading with vision model…" : "Reading the board…"}
+        </div>
+      )}
+      {showing === "recent" && lastMove && (
+        <div className="flex items-center gap-2.5 rounded-full bg-emerald-500/95 px-4 py-2 text-sm font-semibold tracking-tight text-emerald-950 shadow-lg shadow-emerald-500/30 ring-1 ring-emerald-300/40 backdrop-blur-xl">
+          <svg
+            viewBox="0 0 24 24"
+            className="h-4 w-4"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth={3}
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden
+          >
+            <path d="M5 12l4 4L19 7" />
+          </svg>
+          <span className="font-mono text-base">{lastMove.san}</span>
+          <span className="text-[10px] font-bold uppercase tracking-[0.18em] opacity-80">
+            {lastMove.side === "white" ? "white" : "black"}
+          </span>
+        </div>
+      )}
     </div>
   );
 }
