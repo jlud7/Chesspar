@@ -118,12 +118,6 @@ const VLM_PROVIDER_COST_HINT: Record<VlmProvider, string> = {
 };
 const RECTIFIED_SIZE = 384;
 const CORNER_LABELS = ["a8", "h8", "h1", "a1"] as const;
-const CORNER_HINTS = [
-  "Tap the a8 corner — Black's queenside-rook corner",
-  "Tap the h8 corner — Black's kingside-rook corner",
-  "Tap the h1 corner — White's kingside-rook corner",
-  "Tap the a1 corner — White's queenside-rook corner",
-];
 
 export function CaptureGame() {
   const [phase, setPhase] = useState<Phase>("settings");
@@ -646,6 +640,8 @@ export function CaptureGame() {
 
   // We keep busy state for the in-calibration auto-detect spinner.
   const [busy, setBusy] = useState(false);
+  const stableDetectionCountRef = useRef(0);
+  const lastDetectedCornersRef = useRef<[Point, Point, Point, Point] | null>(null);
 
   const tryAutoCalibrate = useCallback(async () => {
     if (cornersRef.current.length === 4) return;
@@ -680,7 +676,23 @@ export function CaptureGame() {
           /* skip invalid rotation */
         }
       }
-      setCorners(bestCorners);
+      const sameAsLast = (() => {
+        const last = lastDetectedCornersRef.current;
+        if (!last) return false;
+        const d = bestCorners.reduce((acc, p, i) => {
+          const q = last[i];
+          return acc + Math.hypot(p.x - q.x, p.y - q.y);
+        }, 0);
+        return d / 4 < 12;
+      })();
+      if (sameAsLast) stableDetectionCountRef.current += 1;
+      else stableDetectionCountRef.current = 1;
+      lastDetectedCornersRef.current = bestCorners;
+
+      // Require 3 consistent detections before accepting calibration.
+      if (stableDetectionCountRef.current >= 3) {
+        setCorners(bestCorners);
+      }
     } finally {
       setBusy(false);
     }
@@ -688,11 +700,30 @@ export function CaptureGame() {
   }, []);
 
   useEffect(() => {
-    if (phase !== "calibrating") return;
-    if (corners.length === 4) return;
-    void tryAutoCalibrate();
+    if (phase !== "calibrating" || corners.length === 4) return;
+    let cancelled = false;
+    let timer: number | null = null;
+    const tick = async () => {
+      if (cancelled) return;
+      await tryAutoCalibrate();
+      if (!cancelled && cornersRef.current.length !== 4) {
+        timer = window.setTimeout(() => void tick(), 250);
+      }
+    };
+    void tick();
+    return () => {
+      cancelled = true;
+      if (timer !== null) window.clearTimeout(timer);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [phase, videoDims, testFrames]);
+  }, [phase, videoDims, testFrames, testFrameIdx]);
+
+  useEffect(() => {
+    if (phase !== "calibrating" || corners.length !== 4 || busy) return;
+    const t = window.setTimeout(() => startPlayingFromCalibration(), 300);
+    return () => window.clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phase, corners.length, busy]);
 
   useEffect(() => {
     if (!testMode) return;
@@ -775,6 +806,8 @@ export function CaptureGame() {
 
   function recalibrate() {
     setCorners([]);
+    stableDetectionCountRef.current = 0;
+    lastDetectedCornersRef.current = null;
     baselineRef.current = null;
     previousFrameRef.current = null;
     setPhase("calibrating");
@@ -799,15 +832,6 @@ export function CaptureGame() {
     }
   }, []);
 
-  function onCalibrationTap(e: React.PointerEvent<HTMLDivElement>) {
-    if (corners.length >= 4 || !videoDims) return;
-    const target = e.currentTarget;
-    const rect = target.getBoundingClientRect();
-    const x = ((e.clientX - rect.left) / rect.width) * videoDims.w;
-    const y = ((e.clientY - rect.top) / rect.height) * videoDims.h;
-    setCorners((c) => [...c, { x, y }]);
-  }
-
   function onCornerDrag(idx: number, x: number, y: number) {
     setCorners((c) => {
       if (idx < 0 || idx >= c.length) return c;
@@ -817,17 +841,11 @@ export function CaptureGame() {
     });
   }
 
-  function undoCorner() {
-    setCorners((c) => c.slice(0, -1));
-  }
-
-  function resetCorners() {
-    setCorners([]);
-  }
-
   /** Re-run the auto-detector from scratch. */
   function redetectCorners() {
     setCorners([]);
+    stableDetectionCountRef.current = 0;
+    lastDetectedCornersRef.current = null;
     // The useEffect on phase==='calibrating' && corners.length<4 triggers
     // tryAutoCalibrate; the next tick will pick this up.
   }
@@ -924,6 +942,8 @@ export function CaptureGame() {
       const cvFullyConfident =
         cvResult.kind === "matched" &&
         cvResult.pick != null &&
+        top != null &&
+        top.weightedMismatch <= 0.18 &&
         disputedSquares.length === 0 &&
         margin >= 0.3;
 
@@ -1347,11 +1367,11 @@ export function CaptureGame() {
     ? "Detecting board automatically…"
     : corners.length === 4
       ? testMode
-        ? "Starting position (photo 1). Drag any corner to fine-tune, then start the clock to feed in the rest."
-        : "Drag any corner to fine-tune, then start the clock."
+        ? "Starting position detected. Launching automated capture…"
+        : "Board detected. Launching automated capture…"
       : testMode
-        ? `Starting position (photo 1 of ${testFrames.length}). ${CORNER_HINTS[corners.length]}`
-        : CORNER_HINTS[corners.length];
+        ? `Analyzing starting position (photo 1 of ${testFrames.length})…`
+        : "Searching for the board in camera view…";
 
   return (
     <div className="fixed inset-0 flex flex-col overflow-hidden bg-zinc-950 text-zinc-100 select-none">
@@ -1389,9 +1409,6 @@ export function CaptureGame() {
           )}
         >
           <div
-            onPointerDown={
-              phase === "calibrating" ? onCalibrationTap : undefined
-            }
             className="relative overflow-hidden rounded-md border border-zinc-800 bg-zinc-950"
             style={
               videoDims
@@ -1442,8 +1459,8 @@ export function CaptureGame() {
                 Rectified preview
               </div>
               <div className="mt-1 leading-snug text-zinc-400">
-                White&apos;s pieces should sit at the bottom. If the
-                orientation looks wrong, hit Reset and try again.
+                White&apos;s pieces should sit at the bottom. If this looks
+                wrong, tap Re-detect.
               </div>
             </div>
           </div>
@@ -1458,25 +1475,11 @@ export function CaptureGame() {
               {busy ? "Detecting…" : "Re-detect"}
             </button>
             <button
-              onClick={undoCorner}
-              disabled={corners.length === 0}
-              className="rounded-md border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm text-zinc-200 hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-40"
-            >
-              Undo
-            </button>
-            <button
-              onClick={resetCorners}
-              disabled={corners.length === 0}
-              className="rounded-md border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm text-zinc-200 hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-40"
-            >
-              Reset
-            </button>
-            <button
               onClick={startPlayingFromCalibration}
               disabled={corners.length !== 4}
               className="rounded-md border border-emerald-500/50 bg-emerald-500/20 px-4 py-2 text-sm font-medium text-emerald-100 hover:bg-emerald-500/30 disabled:cursor-not-allowed disabled:opacity-40"
             >
-              Start clock
+              Start now
             </button>
           </div>
         )}
