@@ -60,8 +60,9 @@ for (const name of photosToRun) {
   sctx.drawImage(c, 0, 0, sw, sh);
   const sd = sctx.getImageData(0, 0, sw, sh).data;
 
-  // Filter: chess-board red is high R, saturated (max-min large). Wood
-  // and skin have moderate redness but LOW saturation, so we use both.
+  // Hue-dominance mask: one RGB channel must DOMINATE the others (catches
+  // any saturated hue), and the overall saturation must be high.
+  // Wood/skin have moderate redness without channel dominance.
   const red = new Uint8Array(sw * sh);
   for (let i = 0, j = 0; i < sd.length; i += 4, j++) {
     const R = sd[i];
@@ -69,9 +70,11 @@ for (const name of photosToRun) {
     const B = sd[i + 2];
     const mx = Math.max(R, G, B);
     const mn = Math.min(R, G, B);
+    // Second-largest channel value: mx >= mid >= mn.
+    const mid = R + G + B - mx - mn;
+    const dominance = mx - mid;
     const sat = mx > 0 ? (mx - mn) / mx : 0;
-    const rDom = R - Math.max(G, B);
-    red[j] = R > 100 && rDom > 50 && sat > 0.5 ? 1 : 0;
+    red[j] = dominance > 50 && sat > 0.5 ? 1 : 0;
   }
 
   // Pass 1: find the LARGEST connected component in the (unerorded) red

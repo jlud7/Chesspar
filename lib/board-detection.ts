@@ -15,9 +15,27 @@ export type DetectionResult = {
 };
 
 const MAX_DIM = 512;
-const RED_R_MIN = 100;
-const RED_DOMINANCE_MIN = 50;
-const RED_SAT_MIN = 0.5;
+// "Dark-square material" gates — colour-agnostic, wide enough to catch the
+// dark squares of any common chess set, narrow enough to reject paper,
+// wood, skin, and pieces.
+//
+//   Hue-dominance path: one RGB channel must dominate the other two by
+//   >50 AND overall saturation > 0.5. Works for any saturated hue (red,
+//   blue, green, navy, dark teal). Wood (≈ 140/100/70 → 40 dominance)
+//   and skin (≈ 210/170/140 → 40) fall under the dominance bar.
+//
+//   Very-dark path: low luminance regardless of hue. Catches black,
+//   ebony, very-dark brown squares. Reserved as fallback for monochrome
+//   boards because it picks up pieces and dark wood too — those become
+//   outliers the grid-fit must reject.
+const HUE_DOMINANCE_MIN = 50;
+const SAT_MIN = 0.5;
+// Minimum value of the dominant RGB channel for the hue path. This keeps
+// out very dark pixels (piece shadows on red squares, black piece edges
+// that have a slight hue tinge); they go through the very-dark fallback
+// path instead if needed.
+const HUE_MAX_MIN = 100;
+const DARK_LUM_MAX = 80;
 const MIN_CENTROIDS = 6;
 
 /**
@@ -25,12 +43,13 @@ const MIN_CENTROIDS = 6;
  * corners ordered `[a8, h8, h1, a1]` — directly usable with `warpBoard`.
  *
  * Algorithm:
- *   1. Build a saturated-red mask (chess-board red, not wood/skin).
- *   2. The largest connected component is "all 32 red squares + thin red
+ *   1. Build a "dark-square material" mask (any chess-board dark colour,
+ *      not wood/skin) using a saturated-hue path plus a very-dark path.
+ *   2. The largest connected component is "all 32 dark squares + thin
  *      border line" merged via the border bridges. Its bounding box gives
  *      the approximate playing-area extent.
- *   3. Erode the red mask so border bridges break; the remaining components
- *      are individual red squares. Their centroids form a regular 4×8
+ *   3. Erode the dark mask so border bridges break; the remaining components
+ *      are individual dark squares. Their centroids form a regular 4×8
  *      sub-grid of the 8×8 board.
  *   4. Fit the centroid cloud to an integer chess grid: scan rotation
  *      angles, estimate square width from nearest-neighbour distance, then
@@ -84,24 +103,23 @@ function detectBoardViaRedness(
   ctx.drawImage(source, 0, 0, w, h);
   const data = ctx.getImageData(0, 0, w, h).data;
 
-  // 1. Saturated-red mask. Chess-board red is high-R, low-G/B, AND high
-  //    saturation. Wood and skin also have moderate redness but are low-
-  //    saturation, so we reject them via the saturation gate.
-  const red = new Uint8Array(w * h);
-  for (let i = 0, j = 0; i < data.length; i += 4, j++) {
-    const R = data[i];
-    const G = data[i + 1];
-    const B = data[i + 2];
-    const mx = Math.max(R, G, B);
-    const mn = Math.min(R, G, B);
-    const sat = mx > 0 ? (mx - mn) / mx : 0;
-    const rDom = R - Math.max(G, B);
-    red[j] =
-      R > RED_R_MIN && rDom > RED_DOMINANCE_MIN && sat > RED_SAT_MIN ? 1 : 0;
+  // 1. Dark-square mask. Two acceptance paths cover the colour space of
+  //    common chess sets:
+  //       hue path       → red, blue, green, navy, dark teal squares
+  //       very-dark path → black, ebony, dark brown squares
+  //    Try the HUE path first — it cleanly excludes wood, skin, and
+  //    pieces of any colour. The very-dark path is a fallback for
+  //    monochrome boards where no square has a dominant hue.
+  let dark = buildDarkMask(data, w, h, "hue");
+  let darkCount = countOnes(dark);
+  if (darkCount < w * h * 0.005) {
+    dark = buildDarkMask(data, w, h, "veryDark");
+    darkCount = countOnes(dark);
+    if (darkCount < w * h * 0.005) return null;
   }
 
-  // 2. Largest connected component → bbox of the playing-area's red blob.
-  const blobCC = connectedComponents(red, w, h);
+  // 2. Largest connected component → bbox of the playing-area's dark blob.
+  const blobCC = connectedComponents(dark, w, h);
   let bigLabel = 0;
   let bigSize = 0;
   for (let lbl = 1; lbl < blobCC.sizes.length; lbl++) {
@@ -128,9 +146,9 @@ function detectBoardViaRedness(
   const blobBbox = { minX: bMinX, maxX: bMaxX, minY: bMinY, maxY: bMaxY };
 
   // 3. Erode so the thin border line breaks; each chess square becomes
-  //    its own component → centroids of the 32 red squares.
+  //    its own component → centroids of the 32 dark squares.
   const erodeR = Math.max(2, Math.round(Math.min(w, h) / 100));
-  const eroded = erode(red, w, h, erodeR);
+  const eroded = erode(dark, w, h, erodeR);
   const cc = connectedComponents(eroded, w, h);
   const topSizes = [...cc.sizes].slice(1).sort((a, b) => b - a);
   const probe = topSizes.slice(0, Math.min(20, topSizes.length));
@@ -200,10 +218,10 @@ type FittedGrid = {
 };
 
 /**
- * Fit an 8×8 chess board to the detected red-square centroids. Returns the
+ * Fit an 8×8 chess board to the detected dark-square centroids. Returns the
  * four playing-area corners in clockwise order [TL, TR, BR, BL].
  *
- * The board has 32 red squares; their centroids form a regular 4×8 sub-grid
+ * The board has 32 dark squares; their centroids form a regular 4×8 sub-grid
  * of the full 8×8. We:
  *   - Search rotation θ to align centroids with image axes.
  *   - Use median nearest-neighbour distance / √2 as the square width.
@@ -211,7 +229,8 @@ type FittedGrid = {
  *     8-wide K window with the most centroids on each axis.
  *   - Decide which edge missing ranks/files sit on using the BLOB BBOX
  *     anchor, plus a "missing rank goes to the top" prior for starting
- *     position (where the black back rank obliterates red on rank 8).
+ *     position (where the black back rank obliterates the dark-square
+ *     signal on rank 8).
  */
 function fitChessGrid(
   centroids: Point[],
@@ -230,7 +249,7 @@ function fitChessGrid(
     v: -(c.x - meanX) * sinT + (c.y - meanY) * cosT,
   }));
 
-  // Square width = nearest-neighbour distance / √2 (diagonal red squares
+  // Square width = nearest-neighbour distance / √2 (diagonal dark squares
   // are at distance √2·sqw).
   const nn: number[] = [];
   for (let i = 0; i < uvs.length; i++) {
@@ -285,7 +304,8 @@ function fitChessGrid(
   const rightU = leftU + 8 * sqw;
 
   // Ranks: missing ranks default to the TOP edge — for piece-occluded
-  // starting positions, black back-rank pieces obliterate redness in
+  // starting positions, black back-rank pieces obliterate the dark-square
+  // signal in
   // rank 8 (top) far more than the white back rank does in rank 1.
   const missingRanks = 8 - (fitV.maxK - fitV.minK + 1);
   let topRankOffset = missingRanks;
@@ -647,7 +667,7 @@ export function refineCornersForFrame(
 }
 
 /**
- * Backwards-compat shim. With the redness-based detector corners already
+ * Backwards-compat shim. With the dark-mask detector corners already
  * come out grid-aligned, so a separate "snap" step is unnecessary — but
  * legacy callers still expect this signature.
  */
@@ -669,6 +689,51 @@ export function refineQuad(
 ): [Point, Point, Point, Point] {
   const detected = detectBoardViaRedness(source);
   return detected ? detected.corners : initial;
+}
+
+type DarkMaskMode = "hue" | "veryDark";
+
+function buildDarkMask(
+  data: Uint8ClampedArray,
+  w: number,
+  h: number,
+  mode: DarkMaskMode,
+): Uint8Array {
+  const out = new Uint8Array(w * h);
+  for (let i = 0, j = 0; i < data.length; i += 4, j++) {
+    const R = data[i];
+    const G = data[i + 1];
+    const B = data[i + 2];
+    const mx = Math.max(R, G, B);
+    const mn = Math.min(R, G, B);
+    const mid = R + G + B - mx - mn; // second-largest channel
+    const sat = mx > 0 ? (mx - mn) / mx : 0;
+    let isSquare: boolean;
+    if (mode === "hue") {
+      // One channel dominates the others by ≥ HUE_DOMINANCE_MIN AND
+      // overall saturation is high enough AND the dominant channel is
+      // moderately bright. Hue-agnostic — works for red / blue / green /
+      // navy / dark-teal boards. Wood and skin have moderate redness
+      // but fail the dominance bar; piece-edge shadows fail the
+      // brightness bar.
+      isSquare =
+        mx > HUE_MAX_MIN && mx - mid > HUE_DOMINANCE_MIN && sat > SAT_MIN;
+    } else {
+      // Very dark regardless of hue. Catches black-square boards.
+      // Pieces and dark wood shadow CAN sneak in here, so this path is
+      // reserved for monochrome boards where the hue path finds nothing.
+      const lum = 0.299 * R + 0.587 * G + 0.114 * B;
+      isSquare = lum < DARK_LUM_MAX;
+    }
+    out[j] = isSquare ? 1 : 0;
+  }
+  return out;
+}
+
+function countOnes(mask: Uint8Array): number {
+  let n = 0;
+  for (let i = 0; i < mask.length; i++) if (mask[i]) n++;
+  return n;
 }
 
 function erode(mask: Uint8Array, w: number, h: number, r: number): Uint8Array {
