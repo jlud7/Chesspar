@@ -8,7 +8,14 @@ const config: Config = {
         board: {
           light: "#f2e8d5",
           dark: "#b58863"
-        }
+        },
+        canvas: "var(--cp-canvas)",
+        ink: "var(--cp-ink)"
+      },
+      fontFamily: {
+        sans: ["var(--font-ui)"],
+        serif: ["var(--font-serif)"],
+        mono: ["var(--font-mono)"]
       }
     }
   },
