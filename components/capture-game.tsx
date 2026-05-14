@@ -11,6 +11,7 @@ import {
 import Link from "next/link";
 import { Chess, type Move as ChessMove } from "chess.js";
 import clsx from "clsx";
+import { Chessboard } from "react-chessboard";
 import { extractSquareCrops, warpBoard } from "@/lib/board-image";
 import type { Point } from "@/lib/homography";
 import {
@@ -130,6 +131,7 @@ export function CaptureGame() {
   });
   const [captures, setCaptures] = useState<Capture[]>([]);
   const [showCaptures, setShowCaptures] = useState(false);
+  const [showReplay, setShowReplay] = useState(false);
   const [soundOn, setSoundOn] = useState(true);
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [winner, setWinner] = useState<Side | null>(null);
@@ -1461,6 +1463,17 @@ export function CaptureGame() {
           onNewGame={backToSettings}
           onRecalibrate={recalibrate}
           onViewCaptures={() => setShowCaptures(true)}
+          onReplay={
+            captures.length > 0 ? () => setShowReplay(true) : undefined
+          }
+        />
+      )}
+
+      {showReplay && (
+        <ReplayView
+          captures={captures}
+          corners={cornersRef.current}
+          onClose={() => setShowReplay(false)}
         />
       )}
 
@@ -2435,6 +2448,7 @@ function EndScreen({
   onNewGame,
   onRecalibrate,
   onViewCaptures,
+  onReplay,
 }: {
   winner: Side | null;
   captureCount: number;
@@ -2444,6 +2458,7 @@ function EndScreen({
   onNewGame: () => void;
   onRecalibrate: () => void;
   onViewCaptures: () => void;
+  onReplay?: () => void;
 }) {
   const [copied, setCopied] = useState(false);
   const title = winner
@@ -2544,16 +2559,29 @@ function EndScreen({
         )}
 
         <div className="flex flex-col gap-2">
+          {onReplay && (
+            <button
+              onClick={onReplay}
+              className="rounded-2xl bg-emerald-500/90 px-4 py-3 text-base font-semibold text-emerald-950 hover:bg-emerald-400"
+            >
+              Replay this game
+            </button>
+          )}
           <button
             onClick={onNewGame}
-            className="rounded-2xl bg-emerald-500/90 px-4 py-3 text-base font-semibold text-emerald-950 hover:bg-emerald-400"
+            className={clsx(
+              "rounded-2xl px-4 py-3 text-base font-semibold transition",
+              onReplay
+                ? "border border-white/10 bg-white/5 text-zinc-100 hover:bg-white/10"
+                : "bg-emerald-500/90 text-emerald-950 hover:bg-emerald-400",
+            )}
           >
             New game
           </button>
           <button
             onClick={onViewCaptures}
             disabled={captureCount === 0}
-            className="rounded-2xl border border-white/10 bg-white/5 px-4 py-2.5 text-sm text-zinc-100 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-40"
+            className="rounded-2xl border border-white/5 bg-white/5 px-4 py-2.5 text-sm text-zinc-300 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-40"
           >
             View captures
           </button>
@@ -2683,6 +2711,277 @@ function CaptureCard({
         <span>after {capture.side === "white" ? "W" : "B"}</span>
       </div>
     </button>
+  );
+}
+
+/**
+ * Game-end replay walkthrough. Steps through captures one at a time
+ * showing the rectified board photo (white-on-bottom) alongside the
+ * inferred position. Prev/Next + swipe; keyboard arrows on desktop.
+ */
+function ReplayView({
+  captures,
+  corners,
+  onClose,
+}: {
+  captures: Capture[];
+  corners: Point[];
+  onClose: () => void;
+}) {
+  // Build a step-by-step list: starting position plus each move-after
+  // state. We replay the inferred moves through a fresh Chess to
+  // recover the FEN at each step rather than trusting capture.inference.fen
+  // (which is unset for ambiguous/unmatched captures).
+  const frames = useMemo(() => {
+    const c = new Chess();
+    const out: {
+      type: "start" | "move";
+      capture: Capture | null;
+      fen: string;
+      san: string | null;
+      side: Side | null;
+      moveNumber: number;
+    }[] = [
+      {
+        type: "start",
+        capture: null,
+        fen: c.fen(),
+        san: null,
+        side: null,
+        moveNumber: 0,
+      },
+    ];
+    for (const cap of captures) {
+      const inf = cap.inference;
+      let san: string | null = null;
+      if (inf.kind === "matched" || inf.kind === "vlm-matched") {
+        try {
+          const mv = c.move({ from: inf.from, to: inf.to, promotion: "q" });
+          san = mv?.san ?? inf.san;
+        } catch {
+          san = null;
+        }
+      }
+      out.push({
+        type: "move",
+        capture: cap,
+        fen: c.fen(),
+        san,
+        side: cap.side,
+        moveNumber: cap.moveNumber,
+      });
+    }
+    return out;
+  }, [captures]);
+
+  const [idx, setIdx] = useState(0);
+  const clampedIdx = Math.max(0, Math.min(idx, frames.length - 1));
+  const frame = frames[clampedIdx];
+
+  // Lazily compute the rectified preview for the current frame. Keep a
+  // small in-component LRU so going prev/next doesn't re-warp the same
+  // photo repeatedly.
+  const rectifiedCache = useRef<Map<string, string>>(new Map());
+  const [rectifiedUrl, setRectifiedUrl] = useState<string | null>(null);
+  useEffect(() => {
+    if (!frame.capture || corners.length !== 4) {
+      setRectifiedUrl(null);
+      return;
+    }
+    const cached = rectifiedCache.current.get(frame.capture.url);
+    if (cached) {
+      setRectifiedUrl(cached);
+      return;
+    }
+    setRectifiedUrl(null);
+    let cancelled = false;
+    const img = new Image();
+    img.onload = () => {
+      if (cancelled) return;
+      try {
+        const warped = warpBoard(
+          img,
+          corners as [Point, Point, Point, Point],
+          384,
+        );
+        const url = warped.toDataURL("image/jpeg", 0.9);
+        rectifiedCache.current.set(frame.capture!.url, url);
+        setRectifiedUrl(url);
+      } catch {
+        setRectifiedUrl(null);
+      }
+    };
+    img.src = frame.capture.url;
+    return () => {
+      cancelled = true;
+    };
+  }, [frame.capture, corners]);
+
+  // Keyboard navigation (desktop nicety).
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "ArrowRight") setIdx((i) => Math.min(frames.length - 1, i + 1));
+      else if (e.key === "ArrowLeft") setIdx((i) => Math.max(0, i - 1));
+      else if (e.key === "Escape") onClose();
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [frames.length, onClose]);
+
+  // Touch swipe nav.
+  const touchStartX = useRef<number | null>(null);
+  function onTouchStart(e: React.TouchEvent) {
+    touchStartX.current = e.touches[0]?.clientX ?? null;
+  }
+  function onTouchEnd(e: React.TouchEvent) {
+    if (touchStartX.current === null) return;
+    const dx = (e.changedTouches[0]?.clientX ?? 0) - touchStartX.current;
+    touchStartX.current = null;
+    if (Math.abs(dx) < 40) return;
+    if (dx < 0) setIdx((i) => Math.min(frames.length - 1, i + 1));
+    else setIdx((i) => Math.max(0, i - 1));
+  }
+
+  const atStart = clampedIdx === 0;
+  const atEnd = clampedIdx === frames.length - 1;
+  const moveLabel =
+    frame.type === "start"
+      ? "Starting position"
+      : `${Math.ceil(frame.moveNumber / 2)}.${
+          frame.side === "white" ? "" : ".."
+        } ${frame.san ?? "—"}`;
+  const inferenceBadge =
+    frame.capture &&
+    (frame.capture.inference.kind === "matched"
+      ? "CV detected"
+      : frame.capture.inference.kind === "vlm-matched"
+        ? "Vision detected"
+        : frame.capture.inference.kind === "ambiguous"
+          ? "Ambiguous"
+          : frame.capture.inference.kind === "unmatched"
+            ? "No match"
+            : "Skipped");
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex flex-col bg-zinc-950/97 backdrop-blur-xl"
+      onTouchStart={onTouchStart}
+      onTouchEnd={onTouchEnd}
+    >
+      <div className="flex shrink-0 items-center justify-between px-5 py-4">
+        <button
+          onClick={onClose}
+          className="rounded-full bg-white/10 px-4 py-1.5 text-sm font-medium text-zinc-100 transition hover:bg-white/20"
+        >
+          Close
+        </button>
+        <div className="text-[11px] uppercase tracking-[0.3em] text-zinc-500">
+          Replay
+        </div>
+        <div className="text-[12px] tabular-nums text-zinc-400">
+          {clampedIdx + 1} / {frames.length}
+        </div>
+      </div>
+
+      <div className="flex flex-1 flex-col items-center justify-center gap-5 overflow-y-auto px-5 pb-5">
+        <div className="text-center">
+          <div className="text-[10px] uppercase tracking-[0.3em] text-zinc-500">
+            {frame.type === "start" ? "Move 0" : `Move ${frame.moveNumber}`}
+          </div>
+          <div className="mt-1 font-mono text-2xl tracking-tight text-zinc-50">
+            {moveLabel}
+          </div>
+          {inferenceBadge && frame.type === "move" && (
+            <div
+              className={clsx(
+                "mt-2 inline-block rounded-full px-3 py-0.5 text-[10px] uppercase tracking-widest",
+                frame.capture?.inference.kind === "matched"
+                  ? "bg-emerald-500/15 text-emerald-200"
+                  : frame.capture?.inference.kind === "vlm-matched"
+                    ? "bg-sky-500/15 text-sky-200"
+                    : "bg-amber-500/15 text-amber-200",
+              )}
+            >
+              {inferenceBadge}
+            </div>
+          )}
+        </div>
+
+        <div className="grid w-full max-w-md gap-4">
+          <div className="aspect-square w-full overflow-hidden rounded-2xl border border-white/8 bg-zinc-900">
+            {frame.type === "start" ? (
+              // For the starting position there's no capture; show a
+              // placeholder so the layout doesn't jump as you scrub.
+              <div className="flex h-full w-full items-center justify-center text-xs text-zinc-500">
+                No photo · starting position
+              </div>
+            ) : rectifiedUrl ? (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img
+                src={rectifiedUrl}
+                alt={`Move ${frame.moveNumber} rectified`}
+                className="block h-full w-full object-cover"
+              />
+            ) : (
+              <div className="flex h-full w-full items-center justify-center text-xs text-zinc-500">
+                Loading…
+              </div>
+            )}
+          </div>
+
+          <div className="aspect-square w-full">
+            <Chessboard
+              options={{
+                id: `replay-board-${clampedIdx}`,
+                position: frame.fen,
+                boardOrientation: "white",
+                allowDragging: false,
+                allowDrawingArrows: false,
+                animationDurationInMs: 0,
+                boardStyle: { width: "100%", height: "100%" },
+                darkSquareStyle: { backgroundColor: "#b91c1c" },
+                lightSquareStyle: { backgroundColor: "#f8f1e0" },
+              }}
+            />
+          </div>
+        </div>
+      </div>
+
+      <div className="flex shrink-0 items-center gap-3 border-t border-white/5 bg-black/40 px-5 py-4">
+        <button
+          onClick={() => setIdx((i) => Math.max(0, i - 1))}
+          disabled={atStart}
+          className="flex h-12 w-12 items-center justify-center rounded-full bg-white/10 text-zinc-100 transition hover:bg-white/15 disabled:cursor-not-allowed disabled:opacity-30"
+          aria-label="Previous move"
+        >
+          <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth={2.4} strokeLinecap="round" strokeLinejoin="round">
+            <path d="M15 18l-6-6 6-6" />
+          </svg>
+        </button>
+        <div className="flex-1">
+          <input
+            type="range"
+            min={0}
+            max={frames.length - 1}
+            step={1}
+            value={clampedIdx}
+            onChange={(e) => setIdx(Number(e.target.value))}
+            className="block w-full accent-emerald-400"
+            aria-label="Scrub through the game"
+          />
+        </div>
+        <button
+          onClick={() => setIdx((i) => Math.min(frames.length - 1, i + 1))}
+          disabled={atEnd}
+          className="flex h-12 w-12 items-center justify-center rounded-full bg-white/10 text-zinc-100 transition hover:bg-white/15 disabled:cursor-not-allowed disabled:opacity-30"
+          aria-label="Next move"
+        >
+          <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth={2.4} strokeLinecap="round" strokeLinejoin="round">
+            <path d="M9 6l6 6-6 6" />
+          </svg>
+        </button>
+      </div>
+    </div>
   );
 }
 
