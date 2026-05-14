@@ -928,24 +928,37 @@ export function CaptureGame() {
       const second = cvResult.ranked[1];
       const margin =
         top && second ? second.weightedMismatch - top.weightedMismatch : Infinity;
-      // top-K = 10 is intentionally wide. The cell-tile verifier only
-      // asks about disputed squares, so adding candidates is cheap as
-      // long as they bring NEW information. A wider window guarantees
-      // the correct move is in the list even when CV's ranking is off
-      // — the back-rank confusion misses had the right move at rank 4+.
-      const topKCandidates = cvResult.ranked
+      // Only candidates whose weighted mismatch is within
+      // COMPETITIVE_WINDOW of the top are "real" alternatives. Distant
+      // candidates (e.g. the runner-up has mismatch 13+ worse than top)
+      // are noise — they shouldn't get a vote in the disputed-squares
+      // check or be sent to the VLM verifier. Without this filter, the
+      // top-10 list almost always contains some far-off knight move that
+      // disagrees with the top pick about an unrelated square, so
+      // `disputedSquares.length === 0` is essentially never true and
+      // every frame falls through to the VLM verifier — even when CV is
+      // overwhelmingly confident.
+      const COMPETITIVE_WINDOW = 3;
+      const competitiveRanked = top
+        ? cvResult.ranked.filter(
+            (c) => c.weightedMismatch <= top.weightedMismatch + COMPETITIVE_WINDOW,
+          )
+        : cvResult.ranked;
+      const topKCandidates = competitiveRanked
         .slice(0, 10)
         .map((c) => c.move.san);
       const disputedSquares = findDisputedSquares(fenBefore, topKCandidates);
-      // CV is fully unambiguous only when NO disputed squares remain
-      // across the top-K AND the margin to the next candidate is wide.
+      // CV is fully unambiguous when only one competitive candidate
+      // remains (no inter-candidate disputes) AND the margin to whatever
+      // came next is wide. The weighted-mismatch ceiling is generous —
+      // any positive value above 5 still falls through to the VLM.
       const cvFullyConfident =
         cvResult.kind === "matched" &&
         cvResult.pick != null &&
         top != null &&
-        top.weightedMismatch <= 0.18 &&
+        top.weightedMismatch <= 5 &&
         disputedSquares.length === 0 &&
-        margin >= 0.3;
+        margin >= 1;
 
       let viaVlm = false;
       let appliedMove: ChessMove | null = null;
