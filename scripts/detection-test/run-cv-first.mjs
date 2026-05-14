@@ -30,6 +30,35 @@ const GROUND_TRUTH = [
   "Ba3", "Nf6", "Nd5", "Nxd5", "exd5", "b6",
 ];
 
+// Set DEBUG_MOVES=8,10 (or DEBUG_MOVES=all) to dump per-square occupancy +
+// delta data for the listed moves. Use this to diagnose which square the
+// classifier is misreading on stubborn misses.
+const DEBUG_MOVES = (() => {
+  const raw = (process.env.DEBUG_MOVES ?? "").trim();
+  if (!raw) return new Set();
+  if (raw === "all" || raw === "*") return "all";
+  return new Set(raw.split(/[,\s]+/).map((s) => Number(s)).filter((n) => !Number.isNaN(n)));
+})();
+
+const FILES = "abcdefgh";
+function idxToSan(idx) {
+  const file = FILES[idx % 8];
+  const rank = 8 - Math.floor(idx / 8);
+  return `${file}${rank}`;
+}
+function sanToIdx(san) {
+  const file = FILES.indexOf(san[0]);
+  const rank = Number(san[1]);
+  if (file < 0 || !rank) return -1;
+  return (8 - rank) * 8 + file;
+}
+function moveSquares(prevFen, san) {
+  const sim = new Chess(prevFen);
+  const m = sim.move(san);
+  if (!m) return null;
+  return { from: m.from, to: m.to, piece: m.piece, color: m.color };
+}
+
 async function loadOriented(filePath) {
   let pipe = sharp(filePath).rotate();
   if (ROTATE_QUARTERS) pipe = pipe.rotate(ROTATE_QUARTERS * 90);
@@ -235,6 +264,46 @@ for (let i = 0; i < GROUND_TRUTH.length; i++) {
     `[${(i + 1).toString().padStart(2)}] expected=${expected.padEnd(6)} cv_top=[${topK.join(",")}] ${pickedBy} → ${final.padEnd(6)} ${ok ? "✓" : "✗"}`,
   );
   if (!ok && vlmRaw) console.log(`     raw: ${vlmRaw.slice(0, 300).replace(/\n/g, " | ")}`);
+
+  const moveNum = i + 1;
+  const shouldDebug =
+    DEBUG_MOVES === "all" ||
+    (DEBUG_MOVES instanceof Set && DEBUG_MOVES.has(moveNum)) ||
+    (!ok && DEBUG_MOVES instanceof Set && DEBUG_MOVES.size === 0 && process.env.DEBUG_MISSES === "1");
+  if (shouldDebug) {
+    const expectedSqs = moveSquares(fullPrevFen, expected);
+    const wrongSqs = !ok ? moveSquares(fullPrevFen, final) : null;
+    const interesting = new Map(); // sanLabel -> { reason }
+    function add(sq, reason) {
+      if (!sq) return;
+      const cur = interesting.get(sq);
+      interesting.set(sq, cur ? `${cur}+${reason}` : reason);
+    }
+    if (expectedSqs) {
+      add(expectedSqs.from, `EXP-from(${expectedSqs.color}${expectedSqs.piece})`);
+      add(expectedSqs.to, `EXP-to(${expectedSqs.color}${expectedSqs.piece})`);
+    }
+    if (wrongSqs) {
+      add(wrongSqs.from, `WRONG-from`);
+      add(wrongSqs.to, `WRONG-to`);
+    }
+    console.log(`     --- DEBUG move ${moveNum} (${expected}${ok ? "" : ` → got ${final}`}) ---`);
+    for (const [sq, why] of interesting) {
+      const idx = sanToIdx(sq);
+      const before = prevOcc[idx];
+      const after = occAfterStates[idx];
+      const conf = confidences[idx].toFixed(2);
+      const delta = cellDeltas[idx].toFixed(1);
+      console.log(
+        `       ${sq.padEnd(2)} ${why.padEnd(28)} before=${before.padEnd(5)} after=${after.padEnd(5)} conf=${conf} delta=${delta}`,
+      );
+    }
+    const top3 = result.ranked.slice(0, 3).map((c) =>
+      `${c.move.san}(mm=${c.mismatch} w=${c.weightedMismatch.toFixed(2)})`,
+    );
+    console.log(`       scores: ${top3.join("  ")}`);
+  }
+
   detail.push({ idx: i + 1, expected, topK, pickedBy, final, ok });
   reference.move(expected);
 }
