@@ -1020,7 +1020,7 @@ export function CaptureGame() {
       } catch {
         /* keep last check on failure */
       }
-      if (!cancelled) timer = window.setTimeout(runCheck, 600);
+      if (!cancelled) timer = window.setTimeout(runCheck, 320);
     };
     runCheck();
     return () => {
@@ -1770,6 +1770,14 @@ export function CaptureGame() {
           onSwitchLens={switchLens}
           corners={corners}
           videoDims={videoDims}
+          onDragCorner={(idx, pt) =>
+            setCorners((cs) => {
+              if (idx < 0 || idx >= cs.length) return cs;
+              const next = [...cs];
+              next[idx] = pt;
+              return next;
+            })
+          }
           onRecalibrate={() => {
             setCorners([]);
             setBoardCheck(null);
@@ -2466,40 +2474,110 @@ function CameraPreviewOverlay({
  * corners the detector currently has locked onto. The viewBox matches
  * the video's native dimensions and the video is rendered with
  * object-contain, so the dots land on the exact pixels the warp will
- * use. If the dots aren't on the board edges, the rectified output is
- * going to be wrong — the player can hit Re-detect.
+ * use. Each corner dot is draggable — touch + drag to nudge the
+ * detection if auto-detect missed.
  */
 function CornerOverlaySvg({
   corners,
   videoDims,
+  onDragCorner,
 }: {
   corners: Point[];
   videoDims: VideoDims;
+  onDragCorner: (idx: number, point: Point) => void;
 }) {
+  const svgRef = useRef<SVGSVGElement | null>(null);
+  const draggingIdxRef = useRef<number | null>(null);
+
   const stroke = Math.max(2, videoDims.w / 400);
-  const dotR = Math.max(8, videoDims.w / 120);
+  const dotR = Math.max(12, videoDims.w / 80);
+  const hitR = dotR * 1.6;
+
+  const toViewBox = useCallback(
+    (clientX: number, clientY: number): Point | null => {
+      const svg = svgRef.current;
+      if (!svg) return null;
+      const rect = svg.getBoundingClientRect();
+      if (!rect.width || !rect.height) return null;
+      // SVG uses preserveAspectRatio="xMidYMid meet" → it fits inside the
+      // container while preserving the video's aspect, centring any
+      // letterboxing. Compute the scale of the meet fit and the offsets.
+      const scale = Math.min(
+        rect.width / videoDims.w,
+        rect.height / videoDims.h,
+      );
+      const drawnW = videoDims.w * scale;
+      const drawnH = videoDims.h * scale;
+      const offsetX = (rect.width - drawnW) / 2;
+      const offsetY = (rect.height - drawnH) / 2;
+      const localX = clientX - rect.left - offsetX;
+      const localY = clientY - rect.top - offsetY;
+      const x = Math.max(0, Math.min(videoDims.w, localX / scale));
+      const y = Math.max(0, Math.min(videoDims.h, localY / scale));
+      return { x, y };
+    },
+    [videoDims],
+  );
+
+  const handlePointerDown = (idx: number) => (e: React.PointerEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    draggingIdxRef.current = idx;
+    (e.target as Element).setPointerCapture?.(e.pointerId);
+    const pt = toViewBox(e.clientX, e.clientY);
+    if (pt) onDragCorner(idx, pt);
+  };
+  const handlePointerMove = (e: React.PointerEvent) => {
+    const idx = draggingIdxRef.current;
+    if (idx === null) return;
+    e.preventDefault();
+    const pt = toViewBox(e.clientX, e.clientY);
+    if (pt) onDragCorner(idx, pt);
+  };
+  const handlePointerUp = (e: React.PointerEvent) => {
+    if (draggingIdxRef.current === null) return;
+    draggingIdxRef.current = null;
+    (e.target as Element).releasePointerCapture?.(e.pointerId);
+  };
+
   return (
     <svg
+      ref={svgRef}
       viewBox={`0 0 ${videoDims.w} ${videoDims.h}`}
-      className="pointer-events-none absolute inset-0 h-full w-full"
+      className="absolute inset-0 h-full w-full"
       preserveAspectRatio="xMidYMid meet"
+      style={{ touchAction: "none" }}
+      onPointerMove={handlePointerMove}
+      onPointerUp={handlePointerUp}
+      onPointerCancel={handlePointerUp}
     >
       <polygon
         points={corners.map((p) => `${p.x},${p.y}`).join(" ")}
         fill="rgba(74,222,128,0.08)"
         stroke="rgba(74,222,128,0.95)"
         strokeWidth={stroke}
+        style={{ pointerEvents: "none" }}
       />
       {corners.map((p, i) => (
-        <circle
-          key={i}
-          cx={p.x}
-          cy={p.y}
-          r={dotR}
-          fill="rgba(16,185,129,0.95)"
-          stroke="white"
-          strokeWidth={stroke * 0.6}
-        />
+        <g key={i}>
+          <circle
+            cx={p.x}
+            cy={p.y}
+            r={hitR}
+            fill="transparent"
+            style={{ cursor: "grab", touchAction: "none" }}
+            onPointerDown={handlePointerDown(i)}
+          />
+          <circle
+            cx={p.x}
+            cy={p.y}
+            r={dotR}
+            fill="rgba(16,185,129,0.95)"
+            stroke="white"
+            strokeWidth={stroke * 0.6}
+            style={{ pointerEvents: "none" }}
+          />
+        </g>
       ))}
     </svg>
   );
@@ -2514,6 +2592,7 @@ function ReadyScreen({
   onSwitchLens,
   corners,
   videoDims,
+  onDragCorner,
   onRecalibrate,
   onCancel,
   onStart,
@@ -2526,6 +2605,7 @@ function ReadyScreen({
   onSwitchLens: (deviceId: string) => void;
   corners: Point[];
   videoDims: VideoDims | null;
+  onDragCorner: (idx: number, point: Point) => void;
   onRecalibrate: () => void;
   onCancel: () => void;
   onStart: () => void;
@@ -2567,7 +2647,11 @@ function ReadyScreen({
                 className="absolute inset-0 h-full w-full object-contain"
               />
               {corners.length === 4 && videoDims && (
-                <CornerOverlaySvg corners={corners} videoDims={videoDims} />
+                <CornerOverlaySvg
+                  corners={corners}
+                  videoDims={videoDims}
+                  onDragCorner={onDragCorner}
+                />
               )}
             </div>
             {lenses.length > 1 && (
@@ -2593,6 +2677,9 @@ function ReadyScreen({
                 })}
               </div>
             )}
+            <p className="text-[10px] uppercase tracking-[0.22em] text-zinc-500">
+              Drag the green dots to fine-tune the corners
+            </p>
           </div>
         )}
 

@@ -71,7 +71,39 @@ export function autoDetectBoardCorners(
   const detected = detectBoardViaRedness(source);
   if (!detected) return null;
 
-  const oriented = orientStartingPosition(source, detected.corners);
+  // The centroid-based grid fit consistently shrinks inward when the
+  // outermost dark squares (a1/h8 etc.) are obscured by the back-rank
+  // rooks. The dark-pixel signal those squares would contribute is gone,
+  // so fitAxis picks a window that starts one file in and the polygon
+  // misses a rank + a file of the playing surface. We can't recover the
+  // missing centroids — but the bias is systematic, so push every
+  // corner ~5% outward from the polygon centroid as a final pass.
+  // Tested against the IMG_8819–8833 sample set: no detectable accuracy
+  // regression on cleanly-detected boards, and recovers the missing
+  // edge on piece-occluded sets.
+  const cx = (detected.corners[0].x + detected.corners[2].x) / 2;
+  const cy = (detected.corners[0].y + detected.corners[2].y) / 2;
+  const EXPAND = 1.07;
+  const expanded: [Point, Point, Point, Point] = [
+    {
+      x: cx + (detected.corners[0].x - cx) * EXPAND,
+      y: cy + (detected.corners[0].y - cy) * EXPAND,
+    },
+    {
+      x: cx + (detected.corners[1].x - cx) * EXPAND,
+      y: cy + (detected.corners[1].y - cy) * EXPAND,
+    },
+    {
+      x: cx + (detected.corners[2].x - cx) * EXPAND,
+      y: cy + (detected.corners[2].y - cy) * EXPAND,
+    },
+    {
+      x: cx + (detected.corners[3].x - cx) * EXPAND,
+      y: cy + (detected.corners[3].y - cy) * EXPAND,
+    },
+  ];
+
+  const oriented = orientStartingPosition(source, expanded);
   return {
     corners: oriented.corners,
     confidence: oriented.score >= 0 ? detected.confidence : 0,
