@@ -1096,10 +1096,12 @@ export function CaptureGame() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Kick off a VLM corner detection ~700 ms after entering calibrating —
-  // the delay lets the camera stabilise (autofocus, exposure) before we
-  // grab a frame to send. Re-detect from the ready screen also triggers
-  // this via the calibrating-phase transition.
+  // Kick off a VLM corner detection after entering calibrating. The
+  // camera stream is already running before the user taps Calibrate (the
+  // settings preview uses it), so we don't need a long stabilisation
+  // delay — Florence fires ~100 ms in to comfortably beat the CV loop.
+  // The Anthropic detector keeps its longer pre-roll because Sonnet
+  // benefits from a sharper frame.
   //
   // Provider preference: Florence-2 if the proxy is configured (faster,
   // cheaper, more reliable), Anthropic Sonnet otherwise.
@@ -1110,9 +1112,10 @@ export function CaptureGame() {
     const useAnthropic = !useFlorence && !!cornerDetectorRef.current;
     if (!useFlorence && !useAnthropic) return;
     setVlmStatus({ kind: "idle" });
+    const delay = useFlorence ? 100 : 700;
     const t = window.setTimeout(
       () => void (useFlorence ? tryFlorenceCalibrate() : tryVlmCalibrate()),
-      700,
+      delay,
     );
     return () => window.clearTimeout(t);
   }, [phase, tapMode, tryFlorenceCalibrate, tryVlmCalibrate]);
@@ -1129,7 +1132,12 @@ export function CaptureGame() {
         timer = window.setTimeout(() => void tick(), 250);
       }
     };
-    void tick();
+    // When Florence is configured, give it a head start — empirically the
+    // round-trip is ~1.2 s and we want its tight crop-based corners to
+    // beat the noisier full-frame CV result. CV still kicks in after the
+    // initial wait so we transparently fall back if Florence fails.
+    const initialDelay = FLORENCE_BBOX_FETCHER ? 1500 : 0;
+    timer = window.setTimeout(() => void tick(), initialDelay);
     return () => {
       cancelled = true;
       if (timer !== null) window.clearTimeout(timer);
