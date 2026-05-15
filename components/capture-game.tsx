@@ -23,10 +23,12 @@ import {
   type BaselineSignature,
 } from "@/lib/occupancy";
 import {
+  makeAnthropicProxyCornerDetector,
   makeAnthropicProxyVerifier,
   makeGeminiProxyVerifier,
   makeOpenAiProxyVerifier,
   makeVerifier,
+  type CornerDetector,
   type VlmProvider,
   type VlmVerifier,
   type VlmVerifyResult,
@@ -56,6 +58,18 @@ function makeProxyVerifier(): VlmVerifier | null {
     return makeGeminiProxyVerifier(VLM_PROXY_URL);
   }
   return makeAnthropicProxyVerifier(VLM_PROXY_URL);
+}
+
+/**
+ * The VLM-based corner detector is the primary calibration path when the
+ * proxy is configured. We use Sonnet (fast + reliable spatial reasoning)
+ * via the existing /verify Anthropic proxy — same auth, same CORS.
+ */
+function makeProxyCornerDetector(): CornerDetector | null {
+  if (!VLM_PROXY_URL) return null;
+  // OpenAI / Gemini detectors not implemented yet — fall back to CV.
+  if (VLM_PROXY_PROVIDER !== "anthropic") return null;
+  return makeAnthropicProxyCornerDetector(VLM_PROXY_URL);
 }
 import { inferMoveFuzzy } from "@/lib/move-inference";
 import {
@@ -381,6 +395,17 @@ export function CaptureGame() {
       el.play().catch(() => {});
     }
   }, []);
+
+  // VLM-based corner detector — instantiated once, used during the
+  // calibrate phase as the primary detection path when the proxy is
+  // available. Falls back to pure-CV when unavailable (no proxy URL,
+  // or a non-anthropic proxy provider).
+  const cornerDetectorRef = useRef<CornerDetector | null>(null);
+  if (cornerDetectorRef.current === null) {
+    cornerDetectorRef.current = makeProxyCornerDetector();
+  }
+  const [vlmDetecting, setVlmDetecting] = useState(false);
+  const vlmDetectingRef = useRef(false);
 
   const stopCamera = useCallback(() => {
     const stream = streamRef.current;
@@ -894,6 +919,83 @@ export function CaptureGame() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  /**
+   * VLM-based corner detection. Grabs the current camera frame and
+   * sends it to the proxied vision model with a corner-detection
+   * prompt. The model returns labelled corners (a8/h8/h1/a1), so the
+   * result is already oriented — no separate `orientStartingPosition`
+   * pass needed. Sets corners directly on success; silently keeps the
+   * CV result on failure.
+   *
+   * Used as the PRIMARY calibration path when the proxy is configured —
+   * the pure-CV detector is far more brittle on phone-angled shots
+   * with corner pieces occluding the dark squares the grid-fit relies
+   * on.
+   */
+  const phaseRef = useRef(phase);
+  useEffect(() => {
+    phaseRef.current = phase;
+  }, [phase]);
+
+  const tryVlmCalibrate = useCallback(async () => {
+    const detector = cornerDetectorRef.current;
+    if (!detector) return;
+    if (vlmDetectingRef.current) return; // already in flight
+    const source = previewSource();
+    if (!source) return;
+    let canvas: HTMLCanvasElement | null;
+    if (source instanceof HTMLImageElement) {
+      canvas = imageToCanvas(source);
+    } else {
+      canvas = source;
+    }
+    if (!canvas || !canvas.width || !canvas.height) return;
+
+    vlmDetectingRef.current = true;
+    setVlmDetecting(true);
+    try {
+      const result = await detector.detectCorners({ image: canvas });
+      if (result.kind !== "detected") return;
+      // Only apply if the user is still in a phase where corners matter.
+      // If they cancelled out to settings while the call was in flight,
+      // discard the result.
+      const live =
+        phaseRef.current === "calibrating" || phaseRef.current === "ready";
+      if (!live) return;
+      // Sanity check — corners should be inside the image bounds and the
+      // polygon should have a non-degenerate area.
+      const W = canvas.width;
+      const H = canvas.height;
+      const inside = result.corners.every(
+        (p) => p.x >= 0 && p.x <= W && p.y >= 0 && p.y <= H,
+      );
+      if (!inside) return;
+      const polyArea = Math.abs(
+        (result.corners[1].x - result.corners[0].x) *
+          (result.corners[3].y - result.corners[0].y) -
+          (result.corners[1].y - result.corners[0].y) *
+            (result.corners[3].x - result.corners[0].x),
+      );
+      if (polyArea < W * H * 0.05) return;
+      setCorners(result.corners);
+    } finally {
+      vlmDetectingRef.current = false;
+      setVlmDetecting(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Kick off a VLM corner detection ~700 ms after entering calibrating —
+  // the delay lets the camera stabilise (autofocus, exposure) before we
+  // grab a frame to send. Re-detect from the ready screen also triggers
+  // this via the calibrating-phase transition.
+  useEffect(() => {
+    if (phase !== "calibrating") return;
+    if (!cornerDetectorRef.current) return;
+    const t = window.setTimeout(() => void tryVlmCalibrate(), 700);
+    return () => window.clearTimeout(t);
+  }, [phase, tryVlmCalibrate]);
 
   useEffect(() => {
     if (phase !== "calibrating" || corners.length === 4) return;
@@ -1754,6 +1856,8 @@ export function CaptureGame() {
             <StartingOverlay
               testMode={testMode}
               cameraError={cameraError}
+              vlmDetecting={vlmDetecting}
+              hasAiDetector={cornerDetectorRef.current !== null}
               onCancel={backToSettings}
             />
           )}
@@ -2817,10 +2921,14 @@ function CheckRow({
 function StartingOverlay({
   testMode,
   cameraError,
+  vlmDetecting,
+  hasAiDetector,
   onCancel,
 }: {
   testMode: boolean;
   cameraError: string | null;
+  vlmDetecting: boolean;
+  hasAiDetector: boolean;
   onCancel: () => void;
 }) {
   const [showHint, setShowHint] = useState(false);
@@ -2828,6 +2936,11 @@ function StartingOverlay({
     const t = window.setTimeout(() => setShowHint(true), 5000);
     return () => window.clearTimeout(t);
   }, []);
+  const label = vlmDetecting
+    ? "Detecting board with AI…"
+    : hasAiDetector
+      ? "Looking at the board…"
+      : "Finding the board…";
   return (
     <div className="pointer-events-none absolute inset-x-0 bottom-0 top-[55vh] z-30 flex items-start justify-center bg-gradient-to-b from-transparent via-black/55 to-black/70 pt-6">
       <div className="pointer-events-auto flex w-[min(20rem,86vw)] flex-col items-center gap-4 rounded-3xl bg-white/8 px-6 py-7 text-center ring-1 ring-white/15">
@@ -2837,7 +2950,7 @@ function StartingOverlay({
         </span>
         <div className="space-y-1">
           <div className="text-sm font-semibold tracking-tight text-zinc-50">
-            Finding the board…
+            {label}
           </div>
           {showHint && !cameraError && (
             <div className="text-xs leading-snug text-zinc-300">

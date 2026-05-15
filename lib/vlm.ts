@@ -466,6 +466,197 @@ export function makeVerifier(
   return makeAnthropicVerifier(apiKey);
 }
 
+// =========================================================================
+// VLM-based corner detection.
+//
+// The pure-CV detector (dark-square centroids → grid fit) is brittle when
+// pieces obscure the corner dark squares — the polygon consistently shrinks
+// inward and clips a file/rank of the playing surface. A vision-language
+// model with spatial reasoning is far more robust here: it sees the whole
+// board, ignores pieces, and identifies the outer corners directly. We use
+// it as the primary detector during calibrate, with CV as the immediate
+// fallback when the VLM proxy isn't configured.
+// =========================================================================
+
+export type CornerPoint = { x: number; y: number };
+
+export type CornerDetectionResult =
+  | {
+      kind: "detected";
+      /**
+       * Four playing-surface corners in clockwise order `[a8, h8, h1, a1]`,
+       * in image-pixel coordinates of the original (un-downscaled) image.
+       * Directly compatible with `warpBoard`.
+       */
+      corners: [CornerPoint, CornerPoint, CornerPoint, CornerPoint];
+      raw: string;
+    }
+  | { kind: "error"; reason: string };
+
+export interface CornerDetector {
+  readonly provider: VlmProvider;
+  detectCorners(args: {
+    image: HTMLCanvasElement;
+  }): Promise<CornerDetectionResult>;
+}
+
+const CORNER_DETECTION_PROMPT = `You are looking at a photo of a chess board.
+
+Find the four corners of the chess BOARD'S PLAYING SURFACE — the outer corners of the 8x8 grid of squares. Do NOT use the paper border, table edge, or chess-clock cable; the corners must lie on the actual playing-surface boundary.
+
+Label each corner by which chess square sits at that position in the photo:
+- "a8" = the corner where Black's queenside rook starts (or would start)
+- "h8" = the corner where Black's kingside rook starts
+- "h1" = the corner where White's kingside rook starts
+- "a1" = the corner where White's queenside rook starts
+
+Return ONLY a JSON object in this exact shape (no markdown, no preamble):
+{"a8":{"x":0.000,"y":0.000},"h8":{"x":0.000,"y":0.000},"h1":{"x":0.000,"y":0.000},"a1":{"x":0.000,"y":0.000}}
+
+Each x and y is a number from 0.0 to 1.0 — fractional position in the image (x=0 is the left edge, x=1 is the right edge, y=0 is the top edge, y=1 is the bottom edge).
+
+Be precise. Place each corner ON the actual board edge, exactly where two perpendicular sides of the playing surface meet. If a piece sits on a corner square, place the corner where the playing surface would extend without the piece. Round each coordinate to 3 decimals.`;
+
+/**
+ * Anthropic-proxy corner detector. Posts a downscaled photo to the same
+ * /verify endpoint the move verifier uses, with a corner-detection prompt
+ * that asks for normalised (0..1) corner positions labelled a8/h8/h1/a1.
+ * The corners come back oriented (no separate `orientStartingPosition`
+ * step needed) — the model identifies which physical corner is which.
+ */
+export function makeAnthropicProxyCornerDetector(
+  proxyUrl: string,
+  model = "claude-sonnet-4-6",
+): CornerDetector {
+  const endpoint = proxyUrl.replace(/\/$/, "") + "/verify";
+  return {
+    provider: "anthropic",
+    async detectCorners({ image }) {
+      try {
+        const scaled = downscaleForVlm(image, 1024);
+        const b64 = canvasToBase64(scaled);
+        const response = await fetch(endpoint, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model,
+            max_tokens: 256,
+            temperature: 0,
+            messages: [
+              {
+                role: "user",
+                content: [
+                  {
+                    type: "image",
+                    source: {
+                      type: "base64",
+                      media_type: "image/jpeg",
+                      data: b64,
+                    },
+                  },
+                  { type: "text", text: CORNER_DETECTION_PROMPT },
+                ],
+              },
+            ],
+          }),
+        });
+        if (!response.ok) {
+          const text = await response.text().catch(() => "");
+          return {
+            kind: "error",
+            reason: `Proxy HTTP ${response.status}: ${text.slice(0, 160)}`,
+          };
+        }
+        const data = (await response.json()) as {
+          content?: { type: string; text?: string }[];
+        };
+        const raw = data.content?.find((c) => c.type === "text")?.text ?? "";
+        return parseCornerResponse(raw, image.width, image.height);
+      } catch (e) {
+        return {
+          kind: "error",
+          reason: e instanceof Error ? e.message : String(e),
+        };
+      }
+    },
+  };
+}
+
+/**
+ * Downscale a canvas so its longest edge ≤ `maxDim`, keeping aspect
+ * ratio. Speeds up the VLM round-trip and stays inside the model's
+ * per-image budget. We send JPEG so quality matters less than dimensions.
+ */
+function downscaleForVlm(
+  source: HTMLCanvasElement,
+  maxDim: number,
+): HTMLCanvasElement {
+  const w = source.width;
+  const h = source.height;
+  const longest = Math.max(w, h);
+  if (longest <= maxDim) return source;
+  const scale = maxDim / longest;
+  const out = document.createElement("canvas");
+  out.width = Math.max(1, Math.round(w * scale));
+  out.height = Math.max(1, Math.round(h * scale));
+  const ctx = out.getContext("2d");
+  if (!ctx) return source;
+  ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(source, 0, 0, out.width, out.height);
+  return out;
+}
+
+/**
+ * Parse the model's reply into four pixel-space corners. Tolerates a bit
+ * of slop in the response: leading/trailing whitespace, accidental code
+ * fences, or stray prose around the JSON. Validates each corner has a
+ * numeric x/y in [0, 1] before scaling to image pixels.
+ */
+function parseCornerResponse(
+  raw: string,
+  imgW: number,
+  imgH: number,
+): CornerDetectionResult {
+  const trimmed = raw.trim();
+  // Strip code fences if the model wrapped the JSON in ```json … ```.
+  const fence = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+  const candidate = fence ? fence[1] : trimmed;
+  // Grab the first {...} block — protects against prose-then-JSON.
+  const objMatch = candidate.match(/\{[\s\S]*\}/);
+  if (!objMatch) {
+    return { kind: "error", reason: `No JSON object in response: ${raw.slice(0, 120)}` };
+  }
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(objMatch[0]) as Record<string, unknown>;
+  } catch (e) {
+    return {
+      kind: "error",
+      reason: `JSON parse failed: ${e instanceof Error ? e.message : String(e)}`,
+    };
+  }
+  const readCorner = (key: "a8" | "h8" | "h1" | "a1"): CornerPoint | null => {
+    const v = parsed[key] as { x?: unknown; y?: unknown } | undefined;
+    if (!v) return null;
+    const x = typeof v.x === "number" ? v.x : Number(v.x);
+    const y = typeof v.y === "number" ? v.y : Number(v.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+    if (x < -0.1 || x > 1.1 || y < -0.1 || y > 1.1) return null;
+    return { x: x * imgW, y: y * imgH };
+  };
+  const a8 = readCorner("a8");
+  const h8 = readCorner("h8");
+  const h1 = readCorner("h1");
+  const a1 = readCorner("a1");
+  if (!a8 || !h8 || !h1 || !a1) {
+    return {
+      kind: "error",
+      reason: `Missing/invalid corner in response: ${objMatch[0].slice(0, 160)}`,
+    };
+  }
+  return { kind: "detected", corners: [a8, h8, h1, a1], raw };
+}
+
 function resolveSan(raw: string, legalMovesSan: string[]): VlmVerifyResult {
   const trimmed = raw.trim();
   if (!trimmed) {
