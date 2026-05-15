@@ -24,6 +24,7 @@ import {
 } from "@/lib/occupancy";
 import {
   makeAnthropicProxyVerifier,
+  makeGeminiProxyVerifier,
   makeOpenAiProxyVerifier,
   makeVerifier,
   type VlmProvider,
@@ -44,12 +45,15 @@ import {
 const VLM_PROXY_URL = process.env.NEXT_PUBLIC_VLM_PROXY_URL || "";
 const VLM_PROXY_PROVIDER = (
   process.env.NEXT_PUBLIC_VLM_PROXY_PROVIDER || "anthropic"
-).toLowerCase() as "anthropic" | "openai";
+).toLowerCase() as "anthropic" | "openai" | "gemini";
 
 function makeProxyVerifier(): VlmVerifier | null {
   if (!VLM_PROXY_URL) return null;
   if (VLM_PROXY_PROVIDER === "openai") {
     return makeOpenAiProxyVerifier(VLM_PROXY_URL);
+  }
+  if (VLM_PROXY_PROVIDER === "gemini") {
+    return makeGeminiProxyVerifier(VLM_PROXY_URL);
   }
   return makeAnthropicProxyVerifier(VLM_PROXY_URL);
 }
@@ -2304,8 +2308,12 @@ function SettingsScreen({
               {VLM_PROXY_URL ? (
                 <div className="rounded-xl border border-emerald-500/30 bg-emerald-500/10 p-3 text-[12px] text-emerald-100">
                   <div className="font-medium">
-                    {VLM_PROXY_PROVIDER === "openai" ? "GPT-5" : "Claude"} is
-                    enabled by default.
+                    {VLM_PROXY_PROVIDER === "openai"
+                      ? "GPT-5"
+                      : VLM_PROXY_PROVIDER === "gemini"
+                        ? "Gemini 2.5 Pro"
+                        : "Claude"}{" "}
+                    is enabled by default.
                   </div>
                   <details className="mt-2 text-[11px] text-emerald-100/80">
                     <summary className="cursor-pointer">

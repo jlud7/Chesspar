@@ -22,8 +22,9 @@ export interface Env {
   ANTHROPIC_API_KEY: string;
   /** Set to enable the /openai endpoint. Leave unset if you only want Claude. */
   OPENAI_API_KEY?: string;
-  /** Comma-separated list of allowed origins, e.g.
-   *  "https://jlud7.github.io,http://localhost:3000". */
+  /** Set to enable the /gemini endpoint (Google AI Studio key). */
+  GEMINI_API_KEY?: string;
+  /** Comma-separated list of allowed origins. */
   ALLOWED_ORIGINS?: string;
   /** Optional shared secret. If set, requests must include
    *  X-Chesspar-Token: <value>. Leave unset to disable. */
@@ -32,6 +33,9 @@ export interface Env {
 
 const ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
 const OPENAI_URL = "https://api.openai.com/v1/chat/completions";
+// Gemini path is per-model; we let the client send the body intact and
+// just attach ?key=… server-side. The frontend POSTs to /gemini?model=…
+const GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
 
 function parseAllowedOrigins(env: Env): string[] {
   if (!env.ALLOWED_ORIGINS) return [];
@@ -68,11 +72,18 @@ export default {
 
     const isVerify = url.pathname === "/verify" && req.method === "POST";
     const isOpenAi = url.pathname === "/openai" && req.method === "POST";
-    if (!isVerify && !isOpenAi) {
+    const isGemini = url.pathname === "/gemini" && req.method === "POST";
+    if (!isVerify && !isOpenAi && !isGemini) {
       return new Response("Not found", { status: 404, headers: baseCors });
     }
     if (isOpenAi && !env.OPENAI_API_KEY) {
       return new Response("OpenAI not configured on this worker", {
+        status: 501,
+        headers: baseCors,
+      });
+    }
+    if (isGemini && !env.GEMINI_API_KEY) {
+      return new Response("Gemini not configured on this worker", {
         status: 501,
         headers: baseCors,
       });
@@ -103,24 +114,37 @@ export default {
       return new Response("Invalid JSON", { status: 400, headers: baseCors });
     }
 
-    const upstream = isVerify
-      ? await fetch(ANTHROPIC_URL, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "x-api-key": env.ANTHROPIC_API_KEY,
-            "anthropic-version": "2023-06-01",
-          },
-          body,
-        })
-      : await fetch(OPENAI_URL, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${env.OPENAI_API_KEY}`,
-          },
-          body,
-        });
+    let upstream: Response;
+    if (isVerify) {
+      upstream = await fetch(ANTHROPIC_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": env.ANTHROPIC_API_KEY,
+          "anthropic-version": "2023-06-01",
+        },
+        body,
+      });
+    } else if (isOpenAi) {
+      upstream = await fetch(OPENAI_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${env.OPENAI_API_KEY}`,
+        },
+        body,
+      });
+    } else {
+      // Gemini: model is selected via ?model=... query param so we don't
+      // need to parse the body to route. Default to gemini-2.5-pro.
+      const model = url.searchParams.get("model") ?? "gemini-2.5-pro";
+      const target = `${GEMINI_BASE}/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(env.GEMINI_API_KEY!)}`;
+      upstream = await fetch(target, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body,
+      });
+    }
 
     const resHeaders = new Headers(baseCors);
     resHeaders.set(

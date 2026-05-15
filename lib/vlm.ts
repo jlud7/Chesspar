@@ -74,10 +74,7 @@ Find which 1-3 squares look different between IMAGE 1 and IMAGE 2. Identify whic
 
 Pick the unique legal move from the list whose result produces those changes. Reply with ONLY that move's SAN, exactly as written in the list (e.g. "e4", "Nxf3", "O-O"). No preamble, no markdown — just the SAN.`;
 
-export function makeGeminiVerifier(
-  apiKey: string,
-  model = "gemini-2.5-pro",
-): VlmVerifier {
+function makeGeminiVerifierFromUrl(url: string, model: string): VlmVerifier {
   return {
     provider: "gemini",
     async verify({ previousFen, legalMovesSan, boardImage, previousBoardImage }) {
@@ -110,13 +107,12 @@ export function makeGeminiVerifier(
         parts.push({
           inline_data: { mime_type: "image/jpeg", data: afterB64 },
         });
-        const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
         const response = await fetch(url, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             contents: [{ parts }],
-            generationConfig: { temperature: 0.05, maxOutputTokens: 32 },
+            generationConfig: { temperature: 0, maxOutputTokens: 2048 },
           }),
         });
         if (!response.ok) {
@@ -139,6 +135,26 @@ export function makeGeminiVerifier(
       }
     },
   };
+}
+
+export function makeGeminiVerifier(
+  apiKey: string,
+  model = "gemini-2.5-pro",
+): VlmVerifier {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+  return makeGeminiVerifierFromUrl(url, model);
+}
+
+/**
+ * Gemini verifier that goes through the Cloudflare Worker /gemini endpoint.
+ * The worker holds GEMINI_API_KEY as a secret; the browser never sees it.
+ */
+export function makeGeminiProxyVerifier(
+  proxyUrl: string,
+  model = "gemini-2.5-pro",
+): VlmVerifier {
+  const url = `${proxyUrl.replace(/\/$/, "")}/gemini?model=${encodeURIComponent(model)}`;
+  return makeGeminiVerifierFromUrl(url, model);
 }
 
 type OpenAiCallArgs = {
