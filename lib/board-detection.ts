@@ -344,33 +344,359 @@ function detectBoardViaRedness(
   }
   if (centroids.length < MIN_CENTROIDS) return null;
 
-  // 4. Fit the grid.
+  // 4. Use the grid fit ONLY to recover the board's tilt angle. The
+  //    centroid-based fit reliably picks `theta` (the integer-grid
+  //    alignment) even when the outermost dark squares are partially
+  //    obscured by back-rank pieces — there are still 24+ unobscured
+  //    interior dark squares whose centroids are clean.
   const grid = fitChessGrid(centroids, blobBbox);
   if (!grid) return null;
 
-  // 5. Read the 4 corners off the fit, in image (source) coordinates.
+  // 5. Build two independent corner estimates, then take the OUTER
+  //    of the two on every edge. This is robust to two distinct
+  //    failure modes:
+  //      a) Grid-fit shrinks inward when corner pieces occlude the
+  //         dark squares whose centroids it relies on. (User's live
+  //         photos.)
+  //      b) Dark-mask extent shrinks when an entire back rank's worth
+  //         of dark squares is occluded by tall pieces — extent
+  //         stops at the highest visible red pixel, which is one cell
+  //         in from the playing surface. (Bundled Test_Photos set.)
+  //    The two failures don't happen on the same edge: when (a) is
+  //    occurring the dark mask still extends to the actual boundary;
+  //    when (b) is occurring grid-fit still has clean centroids for
+  //    the unaffected side. Taking the outer extent on each edge
+  //    recovers the playing surface in both cases.
+  const acceptedLabels = new Set(sums.keys());
+  const extentQuad = orientedExtentsForLabels(
+    cc.labels,
+    acceptedLabels,
+    w,
+    h,
+    grid.theta,
+    erodeR,
+  );
+  if (!extentQuad) return null;
+  // Only allow the extent quad to expand the grid quad when the grid
+  // fit reports MISSING files or ranks. That's the unambiguous signal
+  // that grid centroids couldn't cover an edge of the playing surface
+  // (typically because back-rank pieces occlude the corner dark
+  // squares — exactly the user's live failure mode). When all 8 files
+  // and 8 ranks of centroids are present we trust grid fit verbatim;
+  // expanding via dark-mask extent would only pull the polygon out to
+  // any noise that happens to pass the red filter (chess clock body,
+  // shadow under a cabinet, etc.).
+  const gridIsComplete = grid.missingFiles === 0 && grid.missingRanks === 0;
+  const oriented = gridIsComplete
+    ? grid.corners
+    : clampedOuter(
+        grid.corners,
+        extentQuad,
+        grid.theta,
+        grid.sqw * 1.2,
+      );
+
+  // 6. Edge-snap is temporarily skipped while we lock in the blob-
+  //    extent baseline. (Earlier `snapQuadToEdges` pass collapsed
+  //    the polygon on these photos — needs revisiting after we
+  //    verify the bbox alone is correct.)
+  const snapped = oriented;
+
+  // Scale back to source coordinates.
   const corners: [Point, Point, Point, Point] = [
-    { x: grid.corners[0].x / scale, y: grid.corners[0].y / scale },
-    { x: grid.corners[1].x / scale, y: grid.corners[1].y / scale },
-    { x: grid.corners[2].x / scale, y: grid.corners[2].y / scale },
-    { x: grid.corners[3].x / scale, y: grid.corners[3].y / scale },
+    { x: snapped[0].x / scale, y: snapped[0].y / scale },
+    { x: snapped[1].x / scale, y: snapped[1].y / scale },
+    { x: snapped[2].x / scale, y: snapped[2].y / scale },
+    { x: snapped[3].x / scale, y: snapped[3].y / scale },
   ];
 
-  // Confidence: blob bbox area vs the grid's predicted playing-area area.
-  // A clean detection has the blob almost filling the predicted area.
-  const gridArea =
-    Math.abs(
-      (grid.corners[1].x - grid.corners[0].x) *
-        (grid.corners[3].y - grid.corners[0].y) -
-        (grid.corners[1].y - grid.corners[0].y) *
-          (grid.corners[3].x - grid.corners[0].x),
-    );
+  // Confidence = how square is the rectangle / how much of the blob bbox
+  // it covers. Cheap sanity check for the caller.
+  const polyArea = Math.abs(
+    (snapped[1].x - snapped[0].x) * (snapped[3].y - snapped[0].y) -
+      (snapped[1].y - snapped[0].y) * (snapped[3].x - snapped[0].x),
+  );
   const bboxArea =
     (blobBbox.maxX - blobBbox.minX) * (blobBbox.maxY - blobBbox.minY);
   const confidence =
-    gridArea > 0 ? Math.min(1, Math.max(0, bboxArea / gridArea)) : 0;
+    polyArea > 0 ? Math.min(1, Math.max(0, bboxArea / polyArea)) : 0;
 
   return { corners, confidence };
+}
+
+/**
+ * Rotated bounding rectangle of the UNION of multiple labelled
+ * components, oriented by `theta`. Walks every pixel whose label is
+ * in `acceptedLabels`, projects into the (u, v) coordinate system
+ * rotated by theta, finds the four extreme corner points, expands
+ * outward by `expandPx` to undo erosion shrink, and maps back to
+ * image space.
+ *
+ * Works for both boards with dark border bridges (one giant component,
+ * `acceptedLabels` has one entry) and boards with cream gaps between
+ * squares (32 separate components — each square accepted by size
+ * filter). The extreme points across the union ARE the playing-
+ * surface corners as long as the outermost dark squares (a1/h1/a8/h8
+ * plus rank-1/8 and file-a/h edge cells) contribute at least a few
+ * pixels each.
+ */
+/**
+ * Take the OUTER extent of `quadA` and `quadB` in the (u, v) frame
+ * aligned with the detected grid orientation, capped so that any
+ * outward expansion of `quadA` is no more than `maxOutward` pixels per
+ * edge. Lets the extent quad rescue an occluded back rank from the
+ * grid quad while preventing it from running away to a chess clock
+ * or table edge that happens to pass the dark-mask filter.
+ *
+ * Both inputs are clockwise [TL, TR, BR, BL] (in the orientation the
+ * grid fit declared — caller may rotate later via
+ * `orientStartingPosition`).
+ */
+function clampedOuter(
+  quadA: [Point, Point, Point, Point],
+  quadB: [Point, Point, Point, Point],
+  theta: number,
+  maxOutward: number,
+): [Point, Point, Point, Point] {
+  const cx = (quadA[0].x + quadA[1].x + quadA[2].x + quadA[3].x) / 4;
+  const cy = (quadA[0].y + quadA[1].y + quadA[2].y + quadA[3].y) / 4;
+  const cosT = Math.cos(theta);
+  const sinT = Math.sin(theta);
+  const project = (p: Point): { u: number; v: number } => {
+    const dx = p.x - cx;
+    const dy = p.y - cy;
+    return { u: dx * cosT + dy * sinT, v: -dx * sinT + dy * cosT };
+  };
+  const uvA = quadA.map(project);
+  const uvB = quadB.map(project);
+  const aMinU = Math.min(...uvA.map((p) => p.u));
+  const aMaxU = Math.max(...uvA.map((p) => p.u));
+  const aMinV = Math.min(...uvA.map((p) => p.v));
+  const aMaxV = Math.max(...uvA.map((p) => p.v));
+  const bMinU = Math.min(...uvB.map((p) => p.u));
+  const bMaxU = Math.max(...uvB.map((p) => p.u));
+  const bMinV = Math.min(...uvB.map((p) => p.v));
+  const bMaxV = Math.max(...uvB.map((p) => p.v));
+  // Outward = away from quadA. Clamp each side's adjustment.
+  const minU = Math.max(bMinU, aMinU - maxOutward);
+  const maxU = Math.min(bMaxU, aMaxU + maxOutward);
+  const minV = Math.max(bMinV, aMinV - maxOutward);
+  const maxV = Math.min(bMaxV, aMaxV + maxOutward);
+  // But never SMALLER than A on any side.
+  const finalMinU = Math.min(minU, aMinU);
+  const finalMaxU = Math.max(maxU, aMaxU);
+  const finalMinV = Math.min(minV, aMinV);
+  const finalMaxV = Math.max(maxV, aMaxV);
+  const toImage = (u: number, v: number): Point => ({
+    x: u * cosT - v * sinT + cx,
+    y: u * sinT + v * cosT + cy,
+  });
+  return [
+    toImage(finalMinU, finalMinV),
+    toImage(finalMaxU, finalMinV),
+    toImage(finalMaxU, finalMaxV),
+    toImage(finalMinU, finalMaxV),
+  ];
+}
+
+function orientedExtentsForLabels(
+  labels: Int32Array,
+  acceptedLabels: Set<number>,
+  w: number,
+  h: number,
+  theta: number,
+  expandPx: number,
+): [Point, Point, Point, Point] | null {
+  let sx = 0;
+  let sy = 0;
+  let n = 0;
+  for (let i = 0; i < w * h; i++) {
+    if (acceptedLabels.has(labels[i])) {
+      const x = i % w;
+      const y = (i - x) / w;
+      sx += x;
+      sy += y;
+      n++;
+    }
+  }
+  if (n === 0) return null;
+  const cx = sx / n;
+  const cy = sy / n;
+  const cosT = Math.cos(theta);
+  const sinT = Math.sin(theta);
+  let minU = Infinity;
+  let maxU = -Infinity;
+  let minV = Infinity;
+  let maxV = -Infinity;
+  for (let i = 0; i < w * h; i++) {
+    if (!acceptedLabels.has(labels[i])) continue;
+    const x = i % w;
+    const y = (i - x) / w;
+    const dx = x - cx;
+    const dy = y - cy;
+    const u = dx * cosT + dy * sinT;
+    const v = -dx * sinT + dy * cosT;
+    if (u < minU) minU = u;
+    if (u > maxU) maxU = u;
+    if (v < minV) minV = v;
+    if (v > maxV) maxV = v;
+  }
+  // Undo the inward shrink caused by erosion before component labelling.
+  minU -= expandPx;
+  maxU += expandPx;
+  minV -= expandPx;
+  maxV += expandPx;
+  const toImage = (u: number, v: number): Point => ({
+    x: u * cosT - v * sinT + cx,
+    y: u * sinT + v * cosT + cy,
+  });
+  return [
+    toImage(minU, minV), // TL (u-min, v-min)
+    toImage(maxU, minV), // TR (u-max, v-min)
+    toImage(maxU, maxV), // BR
+    toImage(minU, maxV), // BL
+  ];
+}
+
+/**
+ * Per-edge gradient snap. For each of the polygon's four edges, walk
+ * perpendicular to the edge in a ±W band looking for the strongest
+ * luminance gradient transition (the red-square ↔ cream-border edge
+ * is the strongest line in the image at the playing-surface boundary).
+ * Move that edge to wherever the gradient peaks.
+ *
+ * The dark-blob rotated bbox is correct within ~1-2 pixels in most
+ * cases, but a half-cell occluded by a rook can leave the blob extent
+ * just inside the actual border. The gradient snap reliably closes
+ * that gap because the red-cream transition is the highest-contrast
+ * straight line in the corner neighbourhood, regardless of whether a
+ * piece sits on the corner square.
+ */
+function snapQuadToEdges(
+  rgba: Uint8ClampedArray,
+  w: number,
+  h: number,
+  quad: [Point, Point, Point, Point],
+): [Point, Point, Point, Point] {
+  // Build a luminance buffer for fast sampling.
+  const lum = new Float32Array(w * h);
+  for (let i = 0, j = 0; i < rgba.length; i += 4, j++) {
+    lum[j] = 0.299 * rgba[i] + 0.587 * rgba[i + 1] + 0.114 * rgba[i + 2];
+  }
+  const sample = (x: number, y: number): number => {
+    const xi = Math.max(0, Math.min(w - 1, Math.round(x)));
+    const yi = Math.max(0, Math.min(h - 1, Math.round(y)));
+    return lum[yi * w + xi];
+  };
+  // Find the strongest gradient transition along the line from p1 to
+  // p2, scanning ±band perpendicular. Returns the offset (in pixels)
+  // from the original line that maximises mean |gradient|.
+  const findBestOffset = (
+    p1: Point,
+    p2: Point,
+    outwardSign: number,
+    band: number,
+    samples: number,
+  ): number => {
+    const ex = p2.x - p1.x;
+    const ey = p2.y - p1.y;
+    const len = Math.hypot(ex, ey) || 1;
+    // Perpendicular outward direction.
+    const nx = (-ey / len) * outwardSign;
+    const ny = (ex / len) * outwardSign;
+    let bestOffset = 0;
+    let bestScore = -Infinity;
+    for (let off = -band; off <= band; off += 1) {
+      let total = 0;
+      let count = 0;
+      for (let s = 0; s < samples; s++) {
+        const t = (s + 0.5) / samples;
+        const baseX = p1.x + t * ex + off * nx;
+        const baseY = p1.y + t * ey + off * ny;
+        // Sample 3 px inward and 3 px outward; the difference is the
+        // gradient across the edge.
+        const inX = baseX - 3 * nx;
+        const inY = baseY - 3 * ny;
+        const outX = baseX + 3 * nx;
+        const outY = baseY + 3 * ny;
+        total += Math.abs(sample(inX, inY) - sample(outX, outY));
+        count++;
+      }
+      const score = count > 0 ? total / count : 0;
+      if (score > bestScore) {
+        bestScore = score;
+        bestOffset = off;
+      }
+    }
+    return bestOffset;
+  };
+  // For each of the 4 edges, find the best offset and shift the two
+  // endpoints along the outward normal.
+  const shiftEdge = (
+    p1: Point,
+    p2: Point,
+    offset: number,
+    outwardSign: number,
+  ): [Point, Point] => {
+    const ex = p2.x - p1.x;
+    const ey = p2.y - p1.y;
+    const len = Math.hypot(ex, ey) || 1;
+    const nx = (-ey / len) * outwardSign;
+    const ny = (ex / len) * outwardSign;
+    return [
+      { x: p1.x + offset * nx, y: p1.y + offset * ny },
+      { x: p2.x + offset * nx, y: p2.y + offset * ny },
+    ];
+  };
+  // Compute polygon centroid to determine "outward" direction for each edge.
+  const polyCx = (quad[0].x + quad[1].x + quad[2].x + quad[3].x) / 4;
+  const polyCy = (quad[0].y + quad[1].y + quad[2].y + quad[3].y) / 4;
+  const outwardSign = (p1: Point, p2: Point): number => {
+    const ex = p2.x - p1.x;
+    const ey = p2.y - p1.y;
+    const len = Math.hypot(ex, ey) || 1;
+    const nx = -ey / len;
+    const ny = ex / len;
+    const midX = (p1.x + p2.x) / 2;
+    const midY = (p1.y + p2.y) / 2;
+    const dot = nx * (midX - polyCx) + ny * (midY - polyCy);
+    return dot >= 0 ? 1 : -1;
+  };
+  // Search band: ±6% of the polygon's mean side length.
+  const meanSide =
+    (Math.hypot(quad[1].x - quad[0].x, quad[1].y - quad[0].y) +
+      Math.hypot(quad[2].x - quad[1].x, quad[2].y - quad[1].y) +
+      Math.hypot(quad[3].x - quad[2].x, quad[3].y - quad[2].y) +
+      Math.hypot(quad[0].x - quad[3].x, quad[0].y - quad[3].y)) /
+    4;
+  const band = Math.max(4, Math.round(meanSide * 0.06));
+  const samples = 32;
+  let [tl, tr, br, bl] = quad;
+  // Edge a8→h8 (TL→TR), outward = "up" relative to polygon centroid.
+  {
+    const sign = outwardSign(tl, tr);
+    const off = findBestOffset(tl, tr, sign, band, samples);
+    [tl, tr] = shiftEdge(tl, tr, off, sign);
+  }
+  // Edge h8→h1 (TR→BR), outward = "right".
+  {
+    const sign = outwardSign(tr, br);
+    const off = findBestOffset(tr, br, sign, band, samples);
+    [tr, br] = shiftEdge(tr, br, off, sign);
+  }
+  // Edge h1→a1 (BR→BL), outward = "down".
+  {
+    const sign = outwardSign(br, bl);
+    const off = findBestOffset(br, bl, sign, band, samples);
+    [br, bl] = shiftEdge(br, bl, off, sign);
+  }
+  // Edge a1→a8 (BL→TL), outward = "left".
+  {
+    const sign = outwardSign(bl, tl);
+    const off = findBestOffset(bl, tl, sign, band, samples);
+    [bl, tl] = shiftEdge(bl, tl, off, sign);
+  }
+  return [tl, tr, br, bl];
 }
 
 type FittedGrid = {
@@ -380,6 +706,10 @@ type FittedGrid = {
   sqw: number;
   /** Rotation angle of the U axis relative to image X (radians). */
   theta: number;
+  /** 0..8 — how many files of the playing surface had detected centroids. */
+  missingFiles: number;
+  /** 0..8 — how many ranks of the playing surface had detected centroids. */
+  missingRanks: number;
 };
 
 /**
@@ -494,7 +824,13 @@ function fitChessGrid(
   const br = uvToImage(rightU, bottomV);
   const bl = uvToImage(leftU, bottomV);
 
-  return { corners: [tl, tr, br, bl], sqw, theta };
+  return {
+    corners: [tl, tr, br, bl],
+    sqw,
+    theta,
+    missingFiles,
+    missingRanks,
+  };
 }
 
 type AxisFit = { origin: number; minK: number; maxK: number };
