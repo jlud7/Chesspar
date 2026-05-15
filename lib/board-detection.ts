@@ -1,4 +1,9 @@
-import type { Point } from "./homography.ts";
+import {
+  applyHomography,
+  computeHomographyLeastSquares,
+  type Matrix3x3,
+  type Point,
+} from "./homography.ts";
 import { extractSquareCrops, warpBoard } from "./board-image.ts";
 import { classifyBoard } from "./occupancy.ts";
 
@@ -782,6 +787,90 @@ function fitChessGrid(
     y: u * sinT + v * cosT + meanY,
   });
 
+  // --- Perspective-aware corner fit -----------------------------------
+  // Replace the linear "corner = origin + 8 * sqw" formula with a proper
+  // homography fit from cell-space → image space. Each detected dark
+  // square contributes one correspondence: its (file+0.5, rank+0.5)
+  // chess-cell-center coords ↦ its (image x, y) centroid. With ~28-32
+  // points on the bundled photos and ≥15 even on heavily-occluded live
+  // shots, the least-squares fit nails the perspective transform and
+  // its application to (0,0), (8,0), (8,8), (0,8) gives the playing-
+  // surface corners directly — no uniform-sqw assumption, no need to
+  // pick which centroid is at the corner.
+  //
+  // Falls back to the linear formula on degenerate input (too few
+  // points, collinear, or solver failure).
+  const cellSrc: Point[] = [];
+  const imgDst: Point[] = [];
+  for (let i = 0; i < centroids.length; i++) {
+    const u = uvs[i].u;
+    const v = uvs[i].v;
+    const fileK = Math.round((u - fitU.origin) / sqw);
+    const rankK = Math.round((v - fitV.origin) / sqw);
+    if (fileK < fitU.minK || fileK > fitU.maxK) continue;
+    if (rankK < fitV.minK || rankK > fitV.maxK) continue;
+    const file = fileK - leftFileK; // 0..7 in playing-surface space
+    const rank = rankK - topRankK;
+    if (file < 0 || file > 7) continue;
+    if (rank < 0 || rank > 7) continue;
+    // Reject ALL centroids that don't sit on a dark square — the chess
+    // colouring is alternating, dark cells are (file+rank) even when
+    // a1 is dark. We treat the leftFileK/topRankK basis as having a1
+    // at (file=0, rank=7); per dark-square check that's (file+rank) odd.
+    // (We don't strictly need to filter — wrong-parity centroids are
+    // noise — but filtering tightens the fit.)
+    if (((file + rank) & 1) !== 1) continue;
+    cellSrc.push({ x: file + 0.5, y: rank + 0.5 });
+    imgDst.push({ x: centroids[i].x, y: centroids[i].y });
+  }
+
+  const tryHomographyCorners = (): [Point, Point, Point, Point] | null => {
+    if (cellSrc.length < 8) return null;
+    let H: Matrix3x3;
+    try {
+      H = computeHomographyLeastSquares(cellSrc, imgDst);
+    } catch {
+      return null;
+    }
+    const corners: [Point, Point, Point, Point] = [
+      applyHomography(H, { x: 0, y: 0 }),
+      applyHomography(H, { x: 8, y: 0 }),
+      applyHomography(H, { x: 8, y: 8 }),
+      applyHomography(H, { x: 0, y: 8 }),
+    ];
+    // Sanity check — every corner must be a finite point. Solver can
+    // produce NaN/Infinity on near-singular inputs.
+    for (const p of corners) {
+      if (!Number.isFinite(p.x) || !Number.isFinite(p.y)) return null;
+    }
+    // Sanity check — fitted polygon should be roughly the same size as
+    // the centroid spread. If it's hugely larger (>10× the centroid
+    // bbox area) the fit went rogue and we fall back.
+    const polyArea = Math.abs(
+      (corners[1].x - corners[0].x) * (corners[3].y - corners[0].y) -
+        (corners[1].y - corners[0].y) * (corners[3].x - corners[0].x),
+    );
+    const cMinX = Math.min(...centroids.map((c) => c.x));
+    const cMaxX = Math.max(...centroids.map((c) => c.x));
+    const cMinY = Math.min(...centroids.map((c) => c.y));
+    const cMaxY = Math.max(...centroids.map((c) => c.y));
+    const centroidArea = (cMaxX - cMinX) * (cMaxY - cMinY);
+    if (centroidArea > 0 && polyArea > centroidArea * 6) return null;
+    return corners;
+  };
+
+  const hCorners = tryHomographyCorners();
+  if (hCorners) {
+    return {
+      corners: hCorners,
+      sqw,
+      theta,
+      missingFiles,
+      missingRanks,
+    };
+  }
+
+  // --- Fallback: linear corners (legacy path) -------------------------
   const tl = uvToImage(leftU, topV);
   const tr = uvToImage(rightU, topV);
   const br = uvToImage(rightU, bottomV);

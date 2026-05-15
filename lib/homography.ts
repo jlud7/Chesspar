@@ -35,6 +35,57 @@ export function computeHomography(src: Point[], dst: Point[]): Matrix3x3 {
   ];
 }
 
+/**
+ * Least-squares homography fit for N ≥ 4 point pairs.
+ *
+ * Same DLT formulation as `computeHomography`, but for N pairs we build
+ * a (2N × 8) system and solve it via the normal equations
+ *   (Aᵀ A) h = Aᵀ b
+ * which collapses to an 8x8 system solvable with the same Gaussian
+ * elimination routine. With h22 fixed at 1, h has 8 free entries.
+ *
+ * Used by the chess-board detector to fit a perspective transform from
+ * cell-space (file, rank) coordinates onto the centroids of every
+ * detected dark square (~28-32 correspondences across the board). This
+ * is what makes corner placement robust to phone-angle perspective
+ * where a uniform-square grid fit shrinks or over-extends.
+ */
+export function computeHomographyLeastSquares(
+  src: Point[],
+  dst: Point[],
+): Matrix3x3 {
+  if (src.length !== dst.length) {
+    throw new Error("src and dst must have the same length");
+  }
+  if (src.length < 4) {
+    throw new Error("Need at least 4 point pairs");
+  }
+  // Build Aᵀ A (8x8) and Aᵀ b (8) directly without materialising A —
+  // each row of A appears twice and the accumulation is symmetric.
+  const ATA: number[][] = Array.from({ length: 8 }, () =>
+    new Array<number>(8).fill(0),
+  );
+  const ATb: number[] = new Array<number>(8).fill(0);
+  for (let i = 0; i < src.length; i++) {
+    const { x, y } = src[i];
+    const { x: X, y: Y } = dst[i];
+    const row1 = [x, y, 1, 0, 0, 0, -X * x, -X * y];
+    const row2 = [0, 0, 0, x, y, 1, -Y * x, -Y * y];
+    for (let j = 0; j < 8; j++) {
+      ATb[j] += row1[j] * X + row2[j] * Y;
+      for (let k = 0; k < 8; k++) {
+        ATA[j][k] += row1[j] * row1[k] + row2[j] * row2[k];
+      }
+    }
+  }
+  const h = solveLinearSystem(ATA, ATb);
+  return [
+    [h[0], h[1], h[2]],
+    [h[3], h[4], h[5]],
+    [h[6], h[7], 1],
+  ];
+}
+
 /** Apply a homography H to a 2D point. */
 export function applyHomography(H: Matrix3x3, p: Point): Point {
   const w = H[2][0] * p.x + H[2][1] * p.y + H[2][2];
