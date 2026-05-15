@@ -352,74 +352,37 @@ function detectBoardViaRedness(
   const grid = fitChessGrid(centroids, blobBbox);
   if (!grid) return null;
 
-  // 5. Build two independent corner estimates, then take the OUTER
-  //    of the two on every edge. This is robust to two distinct
-  //    failure modes:
-  //      a) Grid-fit shrinks inward when corner pieces occlude the
-  //         dark squares whose centroids it relies on. (User's live
-  //         photos.)
-  //      b) Dark-mask extent shrinks when an entire back rank's worth
-  //         of dark squares is occluded by tall pieces — extent
-  //         stops at the highest visible red pixel, which is one cell
-  //         in from the playing surface. (Bundled Test_Photos set.)
-  //    The two failures don't happen on the same edge: when (a) is
-  //    occurring the dark mask still extends to the actual boundary;
-  //    when (b) is occurring grid-fit still has clean centroids for
-  //    the unaffected side. Taking the outer extent on each edge
-  //    recovers the playing surface in both cases.
-  const acceptedLabels = new Set(sums.keys());
-  const extentQuad = orientedExtentsForLabels(
-    cc.labels,
-    acceptedLabels,
-    w,
-    h,
-    grid.theta,
-    erodeR,
-  );
-  if (!extentQuad) return null;
-  // Only allow the extent quad to expand the grid quad when the grid
-  // fit reports MISSING files or ranks. That's the unambiguous signal
-  // that grid centroids couldn't cover an edge of the playing surface
-  // (typically because back-rank pieces occlude the corner dark
-  // squares — exactly the user's live failure mode). When all 8 files
-  // and 8 ranks of centroids are present we trust grid fit verbatim;
-  // expanding via dark-mask extent would only pull the polygon out to
-  // any noise that happens to pass the red filter (chess clock body,
-  // shadow under a cabinet, etc.).
-  const gridIsComplete = grid.missingFiles === 0 && grid.missingRanks === 0;
-  const oriented = gridIsComplete
-    ? grid.corners
-    : clampedOuter(
-        grid.corners,
-        extentQuad,
-        grid.theta,
-        grid.sqw * 1.2,
-      );
-
-  // 6. Edge-snap is temporarily skipped while we lock in the blob-
-  //    extent baseline. (Earlier `snapQuadToEdges` pass collapsed
-  //    the polygon on these photos — needs revisiting after we
-  //    verify the bbox alone is correct.)
-  const snapped = oriented;
-
-  // Scale back to source coordinates.
+  // 5. Read the 4 corners off the fit, in image (source) coordinates.
+  //    Earlier attempts to expand the polygon via dark-mask extents
+  //    helped on the bundled photos (where back-rank pieces occlude
+  //    corner squares uniformly) but introduced a worse failure on
+  //    live phone shots: perspective distortion means the near-edge
+  //    cells are physically larger in image space than the far-edge
+  //    cells, so any "uniform 1.2-cell expansion" downward extends
+  //    the polygon past the playing surface and into the table /
+  //    chess clock / lap area. Until we solve the perspective issue
+  //    properly (homography-fit grid or Hough-line edge detection)
+  //    we stick with the raw centroid fit, which at worst clips a
+  //    sliver of an occluded back rank rather than blowing out.
   const corners: [Point, Point, Point, Point] = [
-    { x: snapped[0].x / scale, y: snapped[0].y / scale },
-    { x: snapped[1].x / scale, y: snapped[1].y / scale },
-    { x: snapped[2].x / scale, y: snapped[2].y / scale },
-    { x: snapped[3].x / scale, y: snapped[3].y / scale },
+    { x: grid.corners[0].x / scale, y: grid.corners[0].y / scale },
+    { x: grid.corners[1].x / scale, y: grid.corners[1].y / scale },
+    { x: grid.corners[2].x / scale, y: grid.corners[2].y / scale },
+    { x: grid.corners[3].x / scale, y: grid.corners[3].y / scale },
   ];
 
-  // Confidence = how square is the rectangle / how much of the blob bbox
-  // it covers. Cheap sanity check for the caller.
-  const polyArea = Math.abs(
-    (snapped[1].x - snapped[0].x) * (snapped[3].y - snapped[0].y) -
-      (snapped[1].y - snapped[0].y) * (snapped[3].x - snapped[0].x),
+  // Confidence = how much of the dark-blob bbox is inside the predicted
+  // grid area. A clean detection has the blob almost filling the area.
+  const gridArea = Math.abs(
+    (grid.corners[1].x - grid.corners[0].x) *
+      (grid.corners[3].y - grid.corners[0].y) -
+      (grid.corners[1].y - grid.corners[0].y) *
+        (grid.corners[3].x - grid.corners[0].x),
   );
   const bboxArea =
     (blobBbox.maxX - blobBbox.minX) * (blobBbox.maxY - blobBbox.minY);
   const confidence =
-    polyArea > 0 ? Math.min(1, Math.max(0, bboxArea / polyArea)) : 0;
+    gridArea > 0 ? Math.min(1, Math.max(0, bboxArea / gridArea)) : 0;
 
   return { corners, confidence };
 }

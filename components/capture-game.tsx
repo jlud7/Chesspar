@@ -2795,9 +2795,37 @@ function ReadyScreen({
 }) {
   const lensLabel = (label: string): string =>
     labelLensTier(label) === "ultraWide" ? "0.5×" : "1×";
+
+  // One-line condensed status — replaces the 3-row check rail. The
+  // detail text only appears when something's wrong, so the screen
+  // stays quiet on the happy path.
+  let statusKind: "loading" | "ok" | "warn";
+  let statusText: string;
+  if (!check) {
+    statusKind = "loading";
+    statusText = "Reading the board…";
+  } else if (check.allClear) {
+    statusKind = "ok";
+    statusText = "Board ready — 16 white + 16 black, starting position";
+  } else if (!check.piecesAllDetected) {
+    statusKind = "warn";
+    statusText = `Saw ${check.pieceCount.white}W · ${check.pieceCount.black}B · ${check.pieceCount.empty} empty — should be 16 + 16 + 32`;
+  } else {
+    statusKind = "warn";
+    statusText = `${check.startingPositionMatch}/64 squares match starting position`;
+  }
+  const aiBadge = vlmDetecting
+    ? "AI placing corners…"
+    : vlmStatus.kind === "ok"
+      ? "AI placed corners"
+      : vlmStatus.kind === "error"
+        ? "Using CV fallback"
+        : null;
+
   return (
-    <div className="absolute inset-0 z-40 flex flex-col overflow-y-auto bg-zinc-950 text-zinc-100">
-      <div className="flex shrink-0 items-center justify-between px-5 pb-2 pt-5">
+    <div className="absolute inset-0 z-40 flex flex-col bg-zinc-950 text-zinc-100">
+      {/* Header */}
+      <div className="flex shrink-0 items-center justify-between px-5 pb-1 pt-5">
         <button
           onClick={onCancel}
           className="rounded-full bg-white/5 px-3 py-1 text-[11px] uppercase tracking-widest text-zinc-300 hover:bg-white/10"
@@ -2810,176 +2838,143 @@ function ReadyScreen({
         <div className="w-[68px]" aria-hidden />
       </div>
 
-      <div className="flex flex-1 flex-col gap-4 px-5 pb-6 pt-2">
-        {/* Live camera */}
-        {!testMode && (
-          <div className="flex flex-col items-center gap-2">
-            <div
-              className="relative w-full max-w-[280px] overflow-hidden rounded-2xl border border-white/15 bg-black"
-              style={
-                videoDims
-                  ? { aspectRatio: `${videoDims.w}/${videoDims.h}` }
-                  : { aspectRatio: "3/4" }
-              }
-            >
-              <video
-                ref={onPreviewRef}
-                muted
-                playsInline
-                autoPlay
-                className="absolute inset-0 h-full w-full object-contain"
+      {/* Live camera — takes whatever vertical space is left between
+          header and the action footer. */}
+      {!testMode && (
+        <div className="relative mx-auto mt-2 flex w-full max-w-[440px] flex-1 items-center justify-center px-4">
+          <div
+            className="relative w-full max-h-full overflow-hidden rounded-2xl border border-white/15 bg-black"
+            style={
+              videoDims
+                ? { aspectRatio: `${videoDims.w}/${videoDims.h}` }
+                : { aspectRatio: "3/4" }
+            }
+          >
+            <video
+              ref={onPreviewRef}
+              muted
+              playsInline
+              autoPlay
+              className="absolute inset-0 h-full w-full object-contain"
+            />
+            {corners.length === 4 && videoDims && (
+              <CornerOverlaySvg
+                corners={corners}
+                videoDims={videoDims}
+                onDragCorner={onDragCorner}
               />
-              {corners.length === 4 && videoDims && (
-                <CornerOverlaySvg
-                  corners={corners}
-                  videoDims={videoDims}
-                  onDragCorner={onDragCorner}
-                />
-              )}
-            </div>
-            {lenses.length > 1 && (
-              <div className="flex items-center gap-1 rounded-full border border-white/15 bg-black/70 px-1 py-1 text-[11px] font-medium text-zinc-100">
-                {lenses.map((l, i) => {
-                  const label = lensLabel(l.label);
-                  const selected = l.deviceId === currentLensId;
-                  return (
-                    <button
-                      key={l.deviceId || `lens-${i}`}
-                      type="button"
-                      onClick={() => onSwitchLens(l.deviceId)}
-                      className={clsx(
-                        "rounded-full px-3 py-0.5 transition",
-                        selected
-                          ? "bg-white text-black"
-                          : "text-zinc-200 hover:bg-white/10",
-                      )}
-                    >
-                      {label}
-                    </button>
-                  );
-                })}
-              </div>
             )}
-            <p className="text-[10px] uppercase tracking-[0.22em] text-zinc-500">
-              Drag the green dots to fine-tune the corners
-            </p>
-            {hasAiDetector && (
-              <div className="flex items-center gap-2 text-[10px]">
-                {vlmDetecting ? (
-                  <span className="inline-flex items-center gap-1.5 rounded-full bg-sky-500/15 px-2 py-0.5 text-sky-200">
-                    <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-sky-300" />
-                    AI placing corners…
-                  </span>
-                ) : vlmStatus.kind === "ok" ? (
-                  <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-500/15 px-2 py-0.5 text-emerald-200">
-                    AI placed corners
-                  </span>
-                ) : vlmStatus.kind === "error" ? (
-                  <span
-                    className="inline-flex items-center gap-1.5 rounded-full bg-amber-500/15 px-2 py-0.5 text-amber-200"
-                    title={vlmStatus.reason}
-                  >
-                    AI detection failed
-                  </span>
-                ) : null}
-                {!vlmDetecting && (
-                  <button
-                    type="button"
-                    onClick={onRetryAi}
-                    className="rounded-full border border-white/15 bg-white/5 px-2 py-0.5 text-zinc-200 hover:bg-white/10"
-                  >
-                    Retry AI
-                  </button>
+            {aiBadge && (
+              <div
+                className={clsx(
+                  "pointer-events-none absolute left-3 top-3 inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-[10px] font-medium uppercase tracking-[0.18em] backdrop-blur",
+                  vlmDetecting
+                    ? "bg-sky-500/20 text-sky-100"
+                    : vlmStatus.kind === "ok"
+                      ? "bg-emerald-500/20 text-emerald-100"
+                      : "bg-zinc-700/60 text-zinc-200",
                 )}
+              >
+                {vlmDetecting && (
+                  <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-sky-300" />
+                )}
+                {aiBadge}
               </div>
             )}
-          </div>
-        )}
-
-        {/* Rectified preview + checks */}
-        <div className="flex items-start gap-3 rounded-2xl border border-white/5 bg-white/5 p-3">
-          <div className="relative aspect-square w-28 shrink-0 overflow-hidden rounded-lg border border-white/10 bg-black">
-            {check?.rectifiedUrl ? (
-              // eslint-disable-next-line @next/next/no-img-element
-              <img
-                src={check.rectifiedUrl}
-                alt="Rectified board"
-                className="absolute inset-0 h-full w-full object-cover"
-              />
-            ) : (
-              <div className="flex h-full w-full items-center justify-center text-[10px] uppercase tracking-widest text-zinc-500">
-                Reading…
-              </div>
-            )}
-          </div>
-          <div className="flex flex-1 flex-col gap-1.5 text-[12px]">
-            <CheckRow
-              ok={check?.boardInFrame === true}
-              label="Board fully in frame"
-              detail={
-                check
-                  ? null
-                  : "Aiming the lens at the board — edges still being found."
-              }
-            />
-            <CheckRow
-              ok={check?.piecesAllDetected === true}
-              label="All 32 pieces detected"
-              detail={
-                check
-                  ? check.piecesAllDetected
-                    ? null
-                    : `${check.pieceCount.white}W · ${check.pieceCount.black}B · ${check.pieceCount.empty} empty`
-                  : null
-              }
-            />
-            <CheckRow
-              ok={check?.startingPositionOk === true}
-              label="Pieces in starting position"
-              detail={
-                check && !check.startingPositionOk
-                  ? `${check.startingPositionMatch}/64 squares match`
-                  : null
-              }
-            />
           </div>
         </div>
+      )}
 
-        <div className="flex flex-col gap-2">
+      {/* Lens + drag hint */}
+      <div className="mx-auto mt-3 flex w-full max-w-[440px] items-center justify-between px-4 text-[11px] text-zinc-400">
+        {lenses.length > 1 ? (
+          <div className="flex items-center gap-1 rounded-full border border-white/15 bg-black/70 p-1 text-zinc-100">
+            {lenses.map((l, i) => {
+              const label = lensLabel(l.label);
+              const selected = l.deviceId === currentLensId;
+              return (
+                <button
+                  key={l.deviceId || `lens-${i}`}
+                  type="button"
+                  onClick={() => onSwitchLens(l.deviceId)}
+                  className={clsx(
+                    "rounded-full px-3 py-0.5 transition",
+                    selected
+                      ? "bg-white text-black"
+                      : "text-zinc-200 hover:bg-white/10",
+                  )}
+                >
+                  {label}
+                </button>
+              );
+            })}
+          </div>
+        ) : (
+          <span />
+        )}
+        <span className="text-right">Drag corners to fine-tune</span>
+      </div>
+
+      {/* Status line */}
+      <div className="mx-auto mt-3 w-full max-w-[440px] px-4">
+        <div
+          className={clsx(
+            "flex items-center gap-2 rounded-xl px-3 py-2 text-[12px]",
+            statusKind === "ok"
+              ? "bg-emerald-500/10 text-emerald-100"
+              : statusKind === "warn"
+                ? "bg-amber-500/10 text-amber-100"
+                : "bg-white/5 text-zinc-300",
+          )}
+        >
+          {statusKind === "ok" ? (
+            <svg className="h-4 w-4 shrink-0" viewBox="0 0 16 16" fill="currentColor">
+              <path d="M6 11.5 3 8.5l1-1 2 2 5-5 1 1Z" />
+            </svg>
+          ) : statusKind === "loading" ? (
+            <span className="h-2 w-2 shrink-0 animate-pulse rounded-full bg-zinc-300" />
+          ) : (
+            <span className="h-2 w-2 shrink-0 rounded-full bg-amber-300" />
+          )}
+          <span className="min-w-0 truncate">{statusText}</span>
+        </div>
+      </div>
+
+      {/* Action footer */}
+      <div className="mx-auto mt-3 flex w-full max-w-[440px] shrink-0 flex-col gap-2 px-4 pb-5">
+        <button
+          onClick={onStart}
+          className={clsx(
+            "rounded-2xl px-4 py-3.5 text-base font-semibold transition",
+            check?.allClear
+              ? "bg-emerald-500/95 text-emerald-950 shadow-lg shadow-emerald-500/15 hover:bg-emerald-400"
+              : "border border-amber-400/40 bg-amber-500/15 text-amber-100 hover:bg-amber-500/25",
+          )}
+        >
+          {check?.allClear ? "Start game" : "Start anyway"}
+        </button>
+        <div className="flex gap-2 text-[12px]">
           <button
-            onClick={onStart}
-            disabled={!check?.allClear}
-            className={clsx(
-              "rounded-2xl px-4 py-3.5 text-base font-semibold transition",
-              check?.allClear
-                ? "bg-emerald-500/95 text-emerald-950 shadow-lg shadow-emerald-500/15 hover:bg-emerald-400"
-                : "bg-zinc-800 text-zinc-500",
-            )}
+            onClick={onTapManually}
+            className="flex-1 rounded-xl border border-white/10 bg-white/5 px-3 py-2 font-medium text-zinc-200 hover:bg-white/10"
           >
-            Start game
+            Tap corners myself
           </button>
-          {check && !check.allClear && (
+          <button
+            onClick={onRecalibrate}
+            className="flex-1 rounded-xl border border-white/10 bg-white/5 px-3 py-2 font-medium text-zinc-200 hover:bg-white/10"
+          >
+            Re-detect
+          </button>
+          {hasAiDetector && !vlmDetecting && (
             <button
-              onClick={onStart}
-              className="rounded-2xl border border-amber-400/30 bg-amber-500/10 px-4 py-2.5 text-[13px] font-medium text-amber-100 hover:bg-amber-500/20"
+              onClick={onRetryAi}
+              className="rounded-xl border border-white/10 bg-white/5 px-3 py-2 font-medium text-zinc-300 hover:bg-white/10"
+              title="Re-run the AI corner detector"
             >
-              Start anyway — checks not passing
+              AI
             </button>
           )}
-          <div className="flex gap-2">
-            <button
-              onClick={onRecalibrate}
-              className="flex-1 rounded-2xl border border-white/10 bg-white/5 px-4 py-2.5 text-[13px] font-medium text-zinc-200 hover:bg-white/10"
-            >
-              Re-detect
-            </button>
-            <button
-              onClick={onTapManually}
-              className="flex-1 rounded-2xl border border-white/10 bg-white/5 px-4 py-2.5 text-[13px] font-medium text-zinc-200 hover:bg-white/10"
-            >
-              Tap corners myself
-            </button>
-          </div>
         </div>
       </div>
     </div>
