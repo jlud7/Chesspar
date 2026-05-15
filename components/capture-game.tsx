@@ -406,6 +406,11 @@ export function CaptureGame() {
   }
   const [vlmDetecting, setVlmDetecting] = useState(false);
   const vlmDetectingRef = useRef(false);
+  const [vlmStatus, setVlmStatus] = useState<
+    | { kind: "idle" }
+    | { kind: "ok"; at: number }
+    | { kind: "error"; reason: string }
+  >({ kind: "idle" });
 
   const stopCamera = useCallback(() => {
     const stream = streamRef.current;
@@ -956,29 +961,37 @@ export function CaptureGame() {
     setVlmDetecting(true);
     try {
       const result = await detector.detectCorners({ image: canvas });
-      if (result.kind !== "detected") return;
-      // Only apply if the user is still in a phase where corners matter.
-      // If they cancelled out to settings while the call was in flight,
-      // discard the result.
+      if (result.kind !== "detected") {
+        setVlmStatus({
+          kind: "error",
+          reason: result.kind === "error" ? result.reason : "no corners",
+        });
+        return;
+      }
       const live =
         phaseRef.current === "calibrating" || phaseRef.current === "ready";
       if (!live) return;
-      // Sanity check — corners should be inside the image bounds and the
-      // polygon should have a non-degenerate area.
       const W = canvas.width;
       const H = canvas.height;
       const inside = result.corners.every(
         (p) => p.x >= 0 && p.x <= W && p.y >= 0 && p.y <= H,
       );
-      if (!inside) return;
+      if (!inside) {
+        setVlmStatus({ kind: "error", reason: "corners outside image" });
+        return;
+      }
       const polyArea = Math.abs(
         (result.corners[1].x - result.corners[0].x) *
           (result.corners[3].y - result.corners[0].y) -
           (result.corners[1].y - result.corners[0].y) *
             (result.corners[3].x - result.corners[0].x),
       );
-      if (polyArea < W * H * 0.05) return;
+      if (polyArea < W * H * 0.05) {
+        setVlmStatus({ kind: "error", reason: "polygon too small" });
+        return;
+      }
       setCorners(result.corners);
+      setVlmStatus({ kind: "ok", at: Date.now() });
     } finally {
       vlmDetectingRef.current = false;
       setVlmDetecting(false);
@@ -993,6 +1006,7 @@ export function CaptureGame() {
   useEffect(() => {
     if (phase !== "calibrating") return;
     if (!cornerDetectorRef.current) return;
+    setVlmStatus({ kind: "idle" });
     const t = window.setTimeout(() => void tryVlmCalibrate(), 700);
     return () => window.clearTimeout(t);
   }, [phase, tryVlmCalibrate]);
@@ -1882,9 +1896,14 @@ export function CaptureGame() {
               return next;
             })
           }
+          vlmDetecting={vlmDetecting}
+          vlmStatus={vlmStatus}
+          hasAiDetector={cornerDetectorRef.current !== null}
+          onRetryAi={() => void tryVlmCalibrate()}
           onRecalibrate={() => {
             setCorners([]);
             setBoardCheck(null);
+            setVlmStatus({ kind: "idle" });
             setPhase("calibrating");
           }}
           onCancel={backToSettings}
@@ -2697,6 +2716,10 @@ function ReadyScreen({
   corners,
   videoDims,
   onDragCorner,
+  vlmDetecting,
+  vlmStatus,
+  hasAiDetector,
+  onRetryAi,
   onRecalibrate,
   onCancel,
   onStart,
@@ -2710,6 +2733,13 @@ function ReadyScreen({
   corners: Point[];
   videoDims: VideoDims | null;
   onDragCorner: (idx: number, point: Point) => void;
+  vlmDetecting: boolean;
+  vlmStatus:
+    | { kind: "idle" }
+    | { kind: "ok"; at: number }
+    | { kind: "error"; reason: string };
+  hasAiDetector: boolean;
+  onRetryAi: () => void;
   onRecalibrate: () => void;
   onCancel: () => void;
   onStart: () => void;
@@ -2784,6 +2814,36 @@ function ReadyScreen({
             <p className="text-[10px] uppercase tracking-[0.22em] text-zinc-500">
               Drag the green dots to fine-tune the corners
             </p>
+            {hasAiDetector && (
+              <div className="flex items-center gap-2 text-[10px]">
+                {vlmDetecting ? (
+                  <span className="inline-flex items-center gap-1.5 rounded-full bg-sky-500/15 px-2 py-0.5 text-sky-200">
+                    <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-sky-300" />
+                    AI placing corners…
+                  </span>
+                ) : vlmStatus.kind === "ok" ? (
+                  <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-500/15 px-2 py-0.5 text-emerald-200">
+                    AI placed corners
+                  </span>
+                ) : vlmStatus.kind === "error" ? (
+                  <span
+                    className="inline-flex items-center gap-1.5 rounded-full bg-amber-500/15 px-2 py-0.5 text-amber-200"
+                    title={vlmStatus.reason}
+                  >
+                    AI detection failed
+                  </span>
+                ) : null}
+                {!vlmDetecting && (
+                  <button
+                    type="button"
+                    onClick={onRetryAi}
+                    className="rounded-full border border-white/15 bg-white/5 px-2 py-0.5 text-zinc-200 hover:bg-white/10"
+                  >
+                    Retry AI
+                  </button>
+                )}
+              </div>
+            )}
           </div>
         )}
 

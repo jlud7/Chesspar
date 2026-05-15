@@ -500,22 +500,28 @@ export interface CornerDetector {
   }): Promise<CornerDetectionResult>;
 }
 
-const CORNER_DETECTION_PROMPT = `You are looking at a photo of a chess board.
+const CORNER_DETECTION_PROMPT = `You are looking at a top-down or angled photo of a chess board.
 
-Find the four corners of the chess BOARD'S PLAYING SURFACE — the outer corners of the 8x8 grid of squares. Do NOT use the paper border, table edge, or chess-clock cable; the corners must lie on the actual playing-surface boundary.
+TASK: Identify the FOUR PHYSICAL CORNERS of the playing surface — the rectangular area that contains the 8×8 grid of alternating dark/light squares. Each corner is where two perpendicular sides of the playing surface meet (perspective may distort the angle in the image).
 
-Label each corner by which chess square sits at that position in the photo:
-- "a8" = the corner where Black's queenside rook starts (or would start)
-- "h8" = the corner where Black's kingside rook starts
-- "h1" = the corner where White's kingside rook starts
-- "a1" = the corner where White's queenside rook starts
+CRITICAL RULES:
+1. The corner is at the OUTER EDGE of the playing surface, NOT on top of any piece. If a rook (or any piece) sits on the corner square, the corner is where the playing surface boundary continues OUTSIDE that square — not on the piece itself.
+2. Include the FULL extent of the playing surface — all 8 ranks AND all 8 files. Back-row pieces (rooks, knights, etc.) often obscure the corner dark squares; the corner is STILL at the outer corner of those occupied squares, NOT pulled inward to where you can see clean board pattern.
+3. Use the rank labels (1–8) and file labels (a–h) printed on the board edges to verify orientation if visible.
+4. Do NOT use the paper border, table edge, chess-clock body, or any background as the boundary — only the 8×8 grid of squares.
 
-Return ONLY a JSON object in this exact shape (no markdown, no preamble):
+OUTPUT — return ONLY this JSON, no preamble, no markdown, no explanation:
 {"a8":{"x":0.000,"y":0.000},"h8":{"x":0.000,"y":0.000},"h1":{"x":0.000,"y":0.000},"a1":{"x":0.000,"y":0.000}}
 
-Each x and y is a number from 0.0 to 1.0 — fractional position in the image (x=0 is the left edge, x=1 is the right edge, y=0 is the top edge, y=1 is the bottom edge).
+Corner labels (use whichever rooks/back-rank pieces are visible to anchor):
+- a8 = corner where Black's queenside rook is/should be
+- h8 = corner where Black's kingside rook is/should be
+- h1 = corner where White's kingside rook is/should be
+- a1 = corner where White's queenside rook is/should be
 
-Be precise. Place each corner ON the actual board edge, exactly where two perpendicular sides of the playing surface meet. If a piece sits on a corner square, place the corner where the playing surface would extend without the piece. Round each coordinate to 3 decimals.`;
+x and y are fractions from 0.0 to 1.0 (x=0 left edge of image, x=1 right edge; y=0 top edge, y=1 bottom edge). Round to 3 decimals.
+
+Before answering, mentally trace the OUTER PERIMETER of the playing surface — the boundary between the 8×8 checker pattern and everything else. The four corners are exactly where that perimeter changes direction by 90°. Make sure your four points include the full back ranks and full files, even when corner pieces sit there.`;
 
 /**
  * Anthropic-proxy corner detector. Posts a downscaled photo to the same
@@ -526,39 +532,46 @@ Be precise. Place each corner ON the actual board edge, exactly where two perpen
  */
 export function makeAnthropicProxyCornerDetector(
   proxyUrl: string,
-  model = "claude-sonnet-4-6",
+  model = "claude-opus-4-7",
 ): CornerDetector {
   const endpoint = proxyUrl.replace(/\/$/, "") + "/verify";
+  const isOpus = model.includes("opus");
   return {
     provider: "anthropic",
     async detectCorners({ image }) {
       try {
-        const scaled = downscaleForVlm(image, 1024);
+        // Match Anthropic's native vision resolution (≤1568 px longest
+        // edge) — sending lower res throws away the spatial precision
+        // we need for pixel-accurate corner placement.
+        const scaled = downscaleForVlm(image, 1568);
         const b64 = canvasToBase64(scaled);
+        const body: Record<string, unknown> = {
+          model,
+          // Opus does its own chain-of-thought; needs many more tokens
+          // than Sonnet to reach a final answer.
+          max_tokens: isOpus ? 4000 : 512,
+          messages: [
+            {
+              role: "user",
+              content: [
+                {
+                  type: "image",
+                  source: {
+                    type: "base64",
+                    media_type: "image/jpeg",
+                    data: b64,
+                  },
+                },
+                { type: "text", text: CORNER_DETECTION_PROMPT },
+              ],
+            },
+          ],
+        };
+        if (!isOpus) body.temperature = 0;
         const response = await fetch(endpoint, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            model,
-            max_tokens: 256,
-            temperature: 0,
-            messages: [
-              {
-                role: "user",
-                content: [
-                  {
-                    type: "image",
-                    source: {
-                      type: "base64",
-                      media_type: "image/jpeg",
-                      data: b64,
-                    },
-                  },
-                  { type: "text", text: CORNER_DETECTION_PROMPT },
-                ],
-              },
-            ],
-          }),
+          body: JSON.stringify(body),
         });
         if (!response.ok) {
           const text = await response.text().catch(() => "");
