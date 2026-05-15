@@ -76,12 +76,17 @@ type Phase =
 
 type BoardCheck = {
   rectifiedUrl: string;
-  cornersFound: boolean;
-  whiteAtBottom: boolean;
-  orientationScore: number;
+  /** All four corners of the playing surface are inside the camera frame. */
+  boardInFrame: boolean;
+  /** Total pieces classified per colour + empty (always sums to 64). */
   pieceCount: { white: number; black: number; empty: number };
+  /** 16 white + 16 black observed — every piece accounted for. */
+  piecesAllDetected: boolean;
+  /** Out of 64 — how many cells match the canonical starting layout. */
   startingPositionMatch: number;
+  /** ≥60/64 squares match starting position. */
   startingPositionOk: boolean;
+  /** All three checks pass. */
   allClear: boolean;
 };
 
@@ -923,8 +928,25 @@ export function CaptureGame() {
   /**
    * Live verification loop. Once corners are detected and we're in
    * "ready", re-classify the current frame every ~600 ms so the player
-   * can see piece-count + orientation checks update as they nudge the
-   * phone. Only when all three pass do we let them tap Start Game.
+   * sees the checks update as they nudge the phone.
+   *
+   * Pipeline (per tick):
+   *   1. Warp the camera frame using the detected corners.
+   *   2. Build a tentative per-board baseline by *assuming* starting
+   *      position — that gives `computeBaseline` labels for the 16 piece
+   *      + 32 empty cells. The baseline learns the user's actual cream
+   *      square / red square / piece colour values, which is what makes
+   *      this far more reliable than the uncalibrated heuristic
+   *      classifier on cream-on-red sets.
+   *   3. Re-classify every cell against that baseline.
+   *   4. Score: 16 W + 16 B detected? How many cells land in their
+   *      starting-position slot?
+   *
+   * The tentative-baseline approach is self-validating: if the board
+   * really IS in starting position, the labels we fed in match the
+   * pixels and the baseline is accurate. If it isn't, the wrong-bucketed
+   * cells skew the baseline so far that the classifier returns garbage
+   * — the checks fail and the player knows something is off.
    */
   useEffect(() => {
     if (phase !== "ready") return;
@@ -945,7 +967,17 @@ export function CaptureGame() {
           RECTIFIED_SIZE,
         );
         const crops = extractSquareCrops(warped);
-        const occ = classifyBoard(crops).map((c) => c.state);
+        // Step 2 + 3: tentative baseline, then calibrated classification.
+        // Fall back to the uncalibrated heuristic only if baseline
+        // construction throws (shouldn't happen unless `crops.length`
+        // isn't 64).
+        let occ: Array<"empty" | "white" | "black">;
+        try {
+          const tentative = computeBaseline(crops);
+          occ = classifyBoardCalibrated(crops, tentative).map((c) => c.state);
+        } catch {
+          occ = classifyBoard(crops).map((c) => c.state);
+        }
         let white = 0;
         let black = 0;
         let empty = 0;
@@ -954,27 +986,26 @@ export function CaptureGame() {
           else if (s === "black") black++;
           else empty++;
         }
-        const orientationScore = scorePlayingOrientation(occ);
-        const whiteAtBottom = orientationScore >= 20;
-        // Cells 0..15 = ranks 8,7 (black); 16..47 = ranks 6..3 (empty);
-        // 48..63 = ranks 2,1 (white).
+        // Cells 0..15 = ranks 8,7 (black side); 16..47 = ranks 6..3
+        // (empty middle); 48..63 = ranks 2,1 (white side). autoDetect
+        // already rotated the corners so this orientation is the one
+        // the rectified canvas adopts.
         let startingPositionMatch = 0;
         for (let i = 0; i < 64; i++) {
           const expected: "black" | "empty" | "white" =
             i < 16 ? "black" : i < 48 ? "empty" : "white";
           if (occ[i] === expected) startingPositionMatch++;
         }
-        const pieceCountOk = white === 16 && black === 16 && empty === 32;
-        const startingPositionOk = startingPositionMatch >= 58;
+        const piecesAllDetected = white === 16 && black === 16;
+        const startingPositionOk = startingPositionMatch >= 60;
         const next: BoardCheck = {
           rectifiedUrl: warped.toDataURL("image/jpeg", 0.82),
-          cornersFound: true,
-          whiteAtBottom,
-          orientationScore,
+          boardInFrame: true,
           pieceCount: { white, black, empty },
+          piecesAllDetected,
           startingPositionMatch,
           startingPositionOk,
-          allClear: whiteAtBottom && pieceCountOk && startingPositionOk,
+          allClear: piecesAllDetected && startingPositionOk,
         };
         if (!cancelled) setBoardCheck(next);
       } catch {
@@ -2516,38 +2547,44 @@ function ReadyScreen({
             </div>
             <div className="flex flex-1 flex-col gap-1.5 text-[12px]">
               <CheckRow
-                ok={check?.cornersFound === true}
-                label="Board edges detected"
+                ok={check?.boardInFrame === true}
+                label="Board fully in frame"
                 detail={
                   check
                     ? null
-                    : "Aiming the lens at the board, edges still being found."
+                    : "Aiming the lens at the board — edges still being found."
                 }
               />
               <CheckRow
-                ok={check?.whiteAtBottom === true}
-                label="White pieces on bottom"
+                ok={check?.piecesAllDetected === true}
+                label="All 32 pieces detected"
                 detail={
-                  check && !check.whiteAtBottom
-                    ? "Rotate the board or recalibrate to match expected orientation."
+                  check
+                    ? check.piecesAllDetected
+                      ? `16 white · 16 black · 32 empty squares`
+                      : `Saw ${check.pieceCount.white}W · ${check.pieceCount.black}B · ${check.pieceCount.empty} empty. Make sure every piece is upright and visible.`
                     : null
                 }
               />
               <CheckRow
                 ok={check?.startingPositionOk === true}
-                label="Starting position"
+                label="Pieces in starting position"
                 detail={
                   check
-                    ? `${check.pieceCount.white}W · ${check.pieceCount.black}B · ${check.pieceCount.empty} empty${
-                        check.startingPositionOk
-                          ? ""
-                          : ` (${check.startingPositionMatch}/64 squares match)`
-                      }`
+                    ? check.startingPositionOk
+                      ? null
+                      : `${check.startingPositionMatch}/64 squares match the standard layout. If the board is set up correctly, try Re-detect to recalibrate from this angle.`
                     : null
                 }
               />
             </div>
           </div>
+          <p className="text-[11px] leading-snug text-zinc-400">
+            We&apos;re confirming the camera can see the whole board, all 32
+            pieces are visible, and they&apos;re in the standard starting
+            position. This also learns your board&apos;s colours so move
+            detection is reliable for this lighting and piece set.
+          </p>
         </div>
 
         <div className="flex flex-col gap-2">
