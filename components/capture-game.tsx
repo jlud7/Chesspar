@@ -986,17 +986,26 @@ export function CaptureGame() {
           else if (s === "black") black++;
           else empty++;
         }
-        // Cells 0..15 = ranks 8,7 (black side); 16..47 = ranks 6..3
-        // (empty middle); 48..63 = ranks 2,1 (white side). autoDetect
-        // already rotated the corners so this orientation is the one
-        // the rectified canvas adopts.
-        let startingPositionMatch = 0;
-        for (let i = 0; i < 64; i++) {
-          const expected: "black" | "empty" | "white" =
-            i < 16 ? "black" : i < 48 ? "empty" : "white";
-          if (occ[i] === expected) startingPositionMatch++;
-        }
-        const piecesAllDetected = white === 16 && black === 16;
+        // Cells 0..15 = ranks 8,7 (back ranks for one side); 16..47 =
+        // ranks 6..3 (empty middle); 48..63 = ranks 2,1 (back ranks for
+        // the other side). autoDetect rotated the corners so the
+        // rectified canvas takes this orientation.
+        //
+        // The check is *structural*: do the back ranks have pieces and
+        // the middle ranks empty, regardless of which colour is on
+        // which side? Strict colour-per-cell matching is too brittle on
+        // tall-piece overhang where a king/queen silhouette spills into
+        // adjacent crops and gets mis-classified. The piece-count check
+        // separately confirms we saw ~16 of each colour.
+        let backRanksOccupied = 0;
+        for (let i = 0; i < 16; i++) if (occ[i] !== "empty") backRanksOccupied++;
+        for (let i = 48; i < 64; i++)
+          if (occ[i] !== "empty") backRanksOccupied++;
+        let middleRanksEmpty = 0;
+        for (let i = 16; i < 48; i++)
+          if (occ[i] === "empty") middleRanksEmpty++;
+        const startingPositionMatch = backRanksOccupied + middleRanksEmpty;
+        const piecesAllDetected = white >= 14 && black >= 14 && empty >= 28;
         const startingPositionOk = startingPositionMatch >= 60;
         const next: BoardCheck = {
           rectifiedUrl: warped.toDataURL("image/jpeg", 0.82),
@@ -1759,6 +1768,8 @@ export function CaptureGame() {
           lenses={availableLenses}
           currentLensId={currentLensId}
           onSwitchLens={switchLens}
+          corners={corners}
+          videoDims={videoDims}
           onRecalibrate={() => {
             setCorners([]);
             setBoardCheck(null);
@@ -2450,6 +2461,50 @@ function CameraPreviewOverlay({
  * the classifier isn't perfect and the player may know better than the
  * pipeline.
  */
+/**
+ * SVG overlay drawn on top of the live camera preview, showing the four
+ * corners the detector currently has locked onto. The viewBox matches
+ * the video's native dimensions and the video is rendered with
+ * object-contain, so the dots land on the exact pixels the warp will
+ * use. If the dots aren't on the board edges, the rectified output is
+ * going to be wrong — the player can hit Re-detect.
+ */
+function CornerOverlaySvg({
+  corners,
+  videoDims,
+}: {
+  corners: Point[];
+  videoDims: VideoDims;
+}) {
+  const stroke = Math.max(2, videoDims.w / 400);
+  const dotR = Math.max(8, videoDims.w / 120);
+  return (
+    <svg
+      viewBox={`0 0 ${videoDims.w} ${videoDims.h}`}
+      className="pointer-events-none absolute inset-0 h-full w-full"
+      preserveAspectRatio="xMidYMid meet"
+    >
+      <polygon
+        points={corners.map((p) => `${p.x},${p.y}`).join(" ")}
+        fill="rgba(74,222,128,0.08)"
+        stroke="rgba(74,222,128,0.95)"
+        strokeWidth={stroke}
+      />
+      {corners.map((p, i) => (
+        <circle
+          key={i}
+          cx={p.x}
+          cy={p.y}
+          r={dotR}
+          fill="rgba(16,185,129,0.95)"
+          stroke="white"
+          strokeWidth={stroke * 0.6}
+        />
+      ))}
+    </svg>
+  );
+}
+
 function ReadyScreen({
   check,
   testMode,
@@ -2457,6 +2512,8 @@ function ReadyScreen({
   lenses,
   currentLensId,
   onSwitchLens,
+  corners,
+  videoDims,
   onRecalibrate,
   onCancel,
   onStart,
@@ -2467,6 +2524,8 @@ function ReadyScreen({
   lenses: MediaDeviceInfo[];
   currentLensId: string | null;
   onSwitchLens: (deviceId: string) => void;
+  corners: Point[];
+  videoDims: VideoDims | null;
   onRecalibrate: () => void;
   onCancel: () => void;
   onStart: () => void;
@@ -2492,15 +2551,24 @@ function ReadyScreen({
         {/* Live camera */}
         {!testMode && (
           <div className="flex flex-col items-center gap-2">
-            <div className="relative aspect-[3/4] w-full max-w-[280px] overflow-hidden rounded-2xl border border-white/15 bg-black">
+            <div
+              className="relative w-full max-w-[280px] overflow-hidden rounded-2xl border border-white/15 bg-black"
+              style={
+                videoDims
+                  ? { aspectRatio: `${videoDims.w}/${videoDims.h}` }
+                  : { aspectRatio: "3/4" }
+              }
+            >
               <video
                 ref={onPreviewRef}
                 muted
                 playsInline
                 autoPlay
-                className="absolute inset-0 h-full w-full object-cover"
+                className="absolute inset-0 h-full w-full object-contain"
               />
-              <div className="pointer-events-none absolute inset-0 ring-1 ring-inset ring-emerald-400/30" />
+              {corners.length === 4 && videoDims && (
+                <CornerOverlaySvg corners={corners} videoDims={videoDims} />
+              )}
             </div>
             {lenses.length > 1 && (
               <div className="flex items-center gap-1 rounded-full border border-white/15 bg-black/70 px-1 py-1 text-[11px] font-medium text-zinc-100">
@@ -2529,62 +2597,52 @@ function ReadyScreen({
         )}
 
         {/* Rectified preview + checks */}
-        <div className="flex flex-col gap-3 rounded-2xl border border-white/5 bg-white/5 p-3">
-          <div className="flex items-start gap-3">
-            <div className="relative aspect-square w-28 shrink-0 overflow-hidden rounded-lg border border-white/10 bg-black">
-              {check?.rectifiedUrl ? (
-                // eslint-disable-next-line @next/next/no-img-element
-                <img
-                  src={check.rectifiedUrl}
-                  alt="Rectified board"
-                  className="absolute inset-0 h-full w-full object-cover"
-                />
-              ) : (
-                <div className="flex h-full w-full items-center justify-center text-[10px] uppercase tracking-widest text-zinc-500">
-                  Reading…
-                </div>
-              )}
-            </div>
-            <div className="flex flex-1 flex-col gap-1.5 text-[12px]">
-              <CheckRow
-                ok={check?.boardInFrame === true}
-                label="Board fully in frame"
-                detail={
-                  check
-                    ? null
-                    : "Aiming the lens at the board — edges still being found."
-                }
+        <div className="flex items-start gap-3 rounded-2xl border border-white/5 bg-white/5 p-3">
+          <div className="relative aspect-square w-28 shrink-0 overflow-hidden rounded-lg border border-white/10 bg-black">
+            {check?.rectifiedUrl ? (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img
+                src={check.rectifiedUrl}
+                alt="Rectified board"
+                className="absolute inset-0 h-full w-full object-cover"
               />
-              <CheckRow
-                ok={check?.piecesAllDetected === true}
-                label="All 32 pieces detected"
-                detail={
-                  check
-                    ? check.piecesAllDetected
-                      ? `16 white · 16 black · 32 empty squares`
-                      : `Saw ${check.pieceCount.white}W · ${check.pieceCount.black}B · ${check.pieceCount.empty} empty. Make sure every piece is upright and visible.`
-                    : null
-                }
-              />
-              <CheckRow
-                ok={check?.startingPositionOk === true}
-                label="Pieces in starting position"
-                detail={
-                  check
-                    ? check.startingPositionOk
-                      ? null
-                      : `${check.startingPositionMatch}/64 squares match the standard layout. If the board is set up correctly, try Re-detect to recalibrate from this angle.`
-                    : null
-                }
-              />
-            </div>
+            ) : (
+              <div className="flex h-full w-full items-center justify-center text-[10px] uppercase tracking-widest text-zinc-500">
+                Reading…
+              </div>
+            )}
           </div>
-          <p className="text-[11px] leading-snug text-zinc-400">
-            We&apos;re confirming the camera can see the whole board, all 32
-            pieces are visible, and they&apos;re in the standard starting
-            position. This also learns your board&apos;s colours so move
-            detection is reliable for this lighting and piece set.
-          </p>
+          <div className="flex flex-1 flex-col gap-1.5 text-[12px]">
+            <CheckRow
+              ok={check?.boardInFrame === true}
+              label="Board fully in frame"
+              detail={
+                check
+                  ? null
+                  : "Aiming the lens at the board — edges still being found."
+              }
+            />
+            <CheckRow
+              ok={check?.piecesAllDetected === true}
+              label="All 32 pieces detected"
+              detail={
+                check
+                  ? check.piecesAllDetected
+                    ? null
+                    : `${check.pieceCount.white}W · ${check.pieceCount.black}B · ${check.pieceCount.empty} empty`
+                  : null
+              }
+            />
+            <CheckRow
+              ok={check?.startingPositionOk === true}
+              label="Pieces in starting position"
+              detail={
+                check && !check.startingPositionOk
+                  ? `${check.startingPositionMatch}/64 squares match`
+                  : null
+              }
+            />
+          </div>
         </div>
 
         <div className="flex flex-col gap-2">
