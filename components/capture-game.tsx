@@ -66,7 +66,24 @@ import {
 } from "@/lib/board-detection";
 
 type Side = "white" | "black";
-type Phase = "settings" | "calibrating" | "playing" | "paused" | "ended";
+type Phase =
+  | "settings"
+  | "calibrating"
+  | "ready"
+  | "playing"
+  | "paused"
+  | "ended";
+
+type BoardCheck = {
+  rectifiedUrl: string;
+  cornersFound: boolean;
+  whiteAtBottom: boolean;
+  orientationScore: number;
+  pieceCount: { white: number; black: number; empty: number };
+  startingPositionMatch: number;
+  startingPositionOk: boolean;
+  allClear: boolean;
+};
 
 type TimeControl = { baseSeconds: number; incrementSeconds: number };
 
@@ -125,6 +142,52 @@ const VLM_PROVIDER_COST_HINT: Record<VlmProvider, string> = {
 };
 const RECTIFIED_SIZE = 384;
 
+/**
+ * Classify a lens label as the 0.5× ultra-wide, the 1× wide, or
+ * something we don't want to expose to the user (telephoto, composite,
+ * front-facing). Composite cameras like "Back Dual Camera" / "Back
+ * Triple Camera" auto-switch lenses behind the scenes — they look like
+ * 1× at rest but the user can't reason about them, so we hide them.
+ */
+type LensTier = "ultraWide" | "wide" | "skip";
+function labelLensTier(label: string): LensTier {
+  const l = label.toLowerCase();
+  if (/\bfront\b|truedepth|user[-\s]facing|selfie/.test(l)) return "skip";
+  if (/dual|triple|composite/.test(l)) return "skip";
+  if (/tele/.test(l)) return "skip";
+  if (/ultra.?wide|0\.5\s*x|0\.5×/.test(l)) return "ultraWide";
+  if (/wide|back|environment|rear/.test(l)) return "wide";
+  return "skip";
+}
+
+/**
+ * From the raw enumerateDevices() list, return at most one
+ * representative for each physical back lens we care about (0.5×, 1×),
+ * in that order. Anything Safari/Chrome doesn't label (empty label) is
+ * surfaced as the implicit 1× — better than hiding everything when
+ * labels aren't ready yet.
+ */
+function pickBackLenses(devices: MediaDeviceInfo[]): MediaDeviceInfo[] {
+  const cams = devices.filter((d) => d.kind === "videoinput");
+  let ultraWide: MediaDeviceInfo | null = null;
+  let wide: MediaDeviceInfo | null = null;
+  for (const cam of cams) {
+    const tier = labelLensTier(cam.label);
+    if (tier === "ultraWide" && !ultraWide) ultraWide = cam;
+    else if (tier === "wide" && !wide) wide = cam;
+  }
+  // Fallback: no labelled wide lens but we have unlabelled cameras —
+  // expose the first one as 1× so the picker isn't empty.
+  if (!wide) {
+    const unlabelled = cams.find((c) => !c.label.trim());
+    if (unlabelled) wide = unlabelled;
+  }
+  const out: MediaDeviceInfo[] = [];
+  if (ultraWide) out.push(ultraWide);
+  if (wide) out.push(wide);
+  return out;
+}
+
 export function CaptureGame() {
   const [phase, setPhase] = useState<Phase>("settings");
   const [tc, setTc] = useState<TimeControl>(DEFAULT_TC);
@@ -146,6 +209,7 @@ export function CaptureGame() {
   const [corners, setCorners] = useState<Point[]>([]);
   const cornersRef = useRef<Point[]>([]);
   const [videoDims, setVideoDims] = useState<VideoDims | null>(null);
+  const [boardCheck, setBoardCheck] = useState<BoardCheck | null>(null);
 
   const [testMode, setTestMode] = useState(false);
   const [testFrames, setTestFrames] = useState<HTMLImageElement[]>([]);
@@ -371,17 +435,21 @@ export function CaptureGame() {
         let stream = await acquireStream(preferredDeviceId);
 
         // After permission is granted, enumerateDevices() returns labelled
-        // entries. Prefer a back-camera with "ultra wide" / "0.5×" in its
-        // label so the player captures more of the board.
+        // entries. iOS exposes ~8 video inputs on a modern iPhone (front,
+        // back, plus per-lens variants and composite "dual"/"triple"
+        // cameras). We only surface two: the physical 0.5× ultra-wide
+        // back lens and the 1× wide back lens. Anything else (front,
+        // telephoto, composites) gets dropped — they don't help framing
+        // a chess board.
         let chosenId: string | null =
           stream.getVideoTracks()[0]?.getSettings().deviceId ?? null;
         let lenses: MediaDeviceInfo[] = [];
         try {
           const devices = await navigator.mediaDevices.enumerateDevices();
-          lenses = devices.filter((d) => d.kind === "videoinput");
+          lenses = pickBackLenses(devices);
           if (!preferredDeviceId) {
-            const ultra = lenses.find((d) =>
-              /ultra.?wide|0\.5\s*x|0\.5×/i.test(d.label),
+            const ultra = lenses.find(
+              (l) => labelLensTier(l.label) === "ultraWide",
             );
             if (ultra && ultra.deviceId && ultra.deviceId !== chosenId) {
               stream.getTracks().forEach((t) => t.stop());
@@ -843,10 +911,88 @@ export function CaptureGame() {
 
   useEffect(() => {
     if (phase !== "calibrating" || corners.length !== 4 || busy) return;
-    const t = window.setTimeout(() => startPlayingFromCalibration(), 300);
+    // Old behaviour: jump straight into "playing" once corners were found.
+    // That meant a misoriented or mis-cropped board still started the
+    // clock. Now we transition to "ready", where the player can verify
+    // the rectified board and start the game manually.
+    const t = window.setTimeout(() => setPhase("ready"), 200);
     return () => window.clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [phase, corners.length, busy]);
+
+  /**
+   * Live verification loop. Once corners are detected and we're in
+   * "ready", re-classify the current frame every ~600 ms so the player
+   * can see piece-count + orientation checks update as they nudge the
+   * phone. Only when all three pass do we let them tap Start Game.
+   */
+  useEffect(() => {
+    if (phase !== "ready") return;
+    let cancelled = false;
+    let timer: number | null = null;
+    const runCheck = () => {
+      if (cancelled) return;
+      const source = previewSource();
+      const cs = cornersRef.current;
+      if (!source || cs.length !== 4) {
+        timer = window.setTimeout(runCheck, 400);
+        return;
+      }
+      try {
+        const warped = warpBoard(
+          source,
+          cs as [Point, Point, Point, Point],
+          RECTIFIED_SIZE,
+        );
+        const crops = extractSquareCrops(warped);
+        const occ = classifyBoard(crops).map((c) => c.state);
+        let white = 0;
+        let black = 0;
+        let empty = 0;
+        for (const s of occ) {
+          if (s === "white") white++;
+          else if (s === "black") black++;
+          else empty++;
+        }
+        const orientationScore = scorePlayingOrientation(occ);
+        const whiteAtBottom = orientationScore >= 20;
+        // Cells 0..15 = ranks 8,7 (black); 16..47 = ranks 6..3 (empty);
+        // 48..63 = ranks 2,1 (white).
+        let startingPositionMatch = 0;
+        for (let i = 0; i < 64; i++) {
+          const expected: "black" | "empty" | "white" =
+            i < 16 ? "black" : i < 48 ? "empty" : "white";
+          if (occ[i] === expected) startingPositionMatch++;
+        }
+        const pieceCountOk = white === 16 && black === 16 && empty === 32;
+        const startingPositionOk = startingPositionMatch >= 58;
+        const next: BoardCheck = {
+          rectifiedUrl: warped.toDataURL("image/jpeg", 0.82),
+          cornersFound: true,
+          whiteAtBottom,
+          orientationScore,
+          pieceCount: { white, black, empty },
+          startingPositionMatch,
+          startingPositionOk,
+          allClear: whiteAtBottom && pieceCountOk && startingPositionOk,
+        };
+        if (!cancelled) setBoardCheck(next);
+      } catch {
+        /* keep last check on failure */
+      }
+      if (!cancelled) timer = window.setTimeout(runCheck, 600);
+    };
+    runCheck();
+    return () => {
+      cancelled = true;
+      if (timer !== null) window.clearTimeout(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phase]);
+
+  useEffect(() => {
+    if (phase !== "ready") setBoardCheck(null);
+  }, [phase]);
 
   useEffect(() => {
     if (!testMode) return;
@@ -1574,6 +1720,24 @@ export function CaptureGame() {
         </div>
       )}
 
+      {phase === "ready" && (
+        <ReadyScreen
+          check={boardCheck}
+          testMode={testMode}
+          onPreviewRef={attachPreviewVideo}
+          lenses={availableLenses}
+          currentLensId={currentLensId}
+          onSwitchLens={switchLens}
+          onRecalibrate={() => {
+            setCorners([]);
+            setBoardCheck(null);
+            setPhase("calibrating");
+          }}
+          onCancel={backToSettings}
+          onStart={startPlayingFromCalibration}
+        />
+      )}
+
       {phase === "ended" && (
         <EndScreen
           winner={winner}
@@ -2190,18 +2354,10 @@ function CameraPreviewOverlay({
   const sizeCls = isCalibrating
     ? "h-[40vh] max-h-[320px] w-[78vw] max-w-[260px]"
     : "h-24 w-20";
-  // iPhone exposes lenses with labels like "Back Ultra Wide Camera",
-  // "Back Camera", "Back Telephoto Camera". Map those to "0.5×" / "1×"
-  // / "2×" so the toggle reads naturally; otherwise show the deviceId
-  // suffix.
-  const lensLabel = (label: string, idx: number): string => {
-    const l = label.toLowerCase();
-    if (/ultra.?wide|0\.5/.test(l)) return "0.5×";
-    if (/tele/.test(l)) return "2×";
-    if (/wide|back camera|environment/.test(l) || /\bback\b/.test(l))
-      return "1×";
-    return `Cam ${idx + 1}`;
-  };
+  // `lenses` has already been filtered down to one ultra-wide + one
+  // wide back camera. Map each to its tier label.
+  const lensLabel = (label: string): string =>
+    labelLensTier(label) === "ultraWide" ? "0.5×" : "1×";
   return (
     <div className="pointer-events-none absolute left-1/2 top-3 z-40 -translate-x-1/2">
       <div className="flex flex-col items-center gap-1.5">
@@ -2225,7 +2381,7 @@ function CameraPreviewOverlay({
         {lenses.length > 1 && (
           <div className="pointer-events-auto flex items-center gap-1 rounded-full border border-white/15 bg-black/70 px-1 py-1 text-[10px] font-medium text-zinc-100 backdrop-blur-md">
             {lenses.map((l, i) => {
-              const label = lensLabel(l.label, i);
+              const label = lensLabel(l.label);
               const selected = l.deviceId === currentLensId;
               return (
                 <button
@@ -2244,6 +2400,226 @@ function CameraPreviewOverlay({
               );
             })}
           </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Pre-game verification screen. The auto-detector has produced four
+ * corners; before we start the clock, show the player:
+ *  - the live camera (so they can re-aim if framing is wrong),
+ *  - the rectified board (so they can confirm orientation),
+ *  - a checklist of automated checks (orientation, piece count, starting
+ *    position match).
+ *
+ * The "Start game" button is only enabled when all three checks pass.
+ * A secondary "Start anyway" path is offered when a check fails, since
+ * the classifier isn't perfect and the player may know better than the
+ * pipeline.
+ */
+function ReadyScreen({
+  check,
+  testMode,
+  onPreviewRef,
+  lenses,
+  currentLensId,
+  onSwitchLens,
+  onRecalibrate,
+  onCancel,
+  onStart,
+}: {
+  check: BoardCheck | null;
+  testMode: boolean;
+  onPreviewRef: (el: HTMLVideoElement | null) => void;
+  lenses: MediaDeviceInfo[];
+  currentLensId: string | null;
+  onSwitchLens: (deviceId: string) => void;
+  onRecalibrate: () => void;
+  onCancel: () => void;
+  onStart: () => void;
+}) {
+  const lensLabel = (label: string): string =>
+    labelLensTier(label) === "ultraWide" ? "0.5×" : "1×";
+  return (
+    <div className="absolute inset-0 z-40 flex flex-col overflow-y-auto bg-zinc-950 text-zinc-100">
+      <div className="flex shrink-0 items-center justify-between px-5 pb-2 pt-5">
+        <button
+          onClick={onCancel}
+          className="rounded-full bg-white/5 px-3 py-1 text-[11px] uppercase tracking-widest text-zinc-300 hover:bg-white/10"
+        >
+          Cancel
+        </button>
+        <div className="text-[10px] font-semibold uppercase tracking-[0.32em] text-emerald-300">
+          Confirm setup
+        </div>
+        <div className="w-[68px]" aria-hidden />
+      </div>
+
+      <div className="flex flex-1 flex-col gap-4 px-5 pb-6 pt-2">
+        {/* Live camera */}
+        {!testMode && (
+          <div className="flex flex-col items-center gap-2">
+            <div className="relative aspect-[3/4] w-full max-w-[280px] overflow-hidden rounded-2xl border border-white/15 bg-black">
+              <video
+                ref={onPreviewRef}
+                muted
+                playsInline
+                autoPlay
+                className="absolute inset-0 h-full w-full object-cover"
+              />
+              <div className="pointer-events-none absolute inset-0 ring-1 ring-inset ring-emerald-400/30" />
+            </div>
+            {lenses.length > 1 && (
+              <div className="flex items-center gap-1 rounded-full border border-white/15 bg-black/70 px-1 py-1 text-[11px] font-medium text-zinc-100">
+                {lenses.map((l, i) => {
+                  const label = lensLabel(l.label);
+                  const selected = l.deviceId === currentLensId;
+                  return (
+                    <button
+                      key={l.deviceId || `lens-${i}`}
+                      type="button"
+                      onClick={() => onSwitchLens(l.deviceId)}
+                      className={clsx(
+                        "rounded-full px-3 py-0.5 transition",
+                        selected
+                          ? "bg-white text-black"
+                          : "text-zinc-200 hover:bg-white/10",
+                      )}
+                    >
+                      {label}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Rectified preview + checks */}
+        <div className="flex flex-col gap-3 rounded-2xl border border-white/5 bg-white/5 p-3">
+          <div className="flex items-start gap-3">
+            <div className="relative aspect-square w-28 shrink-0 overflow-hidden rounded-lg border border-white/10 bg-black">
+              {check?.rectifiedUrl ? (
+                // eslint-disable-next-line @next/next/no-img-element
+                <img
+                  src={check.rectifiedUrl}
+                  alt="Rectified board"
+                  className="absolute inset-0 h-full w-full object-cover"
+                />
+              ) : (
+                <div className="flex h-full w-full items-center justify-center text-[10px] uppercase tracking-widest text-zinc-500">
+                  Reading…
+                </div>
+              )}
+            </div>
+            <div className="flex flex-1 flex-col gap-1.5 text-[12px]">
+              <CheckRow
+                ok={check?.cornersFound === true}
+                label="Board edges detected"
+                detail={
+                  check
+                    ? null
+                    : "Aiming the lens at the board, edges still being found."
+                }
+              />
+              <CheckRow
+                ok={check?.whiteAtBottom === true}
+                label="White pieces on bottom"
+                detail={
+                  check && !check.whiteAtBottom
+                    ? "Rotate the board or recalibrate to match expected orientation."
+                    : null
+                }
+              />
+              <CheckRow
+                ok={check?.startingPositionOk === true}
+                label="Starting position"
+                detail={
+                  check
+                    ? `${check.pieceCount.white}W · ${check.pieceCount.black}B · ${check.pieceCount.empty} empty${
+                        check.startingPositionOk
+                          ? ""
+                          : ` (${check.startingPositionMatch}/64 squares match)`
+                      }`
+                    : null
+                }
+              />
+            </div>
+          </div>
+        </div>
+
+        <div className="flex flex-col gap-2">
+          <button
+            onClick={onStart}
+            disabled={!check?.allClear}
+            className={clsx(
+              "rounded-2xl px-4 py-3.5 text-base font-semibold transition",
+              check?.allClear
+                ? "bg-emerald-500/95 text-emerald-950 shadow-lg shadow-emerald-500/15 hover:bg-emerald-400"
+                : "bg-zinc-800 text-zinc-500",
+            )}
+          >
+            Start game
+          </button>
+          {check && !check.allClear && (
+            <button
+              onClick={onStart}
+              className="rounded-2xl border border-amber-400/30 bg-amber-500/10 px-4 py-2.5 text-[13px] font-medium text-amber-100 hover:bg-amber-500/20"
+            >
+              Start anyway — checks not passing
+            </button>
+          )}
+          <button
+            onClick={onRecalibrate}
+            className="rounded-2xl border border-white/10 bg-white/5 px-4 py-2.5 text-[13px] font-medium text-zinc-200 hover:bg-white/10"
+          >
+            Re-detect board
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function CheckRow({
+  ok,
+  label,
+  detail,
+}: {
+  ok: boolean;
+  label: string;
+  detail: string | null;
+}) {
+  return (
+    <div className="flex items-start gap-2">
+      <span
+        className={clsx(
+          "mt-[3px] flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded-full",
+          ok ? "bg-emerald-500/90 text-emerald-950" : "bg-zinc-700 text-zinc-300",
+        )}
+        aria-hidden
+      >
+        {ok ? (
+          <svg viewBox="0 0 12 12" className="h-2.5 w-2.5" fill="currentColor">
+            <path d="M4.5 8.4 2.1 6l-.7.7 3.1 3.1 6-6-.7-.7Z" />
+          </svg>
+        ) : (
+          <span className="h-1 w-1 rounded-full bg-current" />
+        )}
+      </span>
+      <div className="min-w-0">
+        <div
+          className={clsx(
+            "font-medium",
+            ok ? "text-zinc-100" : "text-zinc-300",
+          )}
+        >
+          {label}
+        </div>
+        {detail && (
+          <div className="text-[11px] leading-snug text-zinc-400">{detail}</div>
         )}
       </div>
     </div>
