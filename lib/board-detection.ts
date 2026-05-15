@@ -106,6 +106,96 @@ export function autoDetectBoardCornersLegacy(
   };
 }
 
+/**
+ * Async fetcher that returns the chessboard's bbox in original-image
+ * pixel coords, or null if no bbox can be obtained. Injected by callers
+ * so the detector stays test-friendly and doesn't import the worker
+ * client directly.
+ */
+export type ChessboardBboxFetcher = (
+  image: HTMLCanvasElement,
+) => Promise<{ x1: number; y1: number; x2: number; y2: number } | null>;
+
+/**
+ * Detect playing-surface corners using Florence-2 as a calibration aid.
+ *
+ * Steps:
+ *   1. Ask Florence-2 (via the supplied fetcher) for a bbox of the
+ *      chessboard in the original image.
+ *   2. Crop the image to that bbox onto an off-screen canvas.
+ *   3. Run the existing `autoDetectBoardCorners` inside the clean crop —
+ *      table, lamp, hands, and background are now outside the frame.
+ *   4. Translate the corners back to original-image pixel coords.
+ *
+ * Always falls back to the no-Florence detector if any step fails — so
+ * this strictly dominates the original entry point. The bbox itself is
+ * used only as a localiser; the precise 4-corner geometry still comes
+ * from the existing CV pipeline (now running on a much easier input).
+ */
+export async function detectBoardCornersViaFlorence(
+  source: HTMLImageElement | HTMLCanvasElement,
+  fetchBbox: ChessboardBboxFetcher,
+): Promise<DetectionResult | null> {
+  const fullCanvas = sourceToCanvas(source);
+  if (!fullCanvas) return autoDetectBoardCorners(source);
+
+  let bbox: { x1: number; y1: number; x2: number; y2: number } | null = null;
+  try {
+    bbox = await fetchBbox(fullCanvas);
+  } catch {
+    bbox = null;
+  }
+  if (!bbox) return autoDetectBoardCorners(source);
+
+  // Clamp + pad slightly so the crop never excludes the playing surface
+  // when Florence's bbox lands a pixel or two inside it.
+  const pad = Math.max(4, Math.round(fullCanvas.width * 0.005));
+  const cx1 = Math.max(0, Math.floor(bbox.x1 - pad));
+  const cy1 = Math.max(0, Math.floor(bbox.y1 - pad));
+  const cx2 = Math.min(fullCanvas.width, Math.ceil(bbox.x2 + pad));
+  const cy2 = Math.min(fullCanvas.height, Math.ceil(bbox.y2 + pad));
+  const cw = cx2 - cx1;
+  const ch = cy2 - cy1;
+  if (cw < 50 || ch < 50) return autoDetectBoardCorners(source);
+
+  const cropCanvas = document.createElement("canvas");
+  cropCanvas.width = cw;
+  cropCanvas.height = ch;
+  const cropCtx = cropCanvas.getContext("2d");
+  if (!cropCtx) return autoDetectBoardCorners(source);
+  cropCtx.drawImage(fullCanvas, cx1, cy1, cw, ch, 0, 0, cw, ch);
+
+  const inner = autoDetectBoardCorners(cropCanvas);
+  if (!inner) return autoDetectBoardCorners(source);
+
+  return {
+    corners: [
+      { x: inner.corners[0].x + cx1, y: inner.corners[0].y + cy1 },
+      { x: inner.corners[1].x + cx1, y: inner.corners[1].y + cy1 },
+      { x: inner.corners[2].x + cx1, y: inner.corners[2].y + cy1 },
+      { x: inner.corners[3].x + cx1, y: inner.corners[3].y + cy1 },
+    ],
+    confidence: inner.confidence,
+    oriented: inner.oriented,
+  };
+}
+
+function sourceToCanvas(
+  source: HTMLImageElement | HTMLCanvasElement,
+): HTMLCanvasElement | null {
+  if (source instanceof HTMLCanvasElement) return source;
+  const w = source.naturalWidth;
+  const h = source.naturalHeight;
+  if (!w || !h) return null;
+  const c = document.createElement("canvas");
+  c.width = w;
+  c.height = h;
+  const ctx = c.getContext("2d");
+  if (!ctx) return null;
+  ctx.drawImage(source, 0, 0);
+  return c;
+}
+
 function expandQuad(
   corners: [Point, Point, Point, Point],
   scale: number,

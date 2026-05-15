@@ -71,13 +71,31 @@ function makeProxyCornerDetector(): CornerDetector | null {
   if (VLM_PROXY_PROVIDER !== "anthropic") return null;
   return makeAnthropicProxyCornerDetector(VLM_PROXY_URL);
 }
+
+/**
+ * Florence-2 bbox fetcher. When the proxy is configured we prefer this
+ * over the Anthropic corner detector — it's 10x faster (~300 ms vs ~3 s),
+ * ~30x cheaper ($0.0003 vs $0.01), and produced bit-stable bboxes across
+ * all 15 Test_Photos. We use it as the playing-surface localiser, then
+ * run the existing CV grid-fit inside its crop to recover precise 4
+ * corners.
+ */
+const FLORENCE_BBOX_FETCHER: ChessboardBboxFetcher | null = VLM_PROXY_URL
+  ? async (canvas) => {
+      const r = await getChessboardBbox(canvas, VLM_PROXY_URL);
+      return r.kind === "detected" ? r.bbox : null;
+    }
+  : null;
 import { inferMoveFuzzy } from "@/lib/move-inference";
 import {
   autoDetectBoardCorners,
+  detectBoardCornersViaFlorence,
   refineCornersForFrame,
   rotateCorners,
   scorePlayingOrientation,
+  type ChessboardBboxFetcher,
 } from "@/lib/board-detection";
+import { getChessboardBbox } from "@/lib/florence";
 
 type Side = "white" | "black";
 type Phase =
@@ -948,6 +966,80 @@ export function CaptureGame() {
     phaseRef.current = phase;
   }, [phase]);
 
+  /**
+   * Florence-2 calibration path — primary when the proxy is configured.
+   *
+   * Calls `detectBoardCornersViaFlorence` which (a) gets Florence's
+   * playing-surface bbox, (b) crops the source to that bbox, (c) runs the
+   * existing CV grid-fit inside the clean crop, and (d) translates the
+   * resulting corners back to original-image pixel space. The CV step
+   * succeeds in this orchestration because the noisy background (table,
+   * lamp, hands) is no longer in frame.
+   *
+   * The orientation prior inside `autoDetectBoardCorners` only knows about
+   * the canonical starting layout, so after Florence's call we still scan
+   * the four rotations and pick the one whose rectified board best matches
+   * a starting-position-shaped occupancy distribution — same validator as
+   * `tryAutoCalibrate`.
+   */
+  const tryFlorenceCalibrate = useCallback(async () => {
+    if (!FLORENCE_BBOX_FETCHER) return;
+    if (vlmDetectingRef.current) return; // already in flight
+    const source = previewSource();
+    if (!source) return;
+    if (source instanceof HTMLImageElement && !source.naturalWidth) return;
+    if (source instanceof HTMLCanvasElement && (!source.width || !source.height)) return;
+
+    vlmDetectingRef.current = true;
+    setVlmDetecting(true);
+    try {
+      const detection = await detectBoardCornersViaFlorence(
+        source,
+        FLORENCE_BBOX_FETCHER,
+      );
+      if (!detection) {
+        setVlmStatus({ kind: "error", reason: "no corners (florence+cv)" });
+        return;
+      }
+      const live =
+        phaseRef.current === "calibrating" || phaseRef.current === "ready";
+      if (!live) return;
+
+      // Pick the rotation whose rectified board most resembles a real chess
+      // setup (heuristic in `scorePlayingOrientation`). Same validator the
+      // CV-only path uses.
+      let bestScore = -Infinity;
+      let bestCorners = detection.corners;
+      for (let k = 0; k < 4; k++) {
+        const rotated = rotateCorners(detection.corners, k);
+        try {
+          const warped = warpBoard(source, rotated, 256);
+          const crops = extractSquareCrops(warped);
+          const occ = classifyBoard(crops).map((c) => c.state);
+          const score = scorePlayingOrientation(occ);
+          if (score > bestScore) {
+            bestScore = score;
+            bestCorners = rotated;
+          }
+        } catch {
+          /* skip invalid rotation */
+        }
+      }
+
+      setCorners(bestCorners);
+      setVlmStatus({ kind: "ok", at: Date.now() });
+    } catch (e) {
+      setVlmStatus({
+        kind: "error",
+        reason: e instanceof Error ? e.message : String(e),
+      });
+    } finally {
+      vlmDetectingRef.current = false;
+      setVlmDetecting(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const tryVlmCalibrate = useCallback(async () => {
     const detector = cornerDetectorRef.current;
     if (!detector) return;
@@ -1008,14 +1100,22 @@ export function CaptureGame() {
   // the delay lets the camera stabilise (autofocus, exposure) before we
   // grab a frame to send. Re-detect from the ready screen also triggers
   // this via the calibrating-phase transition.
+  //
+  // Provider preference: Florence-2 if the proxy is configured (faster,
+  // cheaper, more reliable), Anthropic Sonnet otherwise.
   useEffect(() => {
     if (phase !== "calibrating") return;
     if (tapMode) return; // user is placing corners by tap — skip AI
-    if (!cornerDetectorRef.current) return;
+    const useFlorence = !!FLORENCE_BBOX_FETCHER;
+    const useAnthropic = !useFlorence && !!cornerDetectorRef.current;
+    if (!useFlorence && !useAnthropic) return;
     setVlmStatus({ kind: "idle" });
-    const t = window.setTimeout(() => void tryVlmCalibrate(), 700);
+    const t = window.setTimeout(
+      () => void (useFlorence ? tryFlorenceCalibrate() : tryVlmCalibrate()),
+      700,
+    );
     return () => window.clearTimeout(t);
-  }, [phase, tapMode, tryVlmCalibrate]);
+  }, [phase, tapMode, tryFlorenceCalibrate, tryVlmCalibrate]);
 
   useEffect(() => {
     if (phase !== "calibrating" || corners.length === 4) return;
@@ -1897,7 +1997,7 @@ export function CaptureGame() {
                 setCorners([]);
                 setTapMode(false);
               }}
-              hasAiDetector={cornerDetectorRef.current !== null}
+              hasAiDetector={!!FLORENCE_BBOX_FETCHER || cornerDetectorRef.current !== null}
             />
           )}
           {phase === "calibrating" && !tapMode && (
@@ -1905,7 +2005,7 @@ export function CaptureGame() {
               testMode={testMode}
               cameraError={cameraError}
               vlmDetecting={vlmDetecting}
-              hasAiDetector={cornerDetectorRef.current !== null}
+              hasAiDetector={!!FLORENCE_BBOX_FETCHER || cornerDetectorRef.current !== null}
               onTapManually={() => {
                 setCorners([]);
                 setVlmStatus({ kind: "idle" });
@@ -1937,8 +2037,12 @@ export function CaptureGame() {
           }
           vlmDetecting={vlmDetecting}
           vlmStatus={vlmStatus}
-          hasAiDetector={cornerDetectorRef.current !== null}
-          onRetryAi={() => void tryVlmCalibrate()}
+          hasAiDetector={!!FLORENCE_BBOX_FETCHER || cornerDetectorRef.current !== null}
+          onRetryAi={() =>
+            void (FLORENCE_BBOX_FETCHER
+              ? tryFlorenceCalibrate()
+              : tryVlmCalibrate())
+          }
           onRecalibrate={() => {
             setCorners([]);
             setBoardCheck(null);

@@ -31,6 +31,9 @@ yarn-error.log*
 # detection test harness outputs
 /scripts/detection-test/out/
 /scripts/detection-test/debug-out/
+/scripts/detection-test/sam2/
+/scripts/detection-test/florence2/
+/scripts/detection-test/florence2-all/
 
 # user-provided test photos (private game shots, large)
 /test_photos/

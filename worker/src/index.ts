@@ -24,6 +24,8 @@ export interface Env {
   OPENAI_API_KEY?: string;
   /** Set to enable the /gemini endpoint (Google AI Studio key). */
   GEMINI_API_KEY?: string;
+  /** Set to enable the /replicate/sam2 endpoint. */
+  REPLICATE_API_TOKEN?: string;
   /** Comma-separated list of allowed origins. */
   ALLOWED_ORIGINS?: string;
   /** Optional shared secret. If set, requests must include
@@ -36,6 +38,22 @@ const OPENAI_URL = "https://api.openai.com/v1/chat/completions";
 // Gemini path is per-model; we let the client send the body intact and
 // just attach ?key=… server-side. The frontend POSTs to /gemini?model=…
 const GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
+// Replicate's "run latest version of a model" endpoint. We use synchronous
+// mode (Prefer: wait) so the worker returns the final prediction in one
+// hop — fine for SAM-2 image runs that finish in seconds.
+const REPLICATE_PREDICTIONS_URL =
+  "https://api.replicate.com/v1/predictions";
+// Version hash pinned so the worker's output shape is stable. Bump this
+// when Meta ships a new SAM-2 image build and we want to opt in.
+const SAM2_VERSION =
+  "fe97b453a6455861e3bac769b441ca1f1086110da7466dbb65cf1eecfd60dc83";
+// Florence-2 large is kept warm on Replicate (~300ms inference). Used for
+// one-shot chessboard localisation at calibration time. Bump after
+// re-fetching via:
+//   curl -s https://api.replicate.com/v1/models/lucataco/florence-2-large \
+//     -H "Authorization: Bearer $TOKEN" | jq -r .latest_version.id
+const FLORENCE2_VERSION =
+  "da53547e17d45b9cfb48174b2f18af8b83ca020fa76db62136bf9c6616762595";
 
 function parseAllowedOrigins(env: Env): string[] {
   if (!env.ALLOWED_ORIGINS) return [];
@@ -73,7 +91,10 @@ export default {
     const isVerify = url.pathname === "/verify" && req.method === "POST";
     const isOpenAi = url.pathname === "/openai" && req.method === "POST";
     const isGemini = url.pathname === "/gemini" && req.method === "POST";
-    if (!isVerify && !isOpenAi && !isGemini) {
+    const isSam2 = url.pathname === "/replicate/sam2" && req.method === "POST";
+    const isFlorence2 =
+      url.pathname === "/replicate/florence2" && req.method === "POST";
+    if (!isVerify && !isOpenAi && !isGemini && !isSam2 && !isFlorence2) {
       return new Response("Not found", { status: 404, headers: baseCors });
     }
     if (isOpenAi && !env.OPENAI_API_KEY) {
@@ -84,6 +105,12 @@ export default {
     }
     if (isGemini && !env.GEMINI_API_KEY) {
       return new Response("Gemini not configured on this worker", {
+        status: 501,
+        headers: baseCors,
+      });
+    }
+    if ((isSam2 || isFlorence2) && !env.REPLICATE_API_TOKEN) {
+      return new Response("Replicate not configured on this worker", {
         status: 501,
         headers: baseCors,
       });
@@ -134,7 +161,7 @@ export default {
         },
         body,
       });
-    } else {
+    } else if (isGemini) {
       // Gemini: model is selected via ?model=... query param so we don't
       // need to parse the body to route. Default to gemini-2.5-pro.
       const model = url.searchParams.get("model") ?? "gemini-2.5-pro";
@@ -143,6 +170,29 @@ export default {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body,
+      });
+    } else {
+      // Both Replicate routes share the same shape: client sends
+      //   { input: { image, ... } }
+      // we attach a pinned version hash for the chosen model and ask
+      // Replicate to block until the prediction finishes (Prefer: wait)
+      // so the worker returns the final prediction in one round-trip.
+      const clientBody = JSON.parse(body) as { input?: unknown };
+      if (!clientBody.input) {
+        return new Response('Missing "input" field', {
+          status: 400,
+          headers: baseCors,
+        });
+      }
+      const version = isSam2 ? SAM2_VERSION : FLORENCE2_VERSION;
+      upstream = await fetch(REPLICATE_PREDICTIONS_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${env.REPLICATE_API_TOKEN}`,
+          Prefer: "wait",
+        },
+        body: JSON.stringify({ version, input: clientBody.input }),
       });
     }
 
