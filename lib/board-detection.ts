@@ -1,6 +1,6 @@
-import { type Point } from "./homography";
-import { extractSquareCrops, warpBoard } from "./board-image";
-import { classifyBoard } from "./occupancy";
+import type { Point } from "./homography.ts";
+import { extractSquareCrops, warpBoard } from "./board-image.ts";
+import { classifyBoard } from "./occupancy.ts";
 
 export type DetectionResult = {
   /**
@@ -71,39 +71,27 @@ export function autoDetectBoardCorners(
 
   const detected = detectBoardViaRedness(source);
   if (!detected) return null;
+  const oriented = orientStartingPosition(source, detected.corners);
+  return {
+    corners: oriented.corners,
+    confidence: oriented.score >= 0 ? detected.confidence : 0,
+    oriented: oriented.score >= 0,
+  };
+}
 
-  // The centroid-based grid fit consistently shrinks inward when the
-  // outermost dark squares (a1/h8 etc.) are obscured by the back-rank
-  // rooks. Two compensating steps:
-  //   a) Uniform 7% expansion from the polygon centroid — a small hedge
-  //      against systematic shrink.
-  //   b) Per-edge outer-row refinement — warp the current corners,
-  //      classify each cell, and if any outer rank/file looks empty
-  //      while the next rank/file in has pieces, expand that specific
-  //      edge by ~0.8 cell widths. Repeats up to twice (handles a
-  //      "missing rank 8 + file a" double offset).
-  const cx = (detected.corners[0].x + detected.corners[2].x) / 2;
-  const cy = (detected.corners[0].y + detected.corners[2].y) / 2;
-  const EXPAND = 1.07;
-  const expanded: [Point, Point, Point, Point] = [
-    {
-      x: cx + (detected.corners[0].x - cx) * EXPAND,
-      y: cy + (detected.corners[0].y - cy) * EXPAND,
-    },
-    {
-      x: cx + (detected.corners[1].x - cx) * EXPAND,
-      y: cy + (detected.corners[1].y - cy) * EXPAND,
-    },
-    {
-      x: cx + (detected.corners[2].x - cx) * EXPAND,
-      y: cy + (detected.corners[2].y - cy) * EXPAND,
-    },
-    {
-      x: cx + (detected.corners[3].x - cx) * EXPAND,
-      y: cy + (detected.corners[3].y - cy) * EXPAND,
-    },
-  ];
+export function autoDetectBoardCornersLegacy(
+  source: HTMLImageElement | HTMLCanvasElement,
+): DetectionResult | null {
+  const w0 =
+    source instanceof HTMLImageElement ? source.naturalWidth : source.width;
+  const h0 =
+    source instanceof HTMLImageElement ? source.naturalHeight : source.height;
+  if (!w0 || !h0) return null;
 
+  const detected = detectBoardViaRedness(source);
+  if (!detected) return null;
+
+  const expanded = expandQuad(detected.corners, 1.07);
   const refined = refineCornersByOuterRows(source, expanded);
   const oriented = orientStartingPosition(source, refined);
   return {
@@ -111,6 +99,32 @@ export function autoDetectBoardCorners(
     confidence: oriented.score >= 0 ? detected.confidence : 0,
     oriented: oriented.score >= 0,
   };
+}
+
+function expandQuad(
+  corners: [Point, Point, Point, Point],
+  scale: number,
+): [Point, Point, Point, Point] {
+  const cx = (corners[0].x + corners[1].x + corners[2].x + corners[3].x) / 4;
+  const cy = (corners[0].y + corners[1].y + corners[2].y + corners[3].y) / 4;
+  return [
+    {
+      x: cx + (corners[0].x - cx) * scale,
+      y: cy + (corners[0].y - cy) * scale,
+    },
+    {
+      x: cx + (corners[1].x - cx) * scale,
+      y: cy + (corners[1].y - cy) * scale,
+    },
+    {
+      x: cx + (corners[2].x - cx) * scale,
+      y: cy + (corners[2].y - cy) * scale,
+    },
+    {
+      x: cx + (corners[3].x - cx) * scale,
+      y: cy + (corners[3].y - cy) * scale,
+    },
+  ];
 }
 
 /**

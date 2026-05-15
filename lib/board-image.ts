@@ -1,4 +1,4 @@
-import { computeHomography, type Point } from "@/lib/homography";
+import { computeHomography, type Point } from "./homography.ts";
 
 /**
  * Warp a source image into a square `size x size` rectified board.
