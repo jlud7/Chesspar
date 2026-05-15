@@ -500,28 +500,26 @@ export interface CornerDetector {
   }): Promise<CornerDetectionResult>;
 }
 
-const CORNER_DETECTION_PROMPT = `You are looking at a top-down or angled photo of a chess board.
+const CORNER_DETECTION_PROMPT = `You are looking at a chess board photo, set up in (or near) standard starting position.
 
-TASK: Identify the FOUR PHYSICAL CORNERS of the playing surface — the rectangular area that contains the 8×8 grid of alternating dark/light squares. Each corner is where two perpendicular sides of the playing surface meet (perspective may distort the angle in the image).
+TASK: Locate the FOUR ROOK PIECES on the corner squares of the back ranks. Rooks are the squat, cylindrical pieces with castle-tower tops on each side of the board's back row.
 
-CRITICAL RULES:
-1. The corner is at the OUTER EDGE of the playing surface, NOT on top of any piece. If a rook (or any piece) sits on the corner square, the corner is where the playing surface boundary continues OUTSIDE that square — not on the piece itself.
-2. Include the FULL extent of the playing surface — all 8 ranks AND all 8 files. Back-row pieces (rooks, knights, etc.) often obscure the corner dark squares; the corner is STILL at the outer corner of those occupied squares, NOT pulled inward to where you can see clean board pattern.
-3. Use the rank labels (1–8) and file labels (a–h) printed on the board edges to verify orientation if visible.
-4. Do NOT use the paper border, table edge, chess-clock body, or any background as the boundary — only the 8×8 grid of squares.
+For each rook, return the (x, y) pixel position of its CENTER (the centre of its base where it touches the board square it sits on) as fractions from 0.0 to 1.0:
+- x = 0.0 is the left edge of the image, x = 1.0 is the right edge
+- y = 0.0 is the top edge of the image, y = 1.0 is the bottom edge
 
-OUTPUT — return ONLY this JSON, no preamble, no markdown, no explanation:
+The four rooks:
+- "a8" = Black's QUEENSIDE rook (one of the two leftmost or rightmost dark pieces on the back row farther from the camera — match by colour)
+- "h8" = Black's KINGSIDE rook (the OTHER black corner piece on the back row farther from the camera)
+- "h1" = White's KINGSIDE rook (on the back row nearer the camera, on the same side as the black kingside rook)
+- "a1" = White's QUEENSIDE rook (on the back row nearer the camera, on the same side as the black queenside rook)
+
+The label assignment depends on the board's orientation in the photo — use the printed rank (1–8) and file (a–h) labels on the board edges if visible. If the photo is tilted or rotated, find the labels first and map a1/a8/h1/h8 accordingly.
+
+OUTPUT — return ONLY this JSON, no markdown, no preamble, no explanation:
 {"a8":{"x":0.000,"y":0.000},"h8":{"x":0.000,"y":0.000},"h1":{"x":0.000,"y":0.000},"a1":{"x":0.000,"y":0.000}}
 
-Corner labels (use whichever rooks/back-rank pieces are visible to anchor):
-- a8 = corner where Black's queenside rook is/should be
-- h8 = corner where Black's kingside rook is/should be
-- h1 = corner where White's kingside rook is/should be
-- a1 = corner where White's queenside rook is/should be
-
-x and y are fractions from 0.0 to 1.0 (x=0 left edge of image, x=1 right edge; y=0 top edge, y=1 bottom edge). Round to 3 decimals.
-
-Before answering, mentally trace the OUTER PERIMETER of the playing surface — the boundary between the 8×8 checker pattern and everything else. The four corners are exactly where that perimeter changes direction by 90°. Make sure your four points include the full back ranks and full files, even when corner pieces sit there.`;
+Round each coordinate to 3 decimals. Place each point at the CENTRE of the rook's base, not at the top of the piece.`;
 
 /**
  * Anthropic-proxy corner detector. Posts a downscaled photo to the same
@@ -648,7 +646,7 @@ function parseCornerResponse(
       reason: `JSON parse failed: ${e instanceof Error ? e.message : String(e)}`,
     };
   }
-  const readCorner = (key: "a8" | "h8" | "h1" | "a1"): CornerPoint | null => {
+  const readPoint = (key: "a8" | "h8" | "h1" | "a1"): CornerPoint | null => {
     const v = parsed[key] as { x?: unknown; y?: unknown } | undefined;
     if (!v) return null;
     const x = typeof v.x === "number" ? v.x : Number(v.x);
@@ -657,17 +655,66 @@ function parseCornerResponse(
     if (x < -0.1 || x > 1.1 || y < -0.1 || y > 1.1) return null;
     return { x: x * imgW, y: y * imgH };
   };
-  const a8 = readCorner("a8");
-  const h8 = readCorner("h8");
-  const h1 = readCorner("h1");
-  const a1 = readCorner("a1");
-  if (!a8 || !h8 || !h1 || !a1) {
+  const a8Rook = readPoint("a8");
+  const h8Rook = readPoint("h8");
+  const h1Rook = readPoint("h1");
+  const a1Rook = readPoint("a1");
+  if (!a8Rook || !h8Rook || !h1Rook || !a1Rook) {
     return {
       kind: "error",
       reason: `Missing/invalid corner in response: ${objMatch[0].slice(0, 160)}`,
     };
   }
-  return { kind: "detected", corners: [a8, h8, h1, a1], raw };
+
+  // The model returned rook CENTRES — each rook sits in the centre of its
+  // back-rank corner cell. The playing-surface corner is offset from each
+  // rook by half a cell along each adjacent edge. We estimate the per-cell
+  // edge vectors from the rook-to-rook distance (7 cells apart along each
+  // back rank / each side file), then push each rook out diagonally to
+  // land on the actual playing-surface corner.
+  //
+  // For the "a8" corner: along the top edge (a8→h8) take -0.5 cell, along
+  // the left edge (a8→a1) take -0.5 cell.
+  // For "h8": +0.5 along top edge, -0.5 along right edge (h8→h1).
+  // For "h1": +0.5 along bottom edge (h1→a1 backwards), +0.5 along right.
+  // For "a1": -0.5 along bottom edge, +0.5 along left edge.
+  const topVec = {
+    x: (h8Rook.x - a8Rook.x) / 7,
+    y: (h8Rook.y - a8Rook.y) / 7,
+  };
+  const bottomVec = {
+    x: (h1Rook.x - a1Rook.x) / 7,
+    y: (h1Rook.y - a1Rook.y) / 7,
+  };
+  const leftVec = {
+    x: (a1Rook.x - a8Rook.x) / 7,
+    y: (a1Rook.y - a8Rook.y) / 7,
+  };
+  const rightVec = {
+    x: (h1Rook.x - h8Rook.x) / 7,
+    y: (h1Rook.y - h8Rook.y) / 7,
+  };
+  const a8Corner: CornerPoint = {
+    x: a8Rook.x - 0.5 * topVec.x - 0.5 * leftVec.x,
+    y: a8Rook.y - 0.5 * topVec.y - 0.5 * leftVec.y,
+  };
+  const h8Corner: CornerPoint = {
+    x: h8Rook.x + 0.5 * topVec.x - 0.5 * rightVec.x,
+    y: h8Rook.y + 0.5 * topVec.y - 0.5 * rightVec.y,
+  };
+  const h1Corner: CornerPoint = {
+    x: h1Rook.x + 0.5 * bottomVec.x + 0.5 * rightVec.x,
+    y: h1Rook.y + 0.5 * bottomVec.y + 0.5 * rightVec.y,
+  };
+  const a1Corner: CornerPoint = {
+    x: a1Rook.x - 0.5 * bottomVec.x + 0.5 * leftVec.x,
+    y: a1Rook.y - 0.5 * bottomVec.y + 0.5 * leftVec.y,
+  };
+  return {
+    kind: "detected",
+    corners: [a8Corner, h8Corner, h1Corner, a1Corner],
+    raw,
+  };
 }
 
 function resolveSan(raw: string, legalMovesSan: string[]): VlmVerifyResult {

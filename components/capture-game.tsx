@@ -411,6 +411,11 @@ export function CaptureGame() {
     | { kind: "ok"; at: number }
     | { kind: "error"; reason: string }
   >({ kind: "idle" });
+  // Manual tap-to-place mode. When true, the calibrating phase shows a
+  // tap-to-place UI instead of the auto-detect overlay, and auto-AI /
+  // auto-CV are suppressed. The user taps 4 corners in sequence and we
+  // transition straight to ready.
+  const [tapMode, setTapMode] = useState(false);
 
   const stopCamera = useCallback(() => {
     const stream = streamRef.current;
@@ -1005,14 +1010,16 @@ export function CaptureGame() {
   // this via the calibrating-phase transition.
   useEffect(() => {
     if (phase !== "calibrating") return;
+    if (tapMode) return; // user is placing corners by tap — skip AI
     if (!cornerDetectorRef.current) return;
     setVlmStatus({ kind: "idle" });
     const t = window.setTimeout(() => void tryVlmCalibrate(), 700);
     return () => window.clearTimeout(t);
-  }, [phase, tryVlmCalibrate]);
+  }, [phase, tapMode, tryVlmCalibrate]);
 
   useEffect(() => {
     if (phase !== "calibrating" || corners.length === 4) return;
+    if (tapMode) return; // manual placement — skip CV detector loop
     let cancelled = false;
     let timer: number | null = null;
     const tick = async () => {
@@ -1028,7 +1035,7 @@ export function CaptureGame() {
       if (timer !== null) window.clearTimeout(timer);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [phase, videoDims, testFrames, testFrameIdx]);
+  }, [phase, videoDims, testFrames, testFrameIdx, tapMode]);
 
   useEffect(() => {
     if (phase !== "calibrating" || corners.length !== 4 || busy) return;
@@ -1036,7 +1043,10 @@ export function CaptureGame() {
     // That meant a misoriented or mis-cropped board still started the
     // clock. Now we transition to "ready", where the player can verify
     // the rectified board and start the game manually.
-    const t = window.setTimeout(() => setPhase("ready"), 200);
+    const t = window.setTimeout(() => {
+      setTapMode(false);
+      setPhase("ready");
+    }, 200);
     return () => window.clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [phase, corners.length, busy]);
@@ -1866,12 +1876,41 @@ export function CaptureGame() {
             />
           )}
           {phase === "paused" && <PausedOverlay onResume={togglePause} />}
-          {phase === "calibrating" && (
+          {phase === "calibrating" && tapMode && (
+            <TapCornersOverlay
+              corners={corners}
+              videoDims={videoDims}
+              onPreviewRef={attachPreviewVideo}
+              onTap={(pt) =>
+                setCorners((cs) =>
+                  cs.length >= 4 ? cs : [...cs, pt],
+                )
+              }
+              onUndo={() =>
+                setCorners((cs) => cs.slice(0, Math.max(0, cs.length - 1)))
+              }
+              onCancel={() => {
+                setTapMode(false);
+                backToSettings();
+              }}
+              onUseAi={() => {
+                setCorners([]);
+                setTapMode(false);
+              }}
+              hasAiDetector={cornerDetectorRef.current !== null}
+            />
+          )}
+          {phase === "calibrating" && !tapMode && (
             <StartingOverlay
               testMode={testMode}
               cameraError={cameraError}
               vlmDetecting={vlmDetecting}
               hasAiDetector={cornerDetectorRef.current !== null}
+              onTapManually={() => {
+                setCorners([]);
+                setVlmStatus({ kind: "idle" });
+                setTapMode(true);
+              }}
               onCancel={backToSettings}
             />
           )}
@@ -1904,6 +1943,14 @@ export function CaptureGame() {
             setCorners([]);
             setBoardCheck(null);
             setVlmStatus({ kind: "idle" });
+            setTapMode(false);
+            setPhase("calibrating");
+          }}
+          onTapManually={() => {
+            setCorners([]);
+            setBoardCheck(null);
+            setVlmStatus({ kind: "idle" });
+            setTapMode(true);
             setPhase("calibrating");
           }}
           onCancel={backToSettings}
@@ -2721,6 +2768,7 @@ function ReadyScreen({
   hasAiDetector,
   onRetryAi,
   onRecalibrate,
+  onTapManually,
   onCancel,
   onStart,
 }: {
@@ -2741,6 +2789,7 @@ function ReadyScreen({
   hasAiDetector: boolean;
   onRetryAi: () => void;
   onRecalibrate: () => void;
+  onTapManually: () => void;
   onCancel: () => void;
   onStart: () => void;
 }) {
@@ -2917,12 +2966,20 @@ function ReadyScreen({
               Start anyway — checks not passing
             </button>
           )}
-          <button
-            onClick={onRecalibrate}
-            className="rounded-2xl border border-white/10 bg-white/5 px-4 py-2.5 text-[13px] font-medium text-zinc-200 hover:bg-white/10"
-          >
-            Re-detect board
-          </button>
+          <div className="flex gap-2">
+            <button
+              onClick={onRecalibrate}
+              className="flex-1 rounded-2xl border border-white/10 bg-white/5 px-4 py-2.5 text-[13px] font-medium text-zinc-200 hover:bg-white/10"
+            >
+              Re-detect
+            </button>
+            <button
+              onClick={onTapManually}
+              className="flex-1 rounded-2xl border border-white/10 bg-white/5 px-4 py-2.5 text-[13px] font-medium text-zinc-200 hover:bg-white/10"
+            >
+              Tap corners myself
+            </button>
+          </div>
         </div>
       </div>
     </div>
@@ -2978,17 +3035,260 @@ function CheckRow({
  * detect within ~1 s and the overlay just flashes briefly. After a long
  * delay we add a hint and a cancel-out link.
  */
+const TAP_LABELS = ["a8", "h8", "h1", "a1"] as const;
+const TAP_HINTS: Record<(typeof TAP_LABELS)[number], string> = {
+  a8: "Black's queenside rook — top-left of the board (from White's view)",
+  h8: "Black's kingside rook — top-right",
+  h1: "White's kingside rook — bottom-right",
+  a1: "White's queenside rook — bottom-left",
+};
+
+/**
+ * Full-screen tap-to-place corner UI. Shown during calibrating when
+ * the user opts into manual placement. Reliably correct in 4 taps —
+ * the escape hatch when auto-detect (CV or VLM) doesn't deliver.
+ */
+function TapCornersOverlay({
+  corners,
+  videoDims,
+  onPreviewRef,
+  onTap,
+  onUndo,
+  onCancel,
+  onUseAi,
+  hasAiDetector,
+}: {
+  corners: Point[];
+  videoDims: VideoDims | null;
+  onPreviewRef: (el: HTMLVideoElement | null) => void;
+  onTap: (point: Point) => void;
+  onUndo: () => void;
+  onCancel: () => void;
+  onUseAi: () => void;
+  hasAiDetector: boolean;
+}) {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const nextIdx = Math.min(corners.length, 3);
+  const targetLabel = corners.length < 4 ? TAP_LABELS[corners.length] : null;
+  const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!videoDims) return;
+    if (corners.length >= 4) return;
+    const el = containerRef.current;
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    if (!rect.width || !rect.height) return;
+    // The video uses object-contain inside a container with the video's
+    // aspect ratio, so client→viewBox mapping is a uniform scale.
+    const scale = Math.min(
+      rect.width / videoDims.w,
+      rect.height / videoDims.h,
+    );
+    const drawnW = videoDims.w * scale;
+    const drawnH = videoDims.h * scale;
+    const offsetX = (rect.width - drawnW) / 2;
+    const offsetY = (rect.height - drawnH) / 2;
+    const localX = e.clientX - rect.left - offsetX;
+    const localY = e.clientY - rect.top - offsetY;
+    if (localX < 0 || localX > drawnW || localY < 0 || localY > drawnH) return;
+    onTap({ x: localX / scale, y: localY / scale });
+  };
+  return (
+    <div className="absolute inset-0 z-40 flex flex-col bg-zinc-950 text-zinc-100">
+      <div className="flex shrink-0 items-center justify-between px-5 pb-2 pt-5">
+        <button
+          onClick={onCancel}
+          className="rounded-full bg-white/5 px-3 py-1 text-[11px] uppercase tracking-widest text-zinc-300 hover:bg-white/10"
+        >
+          Cancel
+        </button>
+        <div className="text-[10px] font-semibold uppercase tracking-[0.32em] text-emerald-300">
+          Tap each corner
+        </div>
+        <div className="w-[68px]" aria-hidden />
+      </div>
+
+      <div className="flex shrink-0 items-center justify-center gap-3 px-5 pb-3 pt-1">
+        <TapCornerInset step={corners.length} />
+        <div className="min-w-0 text-left">
+          {targetLabel ? (
+            <>
+              <div className="text-sm font-semibold tracking-tight text-zinc-50">
+                Tap corner {corners.length + 1} of 4 ·{" "}
+                <span className="text-emerald-300">{targetLabel}</span>
+              </div>
+              <div className="mt-0.5 text-[11px] leading-snug text-zinc-400">
+                {TAP_HINTS[targetLabel]}
+              </div>
+            </>
+          ) : (
+            <div className="text-sm font-medium text-emerald-300">
+              All four corners placed — ready to verify
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="flex flex-1 items-center justify-center bg-black px-2 pb-3">
+        <div
+          ref={containerRef}
+          onPointerDown={handlePointerDown}
+          className="relative w-full max-w-[320px] overflow-hidden rounded-2xl border border-white/15 bg-black"
+          style={{
+            aspectRatio: videoDims
+              ? `${videoDims.w}/${videoDims.h}`
+              : "3/4",
+            touchAction: "none",
+          }}
+        >
+          <video
+            ref={onPreviewRef}
+            muted
+            playsInline
+            autoPlay
+            className="absolute inset-0 h-full w-full object-contain"
+          />
+          {corners.length > 0 && videoDims && (
+            <svg
+              viewBox={`0 0 ${videoDims.w} ${videoDims.h}`}
+              className="pointer-events-none absolute inset-0 h-full w-full"
+              preserveAspectRatio="xMidYMid meet"
+            >
+              {corners.length >= 4 && (
+                <polygon
+                  points={corners.map((p) => `${p.x},${p.y}`).join(" ")}
+                  fill="rgba(74,222,128,0.08)"
+                  stroke="rgba(74,222,128,0.95)"
+                  strokeWidth={Math.max(2, videoDims.w / 400)}
+                />
+              )}
+              {corners.length >= 2 && corners.length < 4 && (
+                <polyline
+                  points={corners.map((p) => `${p.x},${p.y}`).join(" ")}
+                  fill="none"
+                  stroke="rgba(74,222,128,0.8)"
+                  strokeWidth={Math.max(2, videoDims.w / 400)}
+                />
+              )}
+              {corners.map((p, i) => (
+                <g key={i}>
+                  <circle
+                    cx={p.x}
+                    cy={p.y}
+                    r={Math.max(10, videoDims.w / 100)}
+                    fill={i === nextIdx ? "rgba(74,222,128,0.95)" : "rgba(16,185,129,0.95)"}
+                    stroke="white"
+                    strokeWidth={Math.max(2, videoDims.w / 400)}
+                  />
+                  <text
+                    x={p.x}
+                    y={p.y - Math.max(18, videoDims.w / 60)}
+                    fill="white"
+                    stroke="rgba(0,0,0,0.7)"
+                    strokeWidth={Math.max(1.5, videoDims.w / 600)}
+                    paintOrder="stroke"
+                    fontSize={Math.max(14, videoDims.w / 50)}
+                    fontWeight="bold"
+                    textAnchor="middle"
+                  >
+                    {TAP_LABELS[i]}
+                  </text>
+                </g>
+              ))}
+            </svg>
+          )}
+        </div>
+      </div>
+
+      <div className="flex shrink-0 flex-col gap-2 px-5 pb-6 pt-2">
+        <div className="flex gap-2">
+          <button
+            onClick={onUndo}
+            disabled={corners.length === 0}
+            className="flex-1 rounded-2xl border border-white/10 bg-white/5 px-3 py-2.5 text-[13px] font-medium text-zinc-200 hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            Undo last tap
+          </button>
+          {hasAiDetector && (
+            <button
+              onClick={onUseAi}
+              className="flex-1 rounded-2xl border border-white/10 bg-white/5 px-3 py-2.5 text-[13px] font-medium text-zinc-200 hover:bg-white/10"
+            >
+              Use AI auto-detect
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Small 8×8 mini-board with the next corner highlighted, so the user
+ * knows which physical corner of the camera image to tap next.
+ */
+function TapCornerInset({ step }: { step: number }) {
+  const size = 64;
+  const sq = size / 8;
+  const target = step < 4 ? TAP_LABELS[step] : null;
+  const targetCell: Record<(typeof TAP_LABELS)[number], { f: number; r: number }> = {
+    a8: { f: 0, r: 0 },
+    h8: { f: 7, r: 0 },
+    h1: { f: 7, r: 7 },
+    a1: { f: 0, r: 7 },
+  };
+  const cells: React.ReactElement[] = [];
+  for (let r = 0; r < 8; r++) {
+    for (let f = 0; f < 8; f++) {
+      const light = (r + f) % 2 === 0;
+      cells.push(
+        <rect
+          key={`${r}-${f}`}
+          x={f * sq}
+          y={r * sq}
+          width={sq}
+          height={sq}
+          fill={light ? "#e8d6b0" : "#a87b4a"}
+        />,
+      );
+    }
+  }
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox={`0 0 ${size} ${size}`}
+      className="shrink-0 rounded border border-zinc-700"
+      aria-hidden
+    >
+      {cells}
+      {target && (
+        <rect
+          x={targetCell[target].f * sq}
+          y={targetCell[target].r * sq}
+          width={sq}
+          height={sq}
+          fill="rgba(16,185,129,0.9)"
+          stroke="white"
+          strokeWidth={1.5}
+        />
+      )}
+    </svg>
+  );
+}
+
 function StartingOverlay({
   testMode,
   cameraError,
   vlmDetecting,
   hasAiDetector,
+  onTapManually,
   onCancel,
 }: {
   testMode: boolean;
   cameraError: string | null;
   vlmDetecting: boolean;
   hasAiDetector: boolean;
+  onTapManually: () => void;
   onCancel: () => void;
 }) {
   const [showHint, setShowHint] = useState(false);
@@ -3025,6 +3325,14 @@ function StartingOverlay({
             </div>
           )}
         </div>
+        {!testMode && (
+          <button
+            onClick={onTapManually}
+            className="rounded-full border border-white/15 bg-white/5 px-4 py-1.5 text-xs font-medium text-zinc-100 hover:bg-white/10"
+          >
+            Tap the corners myself
+          </button>
+        )}
         <button
           onClick={onCancel}
           className="text-xs uppercase tracking-[0.2em] text-zinc-400 transition hover:text-zinc-200"
