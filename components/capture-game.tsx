@@ -110,6 +110,7 @@ const DEFAULT_TC = PRESETS[2].tc;
 const TC_STORAGE = "chesspar:capture-tc-v1";
 const CORNERS_STORAGE = "chesspar:capture-corners-v1";
 const VLM_STORAGE = "chesspar:capture-vlm-v1";
+const LENS_STORAGE = "chesspar:capture-lens-v1";
 
 type VlmConfig = { provider: VlmProvider; apiKey: string };
 const VLM_PROVIDER_LABELS: Record<VlmProvider, string> = {
@@ -189,7 +190,10 @@ export function CaptureGame() {
   } | null>(null);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const previewVideoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const [availableLenses, setAvailableLenses] = useState<MediaDeviceInfo[]>([]);
+  const [currentLensId, setCurrentLensId] = useState<string | null>(null);
   const wakeLockRef = useRef<WakeLock | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const flashTimeoutRef = useRef<number | null>(null);
@@ -301,6 +305,14 @@ export function CaptureGame() {
     }
   }, [tc, phase]);
 
+  const attachPreviewVideo = useCallback((el: HTMLVideoElement | null) => {
+    previewVideoRef.current = el;
+    if (el && streamRef.current && el.srcObject !== streamRef.current) {
+      el.srcObject = streamRef.current;
+      el.play().catch(() => {});
+    }
+  }, []);
+
   const stopCamera = useCallback(() => {
     const stream = streamRef.current;
     if (stream) {
@@ -310,34 +322,134 @@ export function CaptureGame() {
     if (videoRef.current) {
       videoRef.current.srcObject = null;
     }
+    if (previewVideoRef.current) {
+      previewVideoRef.current.srcObject = null;
+    }
   }, []);
 
-  const startCamera = useCallback(async () => {
-    if (streamRef.current) return;
-    if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) {
-      setCameraError("Camera API not available in this browser");
-      return;
-    }
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          facingMode: { ideal: "environment" },
-          width: { ideal: 1920 },
-          height: { ideal: 1080 },
-        },
+  /**
+   * Try to get a stream from a specific back-camera deviceId. Falls back
+   * to facingMode: environment if the exact deviceId is rejected (e.g.
+   * the lens disappeared after a teardown).
+   */
+  const acquireStream = useCallback(
+    async (deviceId?: string): Promise<MediaStream> => {
+      const baseConstraints = {
+        width: { ideal: 1920 },
+        height: { ideal: 1080 },
+      };
+      if (deviceId) {
+        try {
+          return await navigator.mediaDevices.getUserMedia({
+            video: { deviceId: { exact: deviceId }, ...baseConstraints },
+            audio: false,
+          });
+        } catch {
+          /* fall through to facingMode */
+        }
+      }
+      return navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: "environment" }, ...baseConstraints },
         audio: false,
       });
-      streamRef.current = stream;
-      const v = videoRef.current;
-      if (v) {
-        v.srcObject = stream;
-        await v.play().catch(() => {});
+    },
+    [],
+  );
+
+  const startCamera = useCallback(
+    async (preferredDeviceId?: string) => {
+      if (streamRef.current) return;
+      if (
+        typeof navigator === "undefined" ||
+        !navigator.mediaDevices?.getUserMedia
+      ) {
+        setCameraError("Camera API not available in this browser");
+        return;
       }
-      setCameraError(null);
-    } catch (e) {
-      setCameraError(e instanceof Error ? e.message : String(e));
-    }
-  }, []);
+      try {
+        // First call grants permission and unlocks device labels on iOS.
+        let stream = await acquireStream(preferredDeviceId);
+
+        // After permission is granted, enumerateDevices() returns labelled
+        // entries. Prefer a back-camera with "ultra wide" / "0.5×" in its
+        // label so the player captures more of the board.
+        let chosenId: string | null =
+          stream.getVideoTracks()[0]?.getSettings().deviceId ?? null;
+        let lenses: MediaDeviceInfo[] = [];
+        try {
+          const devices = await navigator.mediaDevices.enumerateDevices();
+          lenses = devices.filter((d) => d.kind === "videoinput");
+          if (!preferredDeviceId) {
+            const ultra = lenses.find((d) =>
+              /ultra.?wide|0\.5\s*x|0\.5×/i.test(d.label),
+            );
+            if (ultra && ultra.deviceId && ultra.deviceId !== chosenId) {
+              stream.getTracks().forEach((t) => t.stop());
+              stream = await acquireStream(ultra.deviceId);
+              chosenId = ultra.deviceId;
+            }
+          }
+
+          // Best-effort: if only one lens is exposed but the track supports
+          // a sub-1× zoom, apply it. (Mostly an Android win; iOS is a
+          // no-op here.)
+          if (lenses.length <= 1) {
+            const track = stream.getVideoTracks()[0];
+            const caps = (
+              track?.getCapabilities as
+                | (() => MediaTrackCapabilities & {
+                    zoom?: { min: number; max: number };
+                  })
+                | undefined
+            )?.call(track);
+            if (caps?.zoom && caps.zoom.min <= 0.5) {
+              await track
+                .applyConstraints({
+                  advanced: [
+                    { zoom: 0.5 } as unknown as MediaTrackConstraintSet,
+                  ],
+                })
+                .catch(() => {});
+            }
+          }
+        } catch {
+          /* enumeration failed — keep whatever stream we have */
+        }
+
+        streamRef.current = stream;
+        setAvailableLenses(lenses);
+        setCurrentLensId(chosenId);
+        const v = videoRef.current;
+        if (v) {
+          v.srcObject = stream;
+          await v.play().catch(() => {});
+        }
+        const p = previewVideoRef.current;
+        if (p) {
+          p.srcObject = stream;
+          await p.play().catch(() => {});
+        }
+        setCameraError(null);
+      } catch (e) {
+        setCameraError(e instanceof Error ? e.message : String(e));
+      }
+    },
+    [acquireStream],
+  );
+
+  const switchLens = useCallback(
+    async (deviceId: string) => {
+      if (!deviceId || deviceId === currentLensId) return;
+      stopCamera();
+      try {
+        window.localStorage.setItem(LENS_STORAGE, deviceId);
+      } catch {
+        /* ignore */
+      }
+      await startCamera(deviceId);
+    },
+    [currentLensId, startCamera, stopCamera],
+  );
 
   useEffect(() => {
     if (phase === "settings" || phase === "ended" || testMode) {
@@ -345,7 +457,13 @@ export function CaptureGame() {
       return;
     }
     if (!streamRef.current) {
-      void startCamera();
+      let saved: string | undefined;
+      try {
+        saved = window.localStorage.getItem(LENS_STORAGE) || undefined;
+      } catch {
+        /* ignore */
+      }
+      void startCamera(saved);
     }
   }, [phase, testMode, startCamera, stopCamera]);
 
@@ -1436,6 +1554,15 @@ export function CaptureGame() {
             onTap={() => endTurn("white")}
             disabled={phase !== "playing" || active !== "white"}
           />
+          {!testMode && (
+            <CameraPreviewOverlay
+              phase={phase}
+              onPreviewRef={attachPreviewVideo}
+              lenses={availableLenses}
+              currentLensId={currentLensId}
+              onSwitchLens={switchLens}
+            />
+          )}
           {phase === "paused" && <PausedOverlay onResume={togglePause} />}
           {phase === "calibrating" && (
             <StartingOverlay
@@ -2039,6 +2166,91 @@ function PausedOverlay({ onResume }: { onResume: () => void }) {
 }
 
 /**
+ * Live camera preview floating over the player UI. Pinned to the top
+ * centre between the two clock panels. Larger during calibration (the
+ * player is actively framing the board) and shrinks once we hit
+ * playing/paused (occasional framing check). Includes a lens-switch
+ * pill when more than one back-camera is exposed — iPhones surface
+ * 0.5×, 1×, sometimes 2× separately.
+ */
+function CameraPreviewOverlay({
+  phase,
+  onPreviewRef,
+  lenses,
+  currentLensId,
+  onSwitchLens,
+}: {
+  phase: Phase;
+  onPreviewRef: (el: HTMLVideoElement | null) => void;
+  lenses: MediaDeviceInfo[];
+  currentLensId: string | null;
+  onSwitchLens: (deviceId: string) => void;
+}) {
+  const isCalibrating = phase === "calibrating";
+  const sizeCls = isCalibrating
+    ? "h-[40vh] max-h-[320px] w-[78vw] max-w-[260px]"
+    : "h-24 w-20";
+  // iPhone exposes lenses with labels like "Back Ultra Wide Camera",
+  // "Back Camera", "Back Telephoto Camera". Map those to "0.5×" / "1×"
+  // / "2×" so the toggle reads naturally; otherwise show the deviceId
+  // suffix.
+  const lensLabel = (label: string, idx: number): string => {
+    const l = label.toLowerCase();
+    if (/ultra.?wide|0\.5/.test(l)) return "0.5×";
+    if (/tele/.test(l)) return "2×";
+    if (/wide|back camera|environment/.test(l) || /\bback\b/.test(l))
+      return "1×";
+    return `Cam ${idx + 1}`;
+  };
+  return (
+    <div className="pointer-events-none absolute left-1/2 top-3 z-40 -translate-x-1/2">
+      <div className="flex flex-col items-center gap-1.5">
+        <div
+          className={clsx(
+            "relative overflow-hidden rounded-2xl border border-white/15 bg-black shadow-lg shadow-black/40 transition-all duration-300",
+            sizeCls,
+          )}
+        >
+          <video
+            ref={onPreviewRef}
+            muted
+            playsInline
+            autoPlay
+            className="absolute inset-0 h-full w-full object-cover"
+          />
+          {isCalibrating && (
+            <div className="pointer-events-none absolute inset-0 ring-1 ring-inset ring-emerald-400/40" />
+          )}
+        </div>
+        {lenses.length > 1 && (
+          <div className="pointer-events-auto flex items-center gap-1 rounded-full border border-white/15 bg-black/70 px-1 py-1 text-[10px] font-medium text-zinc-100 backdrop-blur-md">
+            {lenses.map((l, i) => {
+              const label = lensLabel(l.label, i);
+              const selected = l.deviceId === currentLensId;
+              return (
+                <button
+                  key={l.deviceId || `lens-${i}`}
+                  type="button"
+                  onClick={() => onSwitchLens(l.deviceId)}
+                  className={clsx(
+                    "rounded-full px-2 py-0.5 transition",
+                    selected
+                      ? "bg-white text-black"
+                      : "text-zinc-200 hover:bg-white/10",
+                  )}
+                >
+                  {label}
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/**
  * Lightweight overlay during the brief auto-detect window. Sits on top of
  * the live player UI rather than taking over the screen — most boards
  * detect within ~1 s and the overlay just flashes briefly. After a long
@@ -2059,7 +2271,7 @@ function StartingOverlay({
     return () => window.clearTimeout(t);
   }, []);
   return (
-    <div className="pointer-events-none absolute inset-0 z-30 flex items-center justify-center bg-black/55 backdrop-blur-md">
+    <div className="pointer-events-none absolute inset-x-0 bottom-0 top-[55vh] z-30 flex items-start justify-center bg-gradient-to-b from-transparent via-black/55 to-black/70 pt-6">
       <div className="pointer-events-auto flex w-[min(20rem,86vw)] flex-col items-center gap-4 rounded-3xl bg-white/8 px-6 py-7 text-center ring-1 ring-white/15">
         <span className="relative block h-8 w-8">
           <span className="absolute inset-0 animate-ping rounded-full bg-emerald-400/40" />
