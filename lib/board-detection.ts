@@ -1,5 +1,6 @@
 import { type Point } from "./homography";
-import { warpBoard } from "./board-image";
+import { extractSquareCrops, warpBoard } from "./board-image";
+import { classifyBoard } from "./occupancy";
 
 export type DetectionResult = {
   /**
@@ -73,14 +74,14 @@ export function autoDetectBoardCorners(
 
   // The centroid-based grid fit consistently shrinks inward when the
   // outermost dark squares (a1/h8 etc.) are obscured by the back-rank
-  // rooks. The dark-pixel signal those squares would contribute is gone,
-  // so fitAxis picks a window that starts one file in and the polygon
-  // misses a rank + a file of the playing surface. We can't recover the
-  // missing centroids — but the bias is systematic, so push every
-  // corner ~5% outward from the polygon centroid as a final pass.
-  // Tested against the IMG_8819–8833 sample set: no detectable accuracy
-  // regression on cleanly-detected boards, and recovers the missing
-  // edge on piece-occluded sets.
+  // rooks. Two compensating steps:
+  //   a) Uniform 7% expansion from the polygon centroid — a small hedge
+  //      against systematic shrink.
+  //   b) Per-edge outer-row refinement — warp the current corners,
+  //      classify each cell, and if any outer rank/file looks empty
+  //      while the next rank/file in has pieces, expand that specific
+  //      edge by ~0.8 cell widths. Repeats up to twice (handles a
+  //      "missing rank 8 + file a" double offset).
   const cx = (detected.corners[0].x + detected.corners[2].x) / 2;
   const cy = (detected.corners[0].y + detected.corners[2].y) / 2;
   const EXPAND = 1.07;
@@ -103,12 +104,130 @@ export function autoDetectBoardCorners(
     },
   ];
 
-  const oriented = orientStartingPosition(source, expanded);
+  const refined = refineCornersByOuterRows(source, expanded);
+  const oriented = orientStartingPosition(source, refined);
   return {
     corners: oriented.corners,
     confidence: oriented.score >= 0 ? detected.confidence : 0,
     oriented: oriented.score >= 0,
   };
+}
+
+/**
+ * If the rectified board produced by `corners` has an outer rank/file
+ * with almost no pieces but the next-in rank/file has many, the polygon
+ * very likely missed that outer rank/file (a common failure when corner
+ * pieces obscure the dark squares the centroid grid-fit relies on).
+ * Expand that specific edge by ~0.8 cell widths and try again.
+ * Iterates up to twice to handle a "missing rank 8 + file a" combo.
+ *
+ * Independent of starting position: works whenever the player is set up
+ * with back-rank pieces. For verification we don't actually need it to
+ * match the canonical layout — just to keep the playing area inside the
+ * polygon.
+ */
+function refineCornersByOuterRows(
+  source: HTMLImageElement | HTMLCanvasElement,
+  initial: [Point, Point, Point, Point],
+): [Point, Point, Point, Point] {
+  let corners = initial;
+  for (let iter = 0; iter < 2; iter++) {
+    let warped: HTMLCanvasElement;
+    try {
+      warped = warpBoard(source, corners, 256);
+    } catch {
+      return corners;
+    }
+    const crops = extractSquareCrops(warped);
+    if (crops.length !== 64) return corners;
+    const occ = classifyBoard(crops).map((c) => c.state);
+
+    const piecesIn = (start: number, stride: number, count: number): number => {
+      let n = 0;
+      for (let k = 0; k < count; k++) {
+        if (occ[start + k * stride] !== "empty") n++;
+      }
+      return n;
+    };
+
+    // Top row = cells 0..7, next = cells 8..15
+    const topOuter = piecesIn(0, 1, 8);
+    const topInner = piecesIn(8, 1, 8);
+    // Bottom row = cells 56..63, next = cells 48..55
+    const bottomOuter = piecesIn(56, 1, 8);
+    const bottomInner = piecesIn(48, 1, 8);
+    // Left column = cells 0,8,16,...,56; next = cells 1,9,17,...,57
+    const leftOuter = piecesIn(0, 8, 8);
+    const leftInner = piecesIn(1, 8, 8);
+    // Right column = cells 7,15,...,63; next = cells 6,14,...,62
+    const rightOuter = piecesIn(7, 8, 8);
+    const rightInner = piecesIn(6, 8, 8);
+
+    // "missing" if outer < 2 pieces AND next row in has ≥ 4 — signals a
+    // packed back rank just inside the polygon edge with empty cells at
+    // the edge itself.
+    const needTop = topOuter < 2 && topInner >= 4;
+    const needBottom = bottomOuter < 2 && bottomInner >= 4;
+    const needLeft = leftOuter < 2 && leftInner >= 4;
+    const needRight = rightOuter < 2 && rightInner >= 4;
+
+    if (!needTop && !needBottom && !needLeft && !needRight) return corners;
+
+    // Polygon centroid for outward-direction reference.
+    const polyCx = (corners[0].x + corners[1].x + corners[2].x + corners[3].x) / 4;
+    const polyCy = (corners[0].y + corners[1].y + corners[2].y + corners[3].y) / 4;
+    const cellSize =
+      (Math.hypot(corners[1].x - corners[0].x, corners[1].y - corners[0].y) +
+        Math.hypot(corners[2].x - corners[3].x, corners[2].y - corners[3].y)) /
+      2 /
+      8;
+    const SHIFT = cellSize * 0.85;
+
+    const outwardShift = (p1: Point, p2: Point): { dx: number; dy: number } => {
+      // Outward normal to the edge from p1 to p2.
+      const ex = p2.x - p1.x;
+      const ey = p2.y - p1.y;
+      const len = Math.hypot(ex, ey) || 1;
+      const nx = -ey / len;
+      const ny = ex / len;
+      const midX = (p1.x + p2.x) / 2;
+      const midY = (p1.y + p2.y) / 2;
+      const dot = nx * (midX - polyCx) + ny * (midY - polyCy);
+      const sign = dot >= 0 ? 1 : -1;
+      return { dx: nx * sign * SHIFT, dy: ny * sign * SHIFT };
+    };
+
+    // Corners convention: [TL, TR, BR, BL] (a8, h8, h1, a1).
+    let [tl, tr, br, bl]: [Point, Point, Point, Point] = [
+      { ...corners[0] },
+      { ...corners[1] },
+      { ...corners[2] },
+      { ...corners[3] },
+    ];
+
+    if (needTop) {
+      const s = outwardShift(tl, tr);
+      tl = { x: tl.x + s.dx, y: tl.y + s.dy };
+      tr = { x: tr.x + s.dx, y: tr.y + s.dy };
+    }
+    if (needBottom) {
+      const s = outwardShift(br, bl);
+      br = { x: br.x + s.dx, y: br.y + s.dy };
+      bl = { x: bl.x + s.dx, y: bl.y + s.dy };
+    }
+    if (needLeft) {
+      const s = outwardShift(bl, tl);
+      bl = { x: bl.x + s.dx, y: bl.y + s.dy };
+      tl = { x: tl.x + s.dx, y: tl.y + s.dy };
+    }
+    if (needRight) {
+      const s = outwardShift(tr, br);
+      tr = { x: tr.x + s.dx, y: tr.y + s.dy };
+      br = { x: br.x + s.dx, y: br.y + s.dy };
+    }
+    corners = [tl, tr, br, bl];
+  }
+  return corners;
 }
 
 type RednessDetection = {
