@@ -1,11 +1,11 @@
-import { CaptureGame } from "@/components/capture-game";
+import { Capture } from "@/components/v2/Capture";
 
 export const metadata = {
   title: "Chesspar — Capture",
   description:
-    "Play a timed game. Each tap of your clock captures the board for move inference.",
+    "Aim your phone at the board. Tap to capture each move. Chesspar writes the PGN.",
 };
 
 export default function CapturePage() {
-  return <CaptureGame />;
+  return <Capture />;
 }
