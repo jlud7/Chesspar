@@ -16,7 +16,7 @@
  */
 
 import { Chess } from "chess.js";
-import { rectifyWithLock } from "./board-lock";
+import { rectifyWithLock, refreshBoardLock } from "./board-lock";
 import { computeOccupancyDelta } from "./occupancy-delta";
 import { searchLegalMoves } from "./move-search";
 import { pCorrect, buildFeatures } from "./confidence";
@@ -43,6 +43,9 @@ export type PipelineOutput = {
   /** Rectified post-move canvas — caller should keep this as the next
    *  move's pre-frame on a successful emit. */
   rectified: HTMLCanvasElement;
+  /** Possibly-refreshed lock — caller should adopt this so future
+   *  captures use the latest corners. */
+  lock: BoardLock;
   /** Trace data for diagnostics / debug overlay. */
   trace: {
     changedSquares: string[];
@@ -51,6 +54,7 @@ export type PipelineOutput = {
     pConfident: number;
     laplacian: number;
     escalation: "none" | "vlm";
+    cornerRefresh: "claude" | "gemini" | "kept";
   };
 };
 
@@ -59,7 +63,16 @@ export async function runMovePipeline(
 ): Promise<PipelineOutput> {
   const t0 = performance.now();
   const size = input.config.canonicalSize;
-  const rectified = rectifyWithLock(input.burst.frame, input.lock, size);
+
+  // Per-capture corner refresh — solves the "phone shifted between
+  // moves and diff sees garbage" failure mode that the locked-once
+  // approach can't recover from. Costs ~1 s + ~$0.001/move via Claude
+  // or Gemini; cheap insurance against drift.
+  const refreshed = await refreshBoardLock(input.burst.frame, input.lock, {
+    proxyUrl: input.config.proxyUrl,
+  });
+  const liveLock = refreshed.lock;
+  const rectified = rectifyWithLock(input.burst.frame, liveLock, size);
 
   const diff = computeOccupancyDelta(input.previousRectified, rectified, {
     size,
@@ -91,6 +104,7 @@ export async function runMovePipeline(
         latencyMs: performance.now() - t0,
       },
       rectified,
+      lock: liveLock,
       trace: {
         changedSquares: diff.changedSquares,
         perSquareDelta: diff.perSquareDelta,
@@ -98,6 +112,7 @@ export async function runMovePipeline(
         pConfident: 0,
         laplacian: input.burst.variance,
         escalation: "none",
+        cornerRefresh: refreshed.detector,
       },
     };
   }
@@ -157,11 +172,11 @@ export async function runMovePipeline(
     pConfident,
     laplacian: input.burst.variance,
     escalation,
+    cornerRefresh: refreshed.detector,
   };
   const latencyMs = performance.now() - t0;
 
   if (pConfident >= input.config.emitThreshold) {
-    // Promote chosenSan to the front if VLM swapped order.
     const pickIdx = candidates.findIndex((c) => c.san === chosenSan);
     const pick = candidates[Math.max(0, pickIdx)];
     return {
@@ -174,6 +189,7 @@ export async function runMovePipeline(
         escalation,
       },
       rectified,
+      lock: liveLock,
       trace,
     };
   }
@@ -190,6 +206,7 @@ export async function runMovePipeline(
       latencyMs,
     },
     rectified,
+    lock: liveLock,
     trace,
   };
 }

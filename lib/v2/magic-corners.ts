@@ -1,61 +1,163 @@
 /**
- * Magic corner detector — Gemini 2.5 Pro returns the 4 corners of the
- * actual chess playing surface directly, bypassing the Florence-2 bbox
- * (which can include the user's leg / table / fallen pieces and corrupt
- * the warp).
+ * Magic corner detector — VLM returns the 4 corners of the actual chess
+ * playing surface directly, bypassing CV approaches that can include
+ * the user's leg / table / fallen pieces and corrupt the warp.
  *
- * The model returns four named corners (a1, h1, a8, h8) in normalized
- * coordinates. We then map them to the standard `[a8, h8, h1, a1]`
- * clockwise order that `warpBoard` expects.
+ * Cascade (tries each in order, returns the first successful result):
+ *   1. Claude Sonnet 4.6 via /verify  — uses ANTHROPIC_API_KEY
+ *   2. Gemini 2.5 Pro via /gemini     — uses GEMINI_API_KEY (cheaper)
  *
- * This is the new primary calibration path. Florence-2 + CV stays as
- * fallback when Gemini fails or the user has no proxy URL.
+ * Claude is primary here because ANTHROPIC_API_KEY is the secret most
+ * Chesspar deployments already have configured. If you also set
+ * GEMINI_API_KEY on the worker, this falls back to Gemini transparently
+ * if Claude returns an unparseable response, and saves ~$0.001/call.
+ *
+ * Each call returns 4 named corners in normalized [0,1] coords. We map
+ * them to the standard [a8, h8, h1, a1] clockwise order that
+ * `warpBoard` expects.
  */
 
 import type { Corners, Point } from "./types";
 
 export type MagicCornerResult =
-  | { kind: "detected"; corners: Corners; raw: string }
-  | { kind: "error"; reason: string };
+  | {
+      kind: "detected";
+      corners: Corners;
+      detector: "claude" | "gemini";
+      raw: string;
+    }
+  | { kind: "error"; reason: string; tried: Array<{ detector: string; reason: string }> };
 
-const PROMPT = `You are identifying the EXACT 4 CORNERS of the chess board's PLAYING SURFACE in this photo.
+const PROMPT = `Identify the EXACT 4 OUTER CORNERS of the chessboard's playing surface (the 8×8 grid of squares).
 
-The playing surface is the 8×8 squared region only — ignore the border, the wood frame, the table, any captured pieces sitting next to the board, hands, legs, scoresheets, anything outside the actual squares.
+The four corners are where the OUTER edge of the corner squares meets the wood/cardboard border or rim. Be precise — your corners should be RIGHT AT the outer edge of the grid line, not inside a square, not on the wood border beyond the grid, not on a piece.
 
-Return JSON with the four corners by their algebraic label (a1, h1, a8, h8). Each corner is the POINT WHERE THE OUTER CORNER OF THE CORNER SQUARE MEETS the playing area — at the very corner of the 8×8 grid, NOT at any piece, NOT beyond the grid into the wood border.
+For each corner, return its (x, y) position as fractions from 0.0 to 1.0:
+- x = 0.0 is the left edge of the image, x = 1.0 is the right edge
+- y = 0.0 is the top edge, y = 1.0 is the bottom
 
-- a1 = the corner square nearest white's queenside rook
-- h1 = the corner nearest white's kingside rook
-- a8 = the corner nearest black's queenside rook
-- h8 = the corner nearest black's kingside rook
+Label them by their algebraic name:
+- a1 = white's queenside corner (near the white queen's rook)
+- h1 = white's kingside corner
+- a8 = black's queenside corner
+- h8 = black's kingside corner
 
-Coordinates are normalized [0,1]: x=0 left edge of image, x=1 right edge; y=0 top, y=1 bottom. Round to 4 decimals.
+If the board is set up in starting position, white pieces are on ranks 1-2 and black on ranks 7-8. If the board is at any other position, look at the rank/file labels printed on the board if visible, or infer orientation from piece colours.
 
-If you can not see all four corners or cannot tell white from black, output {"error": "<short reason>"} instead.`;
+If you cannot see all four corners or are uncertain, return {"error": "<short reason>"}.
+
+Return ONLY this JSON (no markdown, no preamble):
+{"a1":{"x":0.000,"y":0.000},"h1":{"x":0.000,"y":0.000},"a8":{"x":0.000,"y":0.000},"h8":{"x":0.000,"y":0.000}}
+
+Round each coordinate to 4 decimals.`;
 
 export async function detectCornersMagic(opts: {
   proxyUrl: string;
   image: HTMLCanvasElement;
-  model?: string;
 }): Promise<MagicCornerResult> {
-  if (!opts.proxyUrl) return { kind: "error", reason: "no proxyUrl" };
-
-  // Downscale to ~1280 px longest edge — enough spatial precision for
-  // sub-square corner placement, ~5× faster than full-res.
-  const scaled = downscale(opts.image, 1280);
+  if (!opts.proxyUrl) {
+    return { kind: "error", reason: "no proxyUrl", tried: [] };
+  }
+  const w = opts.image.width;
+  const h = opts.image.height;
+  const scaled = downscale(opts.image, 1568);
   const dataUrl = scaled.toDataURL("image/jpeg", 0.9);
-  const model = opts.model ?? "gemini-2.5-pro";
+  const tried: Array<{ detector: string; reason: string }> = [];
 
-  const responseSchema = {
-    type: "OBJECT",
-    properties: {
-      a1: cornerSchema(),
-      h1: cornerSchema(),
-      a8: cornerSchema(),
-      h8: cornerSchema(),
-      error: { type: "STRING" },
-    },
+  // ---- 1) Claude Sonnet 4.6 via /verify ----
+  const claude = await detectViaClaude(opts.proxyUrl, dataUrl);
+  if (claude.kind === "parsed") {
+    const corners = mapCorners(claude.parsed, w, h);
+    if (corners) return { kind: "detected", corners, detector: "claude", raw: claude.raw };
+    tried.push({ detector: "claude", reason: "corners failed sanity check" });
+  } else {
+    tried.push({ detector: "claude", reason: claude.reason });
+  }
+
+  // ---- 2) Gemini 2.5 Pro via /gemini ----
+  const gemini = await detectViaGemini(opts.proxyUrl, dataUrl);
+  if (gemini.kind === "parsed") {
+    const corners = mapCorners(gemini.parsed, w, h);
+    if (corners) return { kind: "detected", corners, detector: "gemini", raw: gemini.raw };
+    tried.push({ detector: "gemini", reason: "corners failed sanity check" });
+  } else {
+    tried.push({ detector: "gemini", reason: gemini.reason });
+  }
+
+  return {
+    kind: "error",
+    reason: tried.map((t) => `${t.detector}: ${t.reason}`).join(" · "),
+    tried,
   };
+}
+
+// ---------- Claude via /verify ----------
+
+type DetectInner =
+  | { kind: "parsed"; parsed: ParsedCorners; raw: string }
+  | { kind: "error"; reason: string };
+
+async function detectViaClaude(
+  proxyUrl: string,
+  dataUrl: string,
+): Promise<DetectInner> {
+  const endpoint = proxyUrl.replace(/\/$/, "") + "/verify";
+  const body = {
+    model: "claude-sonnet-4-6",
+    max_tokens: 600,
+    temperature: 0,
+    messages: [
+      {
+        role: "user",
+        content: [
+          {
+            type: "image",
+            source: {
+              type: "base64",
+              media_type: "image/jpeg",
+              data: dataUrlToBase64(dataUrl),
+            },
+          },
+          { type: "text", text: PROMPT },
+        ],
+      },
+    ],
+  };
+  let resp: Response;
+  try {
+    resp = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  } catch (e) {
+    return { kind: "error", reason: e instanceof Error ? e.message : String(e) };
+  }
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    return { kind: "error", reason: `HTTP ${resp.status}: ${text.slice(0, 160)}` };
+  }
+  const data = (await resp.json()) as {
+    content?: { type: string; text?: string }[];
+  };
+  const raw = data.content?.find((c) => c.type === "text")?.text ?? "";
+  if (!raw) return { kind: "error", reason: "Claude returned empty content" };
+  const parsed = parseJsonLoose(raw);
+  if (!parsed) return { kind: "error", reason: `unparseable: ${raw.slice(0, 160)}` };
+  if (parsed.error) {
+    return { kind: "error", reason: `Claude abstained: ${parsed.error}` };
+  }
+  return { kind: "parsed", parsed, raw };
+}
+
+// ---------- Gemini via /gemini ----------
+
+async function detectViaGemini(
+  proxyUrl: string,
+  dataUrl: string,
+): Promise<DetectInner> {
+  const endpoint =
+    proxyUrl.replace(/\/$/, "") + "/gemini?model=gemini-2.5-pro";
   const body = {
     contents: [
       {
@@ -74,104 +176,75 @@ export async function detectCornersMagic(opts: {
     generationConfig: {
       temperature: 0.0,
       responseMimeType: "application/json",
-      responseSchema,
+      responseSchema: {
+        type: "OBJECT",
+        properties: {
+          a1: cornerSchema(),
+          h1: cornerSchema(),
+          a8: cornerSchema(),
+          h8: cornerSchema(),
+          error: { type: "STRING" },
+        },
+      },
     },
   };
-
   let resp: Response;
   try {
-    resp = await fetch(
-      `${opts.proxyUrl.replace(/\/$/, "")}/gemini?model=${encodeURIComponent(model)}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      },
-    );
+    resp = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
   } catch (e) {
-    return {
-      kind: "error",
-      reason: e instanceof Error ? e.message : String(e),
-    };
+    return { kind: "error", reason: e instanceof Error ? e.message : String(e) };
   }
   if (!resp.ok) {
     const text = await resp.text().catch(() => "");
-    return {
-      kind: "error",
-      reason: `Gemini proxy HTTP ${resp.status}: ${text.slice(0, 200)}`,
-    };
+    return { kind: "error", reason: `HTTP ${resp.status}: ${text.slice(0, 160)}` };
   }
-  let data: GeminiResponse;
-  try {
-    data = (await resp.json()) as GeminiResponse;
-  } catch (e) {
-    return {
-      kind: "error",
-      reason: `Bad Gemini JSON: ${e instanceof Error ? e.message : e}`,
-    };
-  }
+  const data = (await resp.json()) as {
+    candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+  };
   const raw = data.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
   if (!raw) return { kind: "error", reason: "Gemini empty response" };
-
-  let parsed: ParsedCorners;
-  try {
-    parsed = JSON.parse(raw) as ParsedCorners;
-  } catch {
-    return { kind: "error", reason: `Could not parse Gemini JSON: ${raw.slice(0, 200)}` };
-  }
+  const parsed = parseJsonLoose(raw);
+  if (!parsed) return { kind: "error", reason: `unparseable: ${raw.slice(0, 160)}` };
   if (parsed.error) {
     return { kind: "error", reason: `Gemini abstained: ${parsed.error}` };
   }
-  const w = opts.image.width;
-  const h = opts.image.height;
+  return { kind: "parsed", parsed, raw };
+}
+
+// ---------- helpers ----------
+
+function mapCorners(
+  parsed: ParsedCorners,
+  w: number,
+  h: number,
+): Corners | null {
+  if (!parsed.a1 || !parsed.h1 || !parsed.a8 || !parsed.h8) return null;
   const toPx = (c: { x: number; y: number }): Point => ({
     x: clamp(c.x * w, 0, w),
     y: clamp(c.y * h, 0, h),
   });
-  if (!parsed.a1 || !parsed.h1 || !parsed.a8 || !parsed.h8) {
-    return { kind: "error", reason: "Gemini missing one or more corners" };
-  }
-  // warpBoard expects [a8, h8, h1, a1] clockwise.
   const corners: Corners = [
     toPx(parsed.a8),
     toPx(parsed.h8),
     toPx(parsed.h1),
     toPx(parsed.a1),
   ];
-  if (!cornersLookValid(corners, w, h)) {
-    return {
-      kind: "error",
-      reason: "Returned corners look degenerate (too small or collinear)",
-    };
-  }
-  return { kind: "detected", corners, raw };
-}
-
-function cornerSchema() {
-  return {
-    type: "OBJECT",
-    properties: {
-      x: { type: "NUMBER" },
-      y: { type: "NUMBER" },
-    },
-    required: ["x", "y"],
-  };
+  if (!cornersLookValid(corners, w, h)) return null;
+  return corners;
 }
 
 function cornersLookValid(corners: Corners, w: number, h: number): boolean {
-  // Min side length: 15% of image width — otherwise we're warping a
-  // dot, not a board.
   const minSide = Math.min(w, h) * 0.15;
   for (let i = 0; i < 4; i++) {
     const a = corners[i];
     const b = corners[(i + 1) % 4];
-    const dx = a.x - b.x;
-    const dy = a.y - b.y;
-    if (Math.hypot(dx, dy) < minSide) return false;
+    if (Math.hypot(a.x - b.x, a.y - b.y) < minSide) return false;
   }
-  // Reject if the quad's area is < 5% of the image — also too small.
-  const area = polygonArea(corners);
-  if (area < 0.05 * w * h) return false;
+  if (polygonArea(corners) < 0.05 * w * h) return false;
   return true;
 }
 
@@ -206,16 +279,53 @@ function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
 }
 
+/**
+ * Tolerant JSON parse: tries JSON.parse, then strips markdown fences,
+ * then extracts the first {...} substring. Claude sometimes wraps JSON
+ * in markdown despite the prompt; Gemini's structured-output usually
+ * returns clean JSON but we use the same parser for both.
+ */
+function parseJsonLoose(raw: string): ParsedCorners | null {
+  const trimmed = raw.trim();
+  try {
+    return JSON.parse(trimmed) as ParsedCorners;
+  } catch {
+    /* fall through */
+  }
+  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced) {
+    try {
+      return JSON.parse(fenced[1].trim()) as ParsedCorners;
+    } catch {
+      /* fall through */
+    }
+  }
+  const inner = trimmed.match(/\{[\s\S]*\}/);
+  if (inner) {
+    try {
+      return JSON.parse(inner[0]) as ParsedCorners;
+    } catch {
+      /* fall through */
+    }
+  }
+  return null;
+}
+
+function cornerSchema() {
+  return {
+    type: "OBJECT",
+    properties: {
+      x: { type: "NUMBER" },
+      y: { type: "NUMBER" },
+    },
+    required: ["x", "y"],
+  };
+}
+
 type ParsedCorners = {
   a1?: { x: number; y: number };
   h1?: { x: number; y: number };
   a8?: { x: number; y: number };
   h8?: { x: number; y: number };
   error?: string;
-};
-
-type GeminiResponse = {
-  candidates?: Array<{
-    content?: { parts?: Array<{ text?: string }> };
-  }>;
 };

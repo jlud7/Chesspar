@@ -47,7 +47,7 @@ export type LockAttempt =
       magicRotationEscalation: boolean;
       rotationDebug: RotationPick;
       /** Diagnostic message for the UI (e.g. which detector succeeded). */
-      detector: "gemini" | "florence-cv" | "cv-only";
+      detector: "claude" | "gemini" | "florence-cv" | "cv-only";
     }
   | {
       kind: "failed";
@@ -71,9 +71,9 @@ export async function lockBoardFromImage(
   const startingFen =
     opts.startingFen ?? "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR";
 
-  // ---- 1) Try Gemini magic corner detector first when we have a proxy ----
+  // ---- 1) Try the VLM cascade (Claude → Gemini) first ----
   let corners: Corners | null = null;
-  let detector: "gemini" | "florence-cv" | "cv-only" = "cv-only";
+  let detector: "claude" | "gemini" | "florence-cv" | "cv-only" = "cv-only";
 
   if (opts.proxyUrl) {
     const magic = await detectCornersMagic({
@@ -82,7 +82,7 @@ export async function lockBoardFromImage(
     });
     if (magic.kind === "detected") {
       corners = magic.corners;
-      detector = "gemini";
+      detector = magic.detector;
     }
   }
 
@@ -164,10 +164,35 @@ export async function lockBoardFromImage(
     lock,
     rectified: chosen.rectified,
     startingCheck,
-    magicCornerEscalation: detector === "gemini",
+    magicCornerEscalation: detector === "claude" || detector === "gemini",
     magicRotationEscalation,
     rotationDebug: chosen,
     detector,
+  };
+}
+
+/**
+ * Per-capture corner refresh — re-detect the board in a new frame so
+ * the cached homography survives the user shifting their phone between
+ * moves. Returns a fresh `BoardLock` if detection succeeded, or the
+ * existing one untouched if it didn't (so we degrade gracefully).
+ *
+ * Called by `runMovePipeline` before warping each post-move frame.
+ */
+export async function refreshBoardLock(
+  source: HTMLCanvasElement,
+  current: BoardLock,
+  opts: { proxyUrl: string },
+): Promise<{ lock: BoardLock; detector: "claude" | "gemini" | "kept" }> {
+  if (!opts.proxyUrl) return { lock: current, detector: "kept" };
+  const magic = await detectCornersMagic({ proxyUrl: opts.proxyUrl, image: source });
+  if (magic.kind !== "detected") return { lock: current, detector: "kept" };
+  return {
+    lock: {
+      ...current,
+      corners: magic.corners,
+    },
+    detector: magic.detector,
   };
 }
 

@@ -237,6 +237,9 @@ export function Capture() {
         previousRectified: prev,
         config,
       });
+      // Adopt the (possibly-refreshed) lock for the next capture so
+      // future moves benefit from fresh corner detection.
+      lockRef.current = result.lock;
       if (result.decision.kind === "matched") {
         const san = result.decision.pick.san;
         const newFen = applyMove(fenRef.current, san);
@@ -268,6 +271,13 @@ export function Capture() {
         });
         setPhase("abstain");
       } else {
+        // Even on error, adopt the new rectified frame as the next
+        // baseline if corners were refreshed — the user just took a
+        // photo so their idea of "current board state" is *this* frame,
+        // not the stale calibration one.
+        if (result.trace.cornerRefresh !== "kept") {
+          prevRectifiedRef.current = result.rectified;
+        }
         setStatusMsg(result.decision.reason);
       }
     } catch (e) {
