@@ -60,7 +60,7 @@ export type LockAttempt =
  *  we reject and ask the user to retake — better than locking on bad
  *  corners and emitting wrong moves for the rest of the game. */
 const MIN_LOCK_SCORE = 0.6;
-const BOARD_CONTEXT_MARGIN = 0.14;
+export const BOARD_CONTEXT_MARGIN = 0.14;
 const MIN_REFRESH_DRIFT_FRACTION = 0.015;
 const MAX_REFRESH_DRIFT_FRACTION = 0.18;
 

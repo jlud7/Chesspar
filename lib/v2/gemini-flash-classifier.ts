@@ -39,6 +39,7 @@ export type FlashClassifierResult =
       uci: string;
       san: string;
       confidence: number;
+      changedSquares: Square[];
       latencyMs: number;
       raw: string;
     }
@@ -67,6 +68,8 @@ export async function classifyMoveWithFlash(opts: {
   proxyUrl: string;
   previousFen: string;
   candidates: FlashCandidate[];
+  /** Rectified board BEFORE the move. Strongly preferred. */
+  preImage?: HTMLCanvasElement | null;
   /** Rectified, top-down view of the board AFTER the move. */
   postImage: HTMLCanvasElement;
   /** Optional override; defaults to gemini-2.5-flash. */
@@ -94,6 +97,7 @@ export async function classifyMoveWithFlash(opts: {
       uci: opts.candidates[0].uci,
       san: opts.candidates[0].san,
       confidence: 1,
+      changedSquares: [opts.candidates[0].fromSquare, opts.candidates[0].toSquare],
       latencyMs: performance.now() - t0,
       raw: "(single legal move — no VLM call needed)",
     };
@@ -105,30 +109,45 @@ export async function classifyMoveWithFlash(opts: {
   const candidateLines = opts.candidates
     .map((c) => `${c.uci} (${c.san})`)
     .join("\n");
-  const dataUrl = opts.postImage.toDataURL("image/jpeg", 0.9);
+  const preDataUrl = opts.preImage?.toDataURL("image/jpeg", 0.88);
+  const postDataUrl = opts.postImage.toDataURL("image/jpeg", 0.88);
+  const hasBefore = !!preDataUrl;
 
   // The smallest prompt that still constrains the answer. Every word
   // here was kept because removing it changed observed behaviour on
   // the test set.
   const prompt = `Previous FEN: ${opts.previousFen}
-The image shows the board after exactly one legal move. White is at the bottom.
+${hasBefore ? "IMAGE 1 is before the move. IMAGE 2 is after the move." : "The image shows the board after exactly one legal move."}
+White is at the bottom. First identify the changed squares, then choose the one legal move that explains those changes.
+If the before/after images do not show a clear move, return ABSTAIN with confidence 0.
 Legal moves:
 ${candidateLines}
-Return JSON only: {"move":"<uci or ABSTAIN>","san":"<san>","confidence":0.0}`;
+Return JSON only: {"move":"<uci or ABSTAIN>","san":"<san>","changed_squares":["e2","e4"],"confidence":0.0}`;
+
+  const parts: Array<
+    | { text: string }
+    | { inlineData: { mimeType: "image/jpeg"; data: string } }
+  > = [{ text: prompt }];
+  if (preDataUrl) {
+    parts.push({
+      inlineData: {
+        mimeType: "image/jpeg",
+        data: dataUrlToBase64(preDataUrl),
+      },
+    });
+  }
+  parts.push({
+    inlineData: {
+      mimeType: "image/jpeg",
+      data: dataUrlToBase64(postDataUrl),
+    },
+  });
 
   const body = {
     contents: [
       {
         role: "user",
-        parts: [
-          { text: prompt },
-          {
-            inlineData: {
-              mimeType: "image/jpeg",
-              data: dataUrlToBase64(dataUrl),
-            },
-          },
-        ],
+        parts,
       },
     ],
     generationConfig: {
@@ -139,9 +158,13 @@ Return JSON only: {"move":"<uci or ABSTAIN>","san":"<san>","confidence":0.0}`;
         properties: {
           move: { type: "STRING", enum: [...uciList, "ABSTAIN"] },
           san: { type: "STRING", enum: [...sanList, "ABSTAIN"] },
+          changed_squares: {
+            type: "ARRAY",
+            items: { type: "STRING" },
+          },
           confidence: { type: "NUMBER" },
         },
-        required: ["move", "san", "confidence"],
+        required: ["move", "san", "changed_squares", "confidence"],
       },
       // thinkingConfig is the Gemini 2.5+/3 control for chain-of-thought
       // depth. 0 = instant response. Most chess move-id queries don't
@@ -195,7 +218,12 @@ Return JSON only: {"move":"<uci or ABSTAIN>","san":"<san>","confidence":0.0}`;
   if (!raw) {
     return { kind: "error", reason: "Gemini returned no text", latencyMs };
   }
-  let parsed: { move?: string; san?: string; confidence?: number };
+  let parsed: {
+    move?: string;
+    san?: string;
+    changed_squares?: unknown;
+    confidence?: number;
+  };
   try {
     parsed = JSON.parse(raw);
   } catch {
@@ -241,6 +269,7 @@ Return JSON only: {"move":"<uci or ABSTAIN>","san":"<san>","confidence":0.0}`;
     uci: matched.uci,
     san: matched.san,
     confidence: conf,
+    changedSquares: parseSquares(parsed.changed_squares),
     latencyMs,
     raw,
   };
@@ -255,6 +284,17 @@ function normalizeConfidence(value: unknown): number {
   if (typeof value !== "number" || !Number.isFinite(value)) return 0.5;
   const scaled = value > 1 && value <= 100 ? value / 100 : value;
   return Math.max(0, Math.min(1, scaled));
+}
+
+function parseSquares(value: unknown): Square[] {
+  if (!Array.isArray(value)) return [];
+  const out: Square[] = [];
+  for (const item of value) {
+    if (typeof item === "string" && /^[a-h][1-8]$/.test(item)) {
+      out.push(item as Square);
+    }
+  }
+  return out;
 }
 
 type GeminiResponse = {

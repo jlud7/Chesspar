@@ -85,27 +85,7 @@ export class BurstCamera {
       for (const t of this.stream.getTracks()) t.stop();
       this.stream = null;
     }
-    let constraints: MediaStreamConstraints;
-    if (deviceId) {
-      constraints = {
-        audio: false,
-        video: {
-          deviceId: { exact: deviceId },
-          ...PHOTO_STYLE_VIDEO_CONSTRAINTS,
-          frameRate: { ideal: 30 },
-        },
-      };
-    } else {
-      constraints = {
-        audio: false,
-        video: {
-          facingMode: { ideal: "environment" },
-          ...PHOTO_STYLE_VIDEO_CONSTRAINTS,
-          frameRate: { ideal: 30 },
-        },
-      };
-    }
-    this.stream = await navigator.mediaDevices.getUserMedia(constraints);
+    this.stream = await openBestStream(deviceId);
     this.currentDeviceId = this.stream.getVideoTracks()[0]?.getSettings()?.deviceId ?? null;
     if (this.video) {
       this.video.srcObject = this.stream;
@@ -225,9 +205,59 @@ export class BurstCamera {
   }
 }
 
-const PHOTO_STYLE_VIDEO_CONSTRAINTS = {
-  width: { ideal: 1440 },
-  height: { ideal: 1920 },
+async function openBestStream(deviceId?: string): Promise<MediaStream> {
+  const selector = deviceId
+    ? { deviceId: { exact: deviceId } }
+    : { facingMode: { ideal: "environment" } };
+  const attempts: MediaStreamConstraints[] = [
+    {
+      audio: false,
+      video: {
+        ...selector,
+        ...PORTRAIT_PHOTO_EXACT_CONSTRAINTS,
+        frameRate: { ideal: 30 },
+      },
+    },
+    {
+      audio: false,
+      video: {
+        ...selector,
+        ...PORTRAIT_PHOTO_IDEAL_CONSTRAINTS,
+        frameRate: { ideal: 30 },
+      },
+    },
+    {
+      audio: false,
+      video: {
+        ...selector,
+        width: { ideal: 1920 },
+        height: { ideal: 1080 },
+        frameRate: { ideal: 30 },
+      },
+    },
+  ];
+
+  let lastError: unknown = null;
+  for (const constraints of attempts) {
+    try {
+      return await navigator.mediaDevices.getUserMedia(constraints);
+    } catch (e) {
+      lastError = e;
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error("Camera unavailable");
+}
+
+const PORTRAIT_PHOTO_EXACT_CONSTRAINTS = {
+  width: { ideal: 1080 },
+  height: { ideal: 1440 },
+  aspectRatio: { exact: 3 / 4 },
+  resizeMode: { ideal: "none" },
+} as MediaTrackConstraints & { resizeMode: { ideal: "none" } };
+
+const PORTRAIT_PHOTO_IDEAL_CONSTRAINTS = {
+  width: { ideal: 1080 },
+  height: { ideal: 1440 },
   aspectRatio: { ideal: 3 / 4 },
   resizeMode: { ideal: "none" },
 } as MediaTrackConstraints & { resizeMode: { ideal: "none" } };

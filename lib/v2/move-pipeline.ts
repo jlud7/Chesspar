@@ -13,7 +13,11 @@
  */
 
 import { Chess, type Move } from "chess.js";
-import { rectifyWithContext, refreshBoardLock } from "./board-lock";
+import {
+  BOARD_CONTEXT_MARGIN,
+  rectifyWithContext,
+  refreshBoardLock,
+} from "./board-lock";
 import {
   classifyMoveWithFlash,
   type FlashCandidate,
@@ -30,6 +34,7 @@ import type {
 export type PipelineInput = {
   burst: CapturedBurst;
   lock: BoardLock;
+  previousRectified?: HTMLCanvasElement | null;
   previousFen: string;
   config: SessionConfig;
 };
@@ -49,6 +54,7 @@ export type PipelineOutput = {
     flashConfidence?: number;
     flashLatencyMs?: number;
     flashRaw?: string;
+    visualSquares?: Square[];
     cornerRefresh: "cv" | "claude" | "gemini" | "kept";
   };
 };
@@ -67,6 +73,9 @@ export async function runMovePipeline(
   });
   const liveLock = refreshed.lock;
   const rectified = rectifyWithContext(input.burst.frame, liveLock, size);
+  const visualSquares = input.previousRectified
+    ? findChangedSquares(input.previousRectified, rectified)
+    : [];
 
   const game = new Chess(input.previousFen);
   const legal = game.moves({ verbose: true });
@@ -99,6 +108,7 @@ export async function runMovePipeline(
     proxyUrl: input.config.proxyUrl,
     previousFen: input.previousFen,
     candidates: flashCandidates,
+    preImage: input.previousRectified,
     postImage: rectified,
   });
 
@@ -108,6 +118,7 @@ export async function runMovePipeline(
     flashConfidence: flash.kind === "matched" ? flash.confidence : undefined,
     flashLatencyMs: flash.latencyMs,
     flashRaw: flash.kind === "error" ? undefined : flash.raw,
+    visualSquares,
     cornerRefresh: refreshed.detector,
   };
   const latencyMs = performance.now() - t0;
@@ -155,7 +166,39 @@ export async function runMovePipeline(
     };
   }
   const pick = candidates[pickIdx];
-  const alternates = candidates.filter((_, i) => i !== pickIdx).slice(0, 3);
+  const visuallyRanked = rankCandidatesByVisualDiff(
+    input.previousFen,
+    candidates,
+    visualSquares,
+  );
+  const visualAgreement = visualSquares.length === 0
+    ? false
+    : candidateMatchesVisual(input.previousFen, pick, visualSquares);
+  const geminiAgreement = flash.changedSquares.length === 0
+    ? true
+    : candidateMatchesVisual(input.previousFen, pick, flash.changedSquares);
+  const alternates = visuallyRanked
+    .filter((c) => c.uci !== pick.uci)
+    .slice(0, 3);
+
+  if (!visualAgreement || !geminiAgreement) {
+    const candidatesForUi = [pick, ...alternates].slice(0, 4);
+    return {
+      decision: {
+        kind: "abstain",
+        candidates: candidatesForUi,
+        reason:
+          visualSquares.length === 0
+            ? "I couldn't see a clear before/after change. Capture again after the move is made."
+            : `Model picked ${flash.san}, but the changed squares look like ${visualSquares.join(", ")}. Please confirm.`,
+        pConfident: Math.min(flash.confidence, 0.6),
+        latencyMs,
+      },
+      rectified,
+      lock: liveLock,
+      trace,
+    };
+  }
 
   if (flash.confidence >= input.config.emitThreshold) {
     return {
@@ -163,7 +206,7 @@ export async function runMovePipeline(
         kind: "matched",
         pick,
         alternates,
-        pConfident: flash.confidence,
+        pConfident: Math.min(flash.confidence, 0.99),
         latencyMs,
       },
       rectified,
@@ -208,4 +251,130 @@ function buildCandidate(previousFen: string, move: Move): MoveCandidate {
     toSquare: move.to as Square,
     resultingFen: sim.fen(),
   };
+}
+
+function findChangedSquares(
+  before: HTMLCanvasElement,
+  after: HTMLCanvasElement,
+): Square[] {
+  if (before.width !== after.width || before.height !== after.height) return [];
+  const size = after.width;
+  if (after.height !== size) return [];
+  const bctx = before.getContext("2d", { willReadFrequently: true });
+  const actx = after.getContext("2d", { willReadFrequently: true });
+  if (!bctx || !actx) return [];
+
+  const pad = size * BOARD_CONTEXT_MARGIN;
+  const grid = size - 2 * pad;
+  const cell = grid / 8;
+  const inset = cell * 0.22;
+  const sampleSize = Math.max(4, Math.round(cell - 2 * inset));
+
+  const deltas: Array<{ square: Square; delta: number }> = [];
+  for (let row = 0; row < 8; row++) {
+    for (let col = 0; col < 8; col++) {
+      const x = Math.round(pad + col * cell + inset);
+      const y = Math.round(pad + row * cell + inset);
+      const square = indexToSquare(row * 8 + col);
+      deltas.push({
+        square,
+        delta: meanAbsRgbDiff(bctx, actx, x, y, sampleSize, sampleSize),
+      });
+    }
+  }
+
+  const values = deltas.map((d) => d.delta).sort((a, b) => a - b);
+  const median = values[Math.floor(values.length / 2)] ?? 0;
+  const top = [...deltas].sort((a, b) => b.delta - a.delta);
+  const threshold = Math.max(10, median + 12);
+  return top
+    .filter((d) => d.delta >= threshold)
+    .slice(0, 6)
+    .map((d) => d.square);
+}
+
+function meanAbsRgbDiff(
+  before: CanvasRenderingContext2D,
+  after: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+): number {
+  const a = before.getImageData(x, y, w, h).data;
+  const b = after.getImageData(x, y, w, h).data;
+  let total = 0;
+  let n = 0;
+  for (let i = 0; i < a.length; i += 4) {
+    total +=
+      Math.abs(a[i] - b[i]) +
+      Math.abs(a[i + 1] - b[i + 1]) +
+      Math.abs(a[i + 2] - b[i + 2]);
+    n += 3;
+  }
+  return n ? total / n : 0;
+}
+
+function rankCandidatesByVisualDiff(
+  previousFen: string,
+  candidates: MoveCandidate[],
+  visualSquares: Square[],
+): MoveCandidate[] {
+  return [...candidates].sort((a, b) => {
+    const aScore = visualMatchScore(previousFen, a, visualSquares);
+    const bScore = visualMatchScore(previousFen, b, visualSquares);
+    return bScore - aScore;
+  });
+}
+
+function candidateMatchesVisual(
+  previousFen: string,
+  candidate: MoveCandidate,
+  visualSquares: Square[],
+): boolean {
+  if (visualSquares.length === 0) return false;
+  return visualMatchScore(previousFen, candidate, visualSquares) >= 2;
+}
+
+function visualMatchScore(
+  previousFen: string,
+  candidate: MoveCandidate,
+  visualSquares: Square[],
+): number {
+  const expected = expectedTouchedSquares(previousFen, candidate);
+  let score = 0;
+  for (const sq of expected) {
+    if (visualSquares.includes(sq)) score++;
+  }
+  return score;
+}
+
+function expectedTouchedSquares(
+  previousFen: string,
+  candidate: MoveCandidate,
+): Square[] {
+  const game = new Chess(previousFen);
+  const move = game
+    .moves({ verbose: true })
+    .find((m) => m.from + m.to + (m.promotion ?? "") === candidate.uci);
+  const touched = new Set<Square>([candidate.fromSquare, candidate.toSquare]);
+  if (move?.san === "O-O") {
+    touched.add((move.color === "w" ? "h1" : "h8") as Square);
+    touched.add((move.color === "w" ? "f1" : "f8") as Square);
+  } else if (move?.san === "O-O-O") {
+    touched.add((move.color === "w" ? "a1" : "a8") as Square);
+    touched.add((move.color === "w" ? "d1" : "d8") as Square);
+  }
+  if (move?.flags.includes("e")) {
+    const file = candidate.toSquare[0];
+    const rank = candidate.fromSquare[1];
+    touched.add(`${file}${rank}` as Square);
+  }
+  return [...touched];
+}
+
+function indexToSquare(idx: number): Square {
+  const file = String.fromCharCode("a".charCodeAt(0) + (idx % 8));
+  const rank = 8 - Math.floor(idx / 8);
+  return `${file}${rank}` as Square;
 }

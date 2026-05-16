@@ -224,6 +224,7 @@ export function Capture() {
       const result = await runMovePipeline({
         burst,
         lock,
+        previousRectified: prevRectifiedRef.current,
         previousFen: fenRef.current,
         config,
       });
@@ -260,13 +261,6 @@ export function Capture() {
         });
         setPhase("abstain");
       } else {
-        // Even on error, adopt the new rectified frame as the next
-        // baseline if corners were refreshed — the user just took a
-        // photo so their idea of "current board state" is *this* frame,
-        // not the stale calibration one.
-        if (result.trace.cornerRefresh !== "kept") {
-          prevRectifiedRef.current = result.rectified;
-        }
         setStatusMsg(result.decision.reason);
       }
     } catch (e) {
