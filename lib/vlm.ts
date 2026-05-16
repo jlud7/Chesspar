@@ -139,7 +139,7 @@ function makeGeminiVerifierFromUrl(url: string, model: string): VlmVerifier {
 
 export function makeGeminiVerifier(
   apiKey: string,
-  model = "gemini-2.5-pro",
+  model = "gemini-2.5-flash",
 ): VlmVerifier {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
   return makeGeminiVerifierFromUrl(url, model);
@@ -151,7 +151,7 @@ export function makeGeminiVerifier(
  */
 export function makeGeminiProxyVerifier(
   proxyUrl: string,
-  model = "gemini-2.5-pro",
+  model = "gemini-2.5-flash",
 ): VlmVerifier {
   const url = `${proxyUrl.replace(/\/$/, "")}/gemini?model=${encodeURIComponent(model)}`;
   return makeGeminiVerifierFromUrl(url, model);

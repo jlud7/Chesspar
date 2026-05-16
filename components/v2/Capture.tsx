@@ -165,21 +165,15 @@ export function Capture() {
       }
       lockRef.current = result.lock;
       prevRectifiedRef.current = result.rectified;
-      setConfirmPreview(result.rectified.toDataURL("image/jpeg", 0.9));
+      setConfirmPreview(null);
       const startingFen = `${result.lock.startingFen} w KQkq - 0 1`;
       fenRef.current = startingFen;
       setLockedFen(startingFen);
-      const detectorLabel =
-        result.detector === "gemini"
-          ? "Gemini corners"
-          : result.detector === "florence-cv"
-            ? "Florence + CV"
-            : "CV";
-      setConfirmDetail(
-        `${detectorLabel} · ${Math.round(result.startingCheck.score * 100)}% match${result.magicRotationEscalation ? " · VLM-oriented" : ""}`,
-      );
-      setStatusMsg(null);
-      setPhase("confirm");
+      setConfirmDetail(null);
+      setMoves([]);
+      setLastDecision(null);
+      setStatusMsg("You're good to go. White moves first.");
+      setPhase("playing");
     } catch (e) {
       setStatusMsg(
         e instanceof Error
@@ -328,6 +322,7 @@ export function Capture() {
   }, [moves]);
 
   const showConfirmOverlay = phase === "confirm" && !!confirmPreview;
+  const sideToMove = getSideToMove(fenRef.current);
 
   return (
     <main className="relative flex min-h-dvh flex-col bg-zinc-950 text-zinc-100">
@@ -365,7 +360,7 @@ export function Capture() {
           </LivePreview>
         </div>
 
-        <div className="flex-1 px-4 pb-32 pt-4 sm:px-8">
+        <div className="flex-1 px-4 pb-44 pt-4 sm:px-8">
           {!showConfirmOverlay && (
             <StatusBar
               phase={phase}
@@ -373,6 +368,7 @@ export function Capture() {
               lastDecision={lastDecision}
               busy={busy}
               proxyConfigured={!!PROXY_URL}
+              sideToMove={sideToMove}
             />
           )}
           {(phase === "playing" || phase === "abstain" || phase === "ended") && (
@@ -389,6 +385,7 @@ export function Capture() {
           onStart={startCamera}
           onCapture={captureForLock}
           onMove={captureMove}
+          sideToMove={sideToMove}
         />
       </div>
 
@@ -544,6 +541,7 @@ function StatusBar({
   lastDecision,
   busy,
   proxyConfigured,
+  sideToMove,
 }: {
   phase: Phase;
   statusMsg: string | null;
@@ -554,10 +552,18 @@ function StatusBar({
   } | null;
   busy: boolean;
   proxyConfigured: boolean;
+  sideToMove: "white" | "black";
 }) {
   if (statusMsg) {
+    const tone = statusTone(statusMsg, busy);
+    const classes =
+      tone === "good"
+        ? "border-emerald-400/25 bg-emerald-400/10 text-emerald-100"
+        : tone === "busy"
+          ? "border-white/10 bg-white/5 text-zinc-300"
+          : "border-amber-300/20 bg-amber-300/5 text-amber-200";
     return (
-      <div className="rounded-xl border border-amber-300/20 bg-amber-300/5 px-4 py-3 text-[13px] text-amber-200">
+      <div className={`rounded-xl border px-4 py-3 text-[13px] ${classes}`}>
         {statusMsg}
       </div>
     );
@@ -588,8 +594,11 @@ function StatusBar({
   if (phase === "playing") {
     return (
       <div className="rounded-xl border border-white/5 bg-white/5 px-4 py-3 text-[12px] text-zinc-400">
-        Make your move, then tap{" "}
-        <span className="font-medium text-zinc-200">Capture move</span> below.
+        Make the move, then tap the{" "}
+        <span className="font-medium text-zinc-200">
+          {sideToMove === "white" ? "White moved" : "Black moved"}
+        </span>{" "}
+        clock button.
       </div>
     );
   }
@@ -627,12 +636,14 @@ function ActionBar({
   onStart,
   onCapture,
   onMove,
+  sideToMove,
 }: {
   phase: Phase;
   busy: boolean;
   onStart: () => void;
   onCapture: () => void;
   onMove: () => void;
+  sideToMove: "white" | "black";
 }) {
   if (phase === "ended") {
     return (
@@ -647,20 +658,36 @@ function ActionBar({
     );
   }
   if (phase === "confirm" || phase === "locking") return null;
+  if (phase === "playing") {
+    return (
+      <div className="fixed inset-x-0 bottom-0 z-30 border-t border-white/5 bg-zinc-950/95 p-3 pb-[calc(env(safe-area-inset-bottom)+0.75rem)] backdrop-blur">
+        <div className="mx-auto grid h-32 max-w-3xl grid-cols-2 overflow-hidden rounded-[2rem] border border-white/10 bg-white/5 shadow-2xl">
+          <ClockButton
+            side="white"
+            active={sideToMove === "white"}
+            busy={busy && sideToMove === "white"}
+            onClick={onMove}
+          />
+          <ClockButton
+            side="black"
+            active={sideToMove === "black"}
+            busy={busy && sideToMove === "black"}
+            onClick={onMove}
+          />
+        </div>
+      </div>
+    );
+  }
   const label =
     phase === "needCamera"
       ? "Start camera"
-      : phase === "framing"
-        ? "Capture starting position"
-        : "Capture move";
+      : "Capture starting position";
   const handler =
     phase === "needCamera"
       ? onStart
       : phase === "framing"
         ? onCapture
-        : phase === "playing"
-          ? onMove
-          : undefined;
+        : undefined;
   if (!handler) return null;
   return (
     <div className="fixed inset-x-0 bottom-0 z-30 flex justify-center border-t border-white/5 bg-zinc-950/95 px-4 py-5 backdrop-blur">
@@ -673,6 +700,57 @@ function ActionBar({
       </button>
     </div>
   );
+}
+
+function ClockButton({
+  side,
+  active,
+  busy,
+  onClick,
+}: {
+  side: "white" | "black";
+  active: boolean;
+  busy: boolean;
+  onClick: () => void;
+}) {
+  const isWhite = side === "white";
+  return (
+    <button
+      onClick={onClick}
+      disabled={!active || busy}
+      className={[
+        "flex flex-col items-center justify-center border-white/10 px-3 text-center transition",
+        isWhite ? "border-r" : "",
+        active
+          ? isWhite
+            ? "bg-zinc-100 text-zinc-950"
+            : "bg-zinc-800 text-zinc-50"
+          : "bg-zinc-900/70 text-zinc-500",
+        !busy && active ? "active:scale-[0.99]" : "",
+      ].join(" ")}
+    >
+      <span className="text-[11px] font-semibold uppercase tracking-[0.28em]">
+        {side}
+      </span>
+      <span className="mt-2 text-xl font-semibold">
+        {busy ? "Capturing..." : active ? `${capitalize(side)} moved` : "Waiting"}
+      </span>
+    </button>
+  );
+}
+
+function statusTone(message: string, busy: boolean): "good" | "busy" | "error" {
+  if (message.startsWith("You're good")) return "good";
+  if (busy || /capturing|locking|working/i.test(message)) return "busy";
+  return "error";
+}
+
+function getSideToMove(fen: string): "white" | "black" {
+  return fen.split(/\s+/)[1] === "b" ? "black" : "white";
+}
+
+function capitalize(side: "white" | "black"): string {
+  return side[0].toUpperCase() + side.slice(1);
 }
 
 function gameIsOver(fen: string): boolean {

@@ -180,8 +180,8 @@ export default {
       });
     } else if (isGemini) {
       // Gemini: model is selected via ?model=... query param so we don't
-      // need to parse the body to route. Default to gemini-2.5-pro.
-      const model = url.searchParams.get("model") ?? "gemini-2.5-pro";
+      // need to parse the body to route. Default to the fast live-capture model.
+      const model = url.searchParams.get("model") ?? "gemini-2.5-flash";
       const target = `${GEMINI_BASE}/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(env.GEMINI_API_KEY!)}`;
       upstream = await fetch(target, {
         method: "POST",

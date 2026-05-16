@@ -8,6 +8,13 @@
  * focal range, and default to the widest back camera so the user can
  * stand the phone close to the board and still capture the whole thing.
  *
+ * Important iPhone detail: camera apps show PHOTO mode as a 4:3 sensor
+ * crop, but Safari often defaults getUserMedia to a narrower 16:9 video
+ * crop. That is why the board can look cut off in Chesspar while the
+ * native 0.5x camera still shows the full left/right edges. We request
+ * a portrait 4:3 feed and `resizeMode: none` as ideals so browsers that
+ * support full-sensor capture do not silently center-crop the preview.
+ *
  * Public surface:
  *   BurstCamera.listBackCameras()      — array of {deviceId, label, role}
  *   BurstCamera.attach(video, opts)    — bind to a <video>, start stream
@@ -84,8 +91,7 @@ export class BurstCamera {
         audio: false,
         video: {
           deviceId: { exact: deviceId },
-          width: { ideal: 1920 },
-          height: { ideal: 1080 },
+          ...PHOTO_STYLE_VIDEO_CONSTRAINTS,
           frameRate: { ideal: 30 },
         },
       };
@@ -94,8 +100,7 @@ export class BurstCamera {
         audio: false,
         video: {
           facingMode: { ideal: "environment" },
-          width: { ideal: 1920 },
-          height: { ideal: 1080 },
+          ...PHOTO_STYLE_VIDEO_CONSTRAINTS,
           frameRate: { ideal: 30 },
         },
       };
@@ -219,6 +224,13 @@ export class BurstCamera {
     };
   }
 }
+
+const PHOTO_STYLE_VIDEO_CONSTRAINTS = {
+  width: { ideal: 1440 },
+  height: { ideal: 1920 },
+  aspectRatio: { ideal: 3 / 4 },
+  resizeMode: { ideal: "none" },
+} as MediaTrackConstraints & { resizeMode: { ideal: "none" } };
 
 /**
  * Heuristic mapping from device.label to a camera role. Apple's labels

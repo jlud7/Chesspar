@@ -4,13 +4,8 @@
  * the user's leg / table / fallen pieces and corrupt the warp.
  *
  * Cascade (tries each in order, returns the first successful result):
- *   1. Claude Sonnet 4.6 via /verify  — uses ANTHROPIC_API_KEY
- *   2. Gemini 2.5 Pro via /gemini     — uses GEMINI_API_KEY (cheaper)
- *
- * Claude is primary here because ANTHROPIC_API_KEY is the secret most
- * Chesspar deployments already have configured. If you also set
- * GEMINI_API_KEY on the worker, this falls back to Gemini transparently
- * if Claude returns an unparseable response, and saves ~$0.001/call.
+ *   1. Gemini 2.5 Flash via /gemini   — fast path for live phone UX
+ *   2. Claude Sonnet 4.6 via /verify  — fallback when Gemini abstains
  *
  * Each call returns 4 named corners in normalized [0,1] coords. We map
  * them to the standard [a8, h8, h1, a1] clockwise order that
@@ -64,17 +59,7 @@ export async function detectCornersMagic(opts: {
   const dataUrl = scaled.toDataURL("image/jpeg", 0.9);
   const tried: Array<{ detector: string; reason: string }> = [];
 
-  // ---- 1) Claude Sonnet 4.6 via /verify ----
-  const claude = await detectViaClaude(opts.proxyUrl, dataUrl);
-  if (claude.kind === "parsed") {
-    const corners = mapCorners(claude.parsed, w, h);
-    if (corners) return { kind: "detected", corners, detector: "claude", raw: claude.raw };
-    tried.push({ detector: "claude", reason: "corners failed sanity check" });
-  } else {
-    tried.push({ detector: "claude", reason: claude.reason });
-  }
-
-  // ---- 2) Gemini 2.5 Pro via /gemini ----
+  // ---- 1) Gemini 2.5 Flash via /gemini ----
   const gemini = await detectViaGemini(opts.proxyUrl, dataUrl);
   if (gemini.kind === "parsed") {
     const corners = mapCorners(gemini.parsed, w, h);
@@ -82,6 +67,16 @@ export async function detectCornersMagic(opts: {
     tried.push({ detector: "gemini", reason: "corners failed sanity check" });
   } else {
     tried.push({ detector: "gemini", reason: gemini.reason });
+  }
+
+  // ---- 2) Claude Sonnet 4.6 via /verify ----
+  const claude = await detectViaClaude(opts.proxyUrl, dataUrl);
+  if (claude.kind === "parsed") {
+    const corners = mapCorners(claude.parsed, w, h);
+    if (corners) return { kind: "detected", corners, detector: "claude", raw: claude.raw };
+    tried.push({ detector: "claude", reason: "corners failed sanity check" });
+  } else {
+    tried.push({ detector: "claude", reason: claude.reason });
   }
 
   return {
@@ -157,7 +152,7 @@ async function detectViaGemini(
   dataUrl: string,
 ): Promise<DetectInner> {
   const endpoint =
-    proxyUrl.replace(/\/$/, "") + "/gemini?model=gemini-2.5-pro";
+    proxyUrl.replace(/\/$/, "") + "/gemini?model=gemini-2.5-flash";
   const body = {
     contents: [
       {
@@ -175,6 +170,9 @@ async function detectViaGemini(
     ],
     generationConfig: {
       temperature: 0.0,
+      thinkingConfig: {
+        thinkingBudget: 0,
+      },
       responseMimeType: "application/json",
       responseSchema: {
         type: "OBJECT",

@@ -33,6 +33,7 @@ import {
   magicRotationFallback,
   pickBestRotation,
   validateStartingPosition,
+  validateStartingPositionWithGemini,
   type RotationPick,
   type StartingCheck,
 } from "./starting-position";
@@ -149,12 +150,25 @@ export async function lockBoardFromImage(
   }
 
   const startingCheck = validateStartingPosition(chosen.rectified);
+  let vlmStartingCheck: Awaited<
+    ReturnType<typeof validateStartingPositionWithGemini>
+  > = null;
+  if (startingCheck.score < MIN_LOCK_SCORE && opts.proxyUrl) {
+    vlmStartingCheck = await validateStartingPositionWithGemini({
+      proxyUrl: opts.proxyUrl,
+      image: source,
+    });
+  }
+  const vlmAccepted =
+    !!vlmStartingCheck &&
+    vlmStartingCheck.valid &&
+    vlmStartingCheck.confidence >= 0.65;
 
   // ---- 4) Reject low-quality locks rather than ship bad corners ----
-  if (startingCheck.score < MIN_LOCK_SCORE) {
+  if (startingCheck.score < MIN_LOCK_SCORE && !vlmAccepted) {
     return {
       kind: "failed",
-      reason: `Board found, but starting position match is only ${Math.round(startingCheck.score * 100)}% (need ≥ ${Math.round(MIN_LOCK_SCORE * 100)}%). Make sure: (1) standard starting position is set up, (2) all 4 corners are visible, (3) lighting is even, (4) phone is held steady. Then tap Retake.`,
+      reason: `I couldn't verify the starting setup (${Math.round(startingCheck.score * 100)}% match). Keep all pieces and board corners visible, then snapshot again.`,
     };
   }
 

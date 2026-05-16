@@ -270,6 +270,9 @@ export async function magicRotationFallback(opts: {
     ],
     generationConfig: {
       temperature: 0.0,
+      thinkingConfig: {
+        thinkingBudget: 0,
+      },
       responseMimeType: "application/json",
       responseSchema: {
         type: "OBJECT",
@@ -283,7 +286,7 @@ export async function magicRotationFallback(opts: {
   };
   try {
     const resp = await fetch(
-      `${opts.proxyUrl.replace(/\/$/, "")}/gemini?model=gemini-2.5-pro`,
+      `${opts.proxyUrl.replace(/\/$/, "")}/gemini?model=gemini-2.5-flash`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -301,6 +304,99 @@ export async function magicRotationFallback(opts: {
     return {
       rotation: opts.alternatives[idx].rotation,
       reason: parsed.reason ?? "",
+    };
+  } catch {
+    return null;
+  }
+}
+
+export type VlmStartingCheck = {
+  valid: boolean;
+  confidence: number;
+  whiteSide: "top" | "right" | "bottom" | "left" | "unknown";
+  errors: string;
+};
+
+/**
+ * Forgiving start-position check. The pixel scorer is deliberately strict
+ * because it protects geometry, but phone shots with tall pieces near the
+ * edge often under-score despite being perfectly valid. Gemini only answers
+ * the small question we actually need here: is this a normal starting setup?
+ */
+export async function validateStartingPositionWithGemini(opts: {
+  proxyUrl: string;
+  image: HTMLCanvasElement;
+}): Promise<VlmStartingCheck | null> {
+  if (!opts.proxyUrl) return null;
+  const body = {
+    contents: [
+      {
+        role: "user",
+        parts: [
+          {
+            text: `This is a photo of a physical chessboard before a game.
+Check only whether the pieces are in the standard chess starting position. The board may be rotated in the image.
+Return JSON only: {"valid":true,"white_side":"top|right|bottom|left|unknown","confidence":0.0,"errors":""}`,
+          },
+          {
+            inlineData: {
+              mimeType: "image/jpeg",
+              data: dataUrlToBase64(
+                downscaleCanvas(opts.image, 1280).toDataURL("image/jpeg", 0.88),
+              ),
+            },
+          },
+        ],
+      },
+    ],
+    generationConfig: {
+      temperature: 0,
+      thinkingConfig: {
+        thinkingBudget: 0,
+      },
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: "OBJECT",
+        properties: {
+          valid: { type: "BOOLEAN" },
+          white_side: {
+            type: "STRING",
+            enum: ["top", "right", "bottom", "left", "unknown"],
+          },
+          confidence: { type: "NUMBER" },
+          errors: { type: "STRING" },
+        },
+        required: ["valid", "white_side", "confidence", "errors"],
+      },
+    },
+  };
+
+  try {
+    const resp = await fetch(
+      `${opts.proxyUrl.replace(/\/$/, "")}/gemini?model=gemini-2.5-flash`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+    );
+    if (!resp.ok) return null;
+    const data = (await resp.json()) as {
+      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+    };
+    const raw = data.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as {
+      valid?: boolean;
+      white_side?: VlmStartingCheck["whiteSide"];
+      confidence?: number;
+      errors?: string;
+    };
+    return {
+      valid: parsed.valid === true,
+      confidence: normalizeConfidence(parsed.confidence),
+      whiteSide: parsed.white_side ?? "unknown",
+      errors: parsed.errors ?? "",
     };
   } catch {
     return null;
@@ -337,4 +433,22 @@ function buildMosaic(
 function dataUrlToBase64(d: string): string {
   const i = d.indexOf(",");
   return i >= 0 ? d.slice(i + 1) : d;
+}
+
+function downscaleCanvas(canvas: HTMLCanvasElement, maxDim: number): HTMLCanvasElement {
+  const scale = Math.min(1, maxDim / Math.max(canvas.width, canvas.height));
+  if (scale >= 1) return canvas;
+  const c = document.createElement("canvas");
+  c.width = Math.round(canvas.width * scale);
+  c.height = Math.round(canvas.height * scale);
+  const ctx = c.getContext("2d");
+  if (!ctx) return canvas;
+  ctx.drawImage(canvas, 0, 0, c.width, c.height);
+  return c;
+}
+
+function normalizeConfidence(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return 0;
+  const scaled = value > 1 && value <= 100 ? value / 100 : value;
+  return Math.max(0, Math.min(1, scaled));
 }
