@@ -1,11 +1,12 @@
 /**
- * Chesspar v2 — diff-first hybrid move detection.
+ * Chesspar v2 — Gemini Flash classifier as the primary move detector.
  *
- * Architecture: Option C from the research PDFs at the repo root.
- * Capture a sharp post-move frame, warp to canonical board, diff against
- * the cached pre-move frame, enumerate legal moves whose touched-square
- * set explains the diff, escalate ambiguities to a VLM, abstain rather
- * than emit silent errors.
+ * Strategy: each captured frame, we rectify the board, enumerate every
+ * legal move from chess.js, and ask Gemini 3 Flash which legal move was
+ * just played. The model returns its own confidence; we emit if it's
+ * above the threshold and abstain otherwise so the user can tap-to-
+ * confirm. No diff, no beam search, no per-square classifier — the VLM
+ * is doing the whole inference job on a constrained set.
  */
 
 export type Point = { x: number; y: number };
@@ -14,9 +15,6 @@ export type Point = { x: number; y: number };
 export type Corners = readonly [Point, Point, Point, Point];
 
 export type Side = "white" | "black";
-
-/** Per-square label space for the diff/classifier path. */
-export type SquareState = "empty" | "white" | "black";
 
 export type Square =
   | `${"a" | "b" | "c" | "d" | "e" | "f" | "g" | "h"}${
@@ -31,15 +29,15 @@ export type Square =
 
 /**
  * One captured burst, post-Laplacian selection. The chosen `frame` is the
- * sharpest of the 5; `variance` is its Laplacian variance (used by the
- * confidence model + smoke-test rejection of motion-blurred bursts).
+ * sharpest of the 5; `variance` is its Laplacian variance (used by smoke-
+ * test rejection of motion-blurred bursts).
  */
 export type CapturedBurst = {
   frame: HTMLCanvasElement;
   variance: number;
   /** Wall-clock ms when the burst was triggered. */
   capturedAt: number;
-  /** All 5 frames, ranked sharpest-first. Kept for VLM escalation. */
+  /** All 5 frames, ranked sharpest-first. Kept for retry/diagnostics. */
   rankedFrames: HTMLCanvasElement[];
 };
 
@@ -60,24 +58,8 @@ export type BoardLock = {
   florenceBbox?: { x1: number; y1: number; x2: number; y2: number };
 };
 
-/** What the diff detector emits — 0–6 candidate changed squares. */
-export type DiffResult = {
-  /** Algebraic squares where the HSV-V delta exceeded the threshold. */
-  changedSquares: Square[];
-  /** Per-square normalized delta in [0, 1]. Length 64, row-major from a8. */
-  perSquareDelta: number[];
-  /** Sharpest-frame Laplacian variance, propagated for confidence scoring. */
-  frameSharpness: number;
-};
-
-/**
- * A scored legal-move candidate from the beam search.
- *
- * `score` is in nats and aggregates: log P(piece on destination | classifier),
- * occupancy-delta alignment with the move's touched-square template, and
- * a small Stockfish prior bonus (capped per the PDFs to avoid pushing
- * sub-1400 players' unnatural moves out of the candidate set).
- */
+/** Minimal legal-move record the UI needs to render an abstention prompt
+ *  and apply the chosen move via chess.js. */
 export type MoveCandidate = {
   san: string;
   uci: string;
@@ -85,15 +67,6 @@ export type MoveCandidate = {
   toSquare: Square;
   /** Resulting FEN if this move is played. */
   resultingFen: string;
-  /** Touched-square template (length 2–4 depending on castle/EP). */
-  touchedSquares: Square[];
-  score: number;
-  /** Subscores kept for the confidence model. */
-  subscores: {
-    diffAlignment: number;
-    classifierLogP: number;
-    enginePrior: number;
-  };
 };
 
 /**
@@ -104,11 +77,10 @@ export type MoveDecision =
   | {
       kind: "matched";
       pick: MoveCandidate;
-      /** Top alternates kept for the abstention UI on later disagreement. */
+      /** Other legal moves, surfaced to the abstention UI on later disagreement. */
       alternates: MoveCandidate[];
       pConfident: number;
       latencyMs: number;
-      escalation: "none" | "vlm";
     }
   | {
       kind: "abstain";
@@ -126,9 +98,11 @@ export type MoveDecision =
 export type SessionConfig = {
   /** Cloudflare worker root, e.g. https://chesspar-vlm.<acct>.workers.dev */
   proxyUrl: string;
-  /** Whether to call Gemini 2.5 Pro on disputed tiles. */
-  enableVlmEscalation: boolean;
-  /** Confidence threshold to emit without abstaining. PDFs recommend 0.99. */
+  /**
+   * Confidence threshold to emit without abstaining. Flash returns a
+   * direct per-call probability (not a noisy aggregator like the old
+   * diff-first stack), so this can be much looser than the prior 0.97.
+   */
   emitThreshold: number;
   /** Burst size in frames. PDFs recommend 5–10. */
   burstSize: number;
@@ -140,8 +114,7 @@ export type SessionConfig = {
 
 export const DEFAULT_CONFIG: SessionConfig = {
   proxyUrl: "",
-  enableVlmEscalation: true,
-  emitThreshold: 0.97,
+  emitThreshold: 0.85,
   burstSize: 5,
   burstIntervalMs: 40,
   canonicalSize: 512,

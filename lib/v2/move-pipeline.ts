@@ -1,59 +1,54 @@
 /**
- * Move pipeline — the orchestrator the UI calls.
+ * Move pipeline — orchestrator the UI calls.
  *
  * One pass per user tap:
- *   1. Warp the sharpest burst frame to canonical board space.
- *   2. Diff against the cached pre-move frame to find changed squares.
- *   3. Beam-search legal moves whose template matches.
- *   4. Score confidence; emit if ≥ threshold.
- *   5. Otherwise escalate to Gemini 2.5 Pro on the disputed candidates.
- *   6. If still unsure, abstain with the top-2 for tap-to-confirm.
- *
- * State the caller is expected to keep between moves:
- *   - the BoardLock from session start
- *   - the previous FEN (chess.js position before this move)
- *   - the previous rectified canvas (becomes the pre-frame for diff)
+ *   1. Refresh the board lock against the new frame (so a phone shift
+ *      between moves doesn't poison the warp).
+ *   2. Warp the sharpest burst frame to canonical board space.
+ *   3. Enumerate every legal move from chess.js.
+ *   4. Hand the legal list + post-move image to Gemini Flash and ask
+ *      which move was played.
+ *   5. Emit if confidence ≥ threshold, otherwise abstain with the top
+ *      candidates for tap-to-confirm.
  */
 
-import { Chess } from "chess.js";
+import { Chess, type Move } from "chess.js";
 import { rectifyWithLock, refreshBoardLock } from "./board-lock";
-import { computeOccupancyDelta } from "./occupancy-delta";
-import { searchLegalMoves } from "./move-search";
-import { pCorrect, buildFeatures } from "./confidence";
-import { adjudicateMove } from "./gemini-adjudicator";
+import {
+  classifyMoveWithFlash,
+  type FlashCandidate,
+} from "./gemini-flash-classifier";
 import type {
   BoardLock,
   CapturedBurst,
+  MoveCandidate,
   MoveDecision,
   SessionConfig,
+  Square,
 } from "./types";
 
 export type PipelineInput = {
   burst: CapturedBurst;
   lock: BoardLock;
   previousFen: string;
-  /** Rectified canvas from the previous emit (or the calibration frame
-   *  for move #1). The pre side of the diff. */
-  previousRectified: HTMLCanvasElement;
   config: SessionConfig;
 };
 
 export type PipelineOutput = {
   decision: MoveDecision;
-  /** Rectified post-move canvas — caller should keep this as the next
-   *  move's pre-frame on a successful emit. */
+  /** Rectified post-move canvas — caller should keep this around for the
+   *  abstention UI / next-move baseline display. */
   rectified: HTMLCanvasElement;
   /** Possibly-refreshed lock — caller should adopt this so future
    *  captures use the latest corners. */
   lock: BoardLock;
   /** Trace data for diagnostics / debug overlay. */
   trace: {
-    changedSquares: string[];
-    perSquareDelta: number[];
-    candidateSummary: Array<{ san: string; score: number }>;
-    pConfident: number;
-    laplacian: number;
-    escalation: "none" | "vlm";
+    legalCount: number;
+    flashSan?: string;
+    flashConfidence?: number;
+    flashLatencyMs?: number;
+    flashRaw?: string;
     cornerRefresh: "claude" | "gemini" | "kept";
   };
 };
@@ -65,128 +60,99 @@ export async function runMovePipeline(
   const size = input.config.canonicalSize;
 
   // Per-capture corner refresh — solves the "phone shifted between
-  // moves and diff sees garbage" failure mode that the locked-once
-  // approach can't recover from. Costs ~1 s + ~$0.001/move via Claude
-  // or Gemini; cheap insurance against drift.
+  // moves" failure mode that the locked-once approach can't recover
+  // from. ~1 s + ~$0.001/move via Claude or Gemini.
   const refreshed = await refreshBoardLock(input.burst.frame, input.lock, {
     proxyUrl: input.config.proxyUrl,
   });
   const liveLock = refreshed.lock;
   const rectified = rectifyWithLock(input.burst.frame, liveLock, size);
 
-  const diff = computeOccupancyDelta(input.previousRectified, rectified, {
-    size,
-  });
-  diff.frameSharpness = input.burst.variance;
+  const game = new Chess(input.previousFen);
+  const legal = game.moves({ verbose: true });
 
-  // Run beam search even when changedSquares < 2 — chess.js will return
-  // an empty list and we surface a meaningful "no change detected" error
-  // rather than crashing.
-  let candidates = searchLegalMoves(input.previousFen, diff);
-
-  // Edge case: zero candidates because the diff missed a square that the
-  // legality filter requires. Relax the slack to 2 and try again — beats
-  // an immediate VLM call.
-  if (candidates.length === 0 && diff.changedSquares.length > 0) {
-    candidates = searchLegalMoves(input.previousFen, diff, undefined, {
-      slack: 2,
-    });
-  }
-
-  if (candidates.length === 0) {
+  if (legal.length === 0) {
     return {
       decision: {
         kind: "error",
         reason:
-          diff.changedSquares.length === 0
-            ? "No change detected — make sure your move is complete and the board is fully in frame"
-            : "No legal move matches the observed change — re-check the previous position",
+          "No legal moves from the previous position — the game may already be over.",
         latencyMs: performance.now() - t0,
       },
       rectified,
       lock: liveLock,
-      trace: {
-        changedSquares: diff.changedSquares,
-        perSquareDelta: diff.perSquareDelta,
-        candidateSummary: [],
-        pConfident: 0,
-        laplacian: input.burst.variance,
-        escalation: "none",
-        cornerRefresh: refreshed.detector,
-      },
+      trace: { legalCount: 0, cornerRefresh: refreshed.detector },
     };
   }
 
-  const features = buildFeatures(candidates, diff);
-  const pConf0 = pCorrect(features);
-  let escalation: "none" | "vlm" = "none";
-  let chosenSan = candidates[0].san;
-  let pConfident = pConf0;
+  const candidates: MoveCandidate[] = legal.map((m) =>
+    buildCandidate(input.previousFen, m),
+  );
+  const flashCandidates: FlashCandidate[] = candidates.map((c) => ({
+    san: c.san,
+    uci: c.uci,
+    fromSquare: c.fromSquare,
+    toSquare: c.toSquare,
+  }));
 
-  // Escalate to VLM if confidence is below threshold AND we have at
-  // least two plausible candidates AND the user enabled the proxy.
-  // Single-candidate moves go through directly because there is nothing
-  // to adjudicate.
-  if (
-    pConf0 < input.config.emitThreshold &&
-    candidates.length >= 2 &&
-    input.config.enableVlmEscalation &&
-    input.config.proxyUrl
-  ) {
-    const adj = await adjudicateMove({
-      proxyUrl: input.config.proxyUrl,
-      previousFen: input.previousFen,
-      candidates: candidates.slice(0, 5),
-      postFrame: rectified,
-      preFrame: input.previousRectified,
-    });
-    if (adj.kind === "matched") {
-      chosenSan = adj.san;
-      // Re-rank: put the chosen candidate first; keep others as alternates.
-      const idx = candidates.findIndex((c) => c.san === adj.san);
-      if (idx > 0) {
-        const [pick] = candidates.splice(idx, 1);
-        candidates.unshift(pick);
-      }
-      escalation = "vlm";
-      // VLM raises confidence proportional to its own self-reported value,
-      // but capped so a deeply-uncertain VLM can't push us past the
-      // abstain threshold.
-      pConfident = Math.min(0.998, pConf0 + 0.5 * adj.confidence);
-    } else if (adj.kind === "abstain") {
-      escalation = "vlm";
-      // Abstain at the orchestrator level too — the VLM saw the same
-      // ambiguity we did.
-      pConfident = Math.min(pConf0, 0.6);
-    }
-    // On VLM error, fall back to the pre-VLM confidence — the orchestrator
-    // will abstain if below threshold.
-  }
+  const flash = await classifyMoveWithFlash({
+    proxyUrl: input.config.proxyUrl,
+    previousFen: input.previousFen,
+    candidates: flashCandidates,
+    postImage: rectified,
+  });
 
   const trace = {
-    changedSquares: diff.changedSquares,
-    perSquareDelta: diff.perSquareDelta,
-    candidateSummary: candidates
-      .slice(0, 5)
-      .map((c) => ({ san: c.san, score: c.score })),
-    pConfident,
-    laplacian: input.burst.variance,
-    escalation,
+    legalCount: legal.length,
+    flashSan: flash.kind === "matched" ? flash.san : undefined,
+    flashConfidence: flash.kind === "matched" ? flash.confidence : undefined,
+    flashLatencyMs: flash.latencyMs,
+    flashRaw: flash.kind === "error" ? undefined : flash.raw,
     cornerRefresh: refreshed.detector,
   };
   const latencyMs = performance.now() - t0;
 
-  if (pConfident >= input.config.emitThreshold) {
-    const pickIdx = candidates.findIndex((c) => c.san === chosenSan);
-    const pick = candidates[Math.max(0, pickIdx)];
+  if (flash.kind === "error") {
+    return {
+      decision: {
+        kind: "error",
+        reason: `Move classifier failed: ${flash.reason}`,
+        latencyMs,
+      },
+      rectified,
+      lock: liveLock,
+      trace,
+    };
+  }
+
+  if (flash.kind === "abstain") {
+    return {
+      decision: {
+        kind: "abstain",
+        candidates: candidates.slice(0, 4),
+        reason: "The model couldn't tell which legal move was played.",
+        pConfident: 0,
+        latencyMs,
+      },
+      rectified,
+      lock: liveLock,
+      trace,
+    };
+  }
+
+  // matched
+  const pickIdx = candidates.findIndex((c) => c.san === flash.san);
+  const pick = candidates[Math.max(0, pickIdx)];
+  const alternates = candidates.filter((_, i) => i !== pickIdx).slice(0, 3);
+
+  if (flash.confidence >= input.config.emitThreshold) {
     return {
       decision: {
         kind: "matched",
         pick,
-        alternates: candidates.filter((_, i) => i !== pickIdx).slice(0, 3),
-        pConfident,
+        alternates,
+        pConfident: flash.confidence,
         latencyMs,
-        escalation,
       },
       rectified,
       lock: liveLock,
@@ -197,12 +163,9 @@ export async function runMovePipeline(
   return {
     decision: {
       kind: "abstain",
-      candidates: candidates.slice(0, 3),
-      reason:
-        escalation === "vlm"
-          ? "VLM was uncertain — please confirm the move"
-          : "Multiple moves match the change — please confirm",
-      pConfident,
+      candidates: [pick, ...alternates].slice(0, 4),
+      reason: `Model picked ${flash.san} (${Math.round(flash.confidence * 100)}%) — please confirm.`,
+      pConfident: flash.confidence,
       latencyMs,
     },
     rectified,
@@ -221,4 +184,16 @@ export function applyMove(previousFen: string, san: string): string | null {
   } catch {
     return null;
   }
+}
+
+function buildCandidate(previousFen: string, move: Move): MoveCandidate {
+  const sim = new Chess(previousFen);
+  sim.move({ from: move.from, to: move.to, promotion: move.promotion });
+  return {
+    san: move.san,
+    uci: move.from + move.to + (move.promotion ?? ""),
+    fromSquare: move.from as Square,
+    toSquare: move.to as Square,
+    resultingFen: sim.fen(),
+  };
 }

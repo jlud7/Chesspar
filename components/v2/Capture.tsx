@@ -79,14 +79,12 @@ export function Capture() {
     san?: string;
     pConf?: number;
     latencyMs?: number;
-    escalation?: "none" | "vlm";
   } | null>(null);
 
   const config: SessionConfig = useMemo(
     () => ({
       ...DEFAULT_CONFIG,
       proxyUrl: PROXY_URL,
-      enableVlmEscalation: !!PROXY_URL,
     }),
     [],
   );
@@ -215,8 +213,7 @@ export function Capture() {
   const captureMove = useCallback(async () => {
     const cam = cameraRef.current;
     const lock = lockRef.current;
-    const prev = prevRectifiedRef.current;
-    if (!cam || !lock || !prev) return;
+    if (!cam || !lock) return;
     setBusy(true);
     setStatusMsg("Capturing move…");
     try {
@@ -234,7 +231,6 @@ export function Capture() {
         burst,
         lock,
         previousFen: fenRef.current,
-        previousRectified: prev,
         config,
       });
       // Adopt the (possibly-refreshed) lock for the next capture so
@@ -255,7 +251,6 @@ export function Capture() {
           san,
           pConf: result.decision.pConfident,
           latencyMs: result.decision.latencyMs,
-          escalation: result.decision.escalation,
         });
         setStatusMsg(null);
         if (gameIsOver(newFen)) setPhase("ended");
@@ -548,7 +543,6 @@ function StatusBar({
     san?: string;
     pConf?: number;
     latencyMs?: number;
-    escalation?: "none" | "vlm";
   } | null;
   busy: boolean;
   proxyConfigured: boolean;
@@ -568,11 +562,6 @@ function StatusBar({
         <span className="text-emerald-200/80">
           {Math.round((lastDecision.pConf ?? 0) * 100)}% confidence
         </span>
-        {lastDecision.escalation === "vlm" && (
-          <span className="rounded-full bg-violet-400/20 px-2 py-0.5 text-[10px] uppercase tracking-widest text-violet-200">
-            VLM
-          </span>
-        )}
         {typeof lastDecision.latencyMs === "number" && (
           <span className="ml-auto text-[11px] text-emerald-300/60">
             {Math.round(lastDecision.latencyMs)} ms
@@ -583,8 +572,8 @@ function StatusBar({
   }
   if (phase === "playing" && !proxyConfigured) {
     return (
-      <div className="rounded-xl border border-white/5 bg-white/5 px-4 py-3 text-[12px] text-zinc-400">
-        Running without VLM escalation. Set <code className="font-mono">NEXT_PUBLIC_VLM_PROXY_URL</code> to enable Gemini tiebreaks.
+      <div className="rounded-xl border border-amber-300/20 bg-amber-300/5 px-4 py-3 text-[12px] text-amber-200">
+        Set <code className="font-mono">NEXT_PUBLIC_VLM_PROXY_URL</code> to enable the Gemini Flash move classifier. Without it Chesspar can&apos;t infer moves.
       </div>
     );
   }
