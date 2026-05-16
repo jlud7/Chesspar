@@ -270,9 +270,6 @@ export async function magicRotationFallback(opts: {
     ],
     generationConfig: {
       temperature: 0.0,
-      thinkingConfig: {
-        thinkingBudget: 0,
-      },
       responseMimeType: "application/json",
       responseSchema: {
         type: "OBJECT",
@@ -286,7 +283,7 @@ export async function magicRotationFallback(opts: {
   };
   try {
     const resp = await fetch(
-      `${opts.proxyUrl.replace(/\/$/, "")}/gemini?model=gemini-2.5-flash`,
+      `${opts.proxyUrl.replace(/\/$/, "")}/gemini?model=gemini-flash-latest`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -351,9 +348,6 @@ Return JSON only: {"valid":true,"white_side":"top|right|bottom|left|unknown","co
     ],
     generationConfig: {
       temperature: 0,
-      thinkingConfig: {
-        thinkingBudget: 0,
-      },
       responseMimeType: "application/json",
       responseSchema: {
         type: "OBJECT",
@@ -373,7 +367,7 @@ Return JSON only: {"valid":true,"white_side":"top|right|bottom|left|unknown","co
 
   try {
     const resp = await fetch(
-      `${opts.proxyUrl.replace(/\/$/, "")}/gemini?model=gemini-2.5-flash`,
+      `${opts.proxyUrl.replace(/\/$/, "")}/gemini?model=gemini-flash-latest`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },

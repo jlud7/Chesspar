@@ -152,7 +152,7 @@ async function detectViaGemini(
   dataUrl: string,
 ): Promise<DetectInner> {
   const endpoint =
-    proxyUrl.replace(/\/$/, "") + "/gemini?model=gemini-2.5-flash";
+    proxyUrl.replace(/\/$/, "") + "/gemini?model=gemini-flash-latest";
   const body = {
     contents: [
       {
@@ -170,9 +170,6 @@ async function detectViaGemini(
     ],
     generationConfig: {
       temperature: 0.0,
-      thinkingConfig: {
-        thinkingBudget: 0,
-      },
       responseMimeType: "application/json",
       responseSchema: {
         type: "OBJECT",
