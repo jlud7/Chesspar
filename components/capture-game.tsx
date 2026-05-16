@@ -96,6 +96,7 @@ import {
   type ChessboardBboxFetcher,
 } from "@/lib/board-detection";
 import { getChessboardBbox } from "@/lib/florence";
+import { identifyMoveViaReplicateVlm } from "@/lib/replicate-vlm";
 
 type Side = "white" | "black";
 type Phase =
@@ -245,6 +246,12 @@ export function CaptureGame() {
 
   const [corners, setCorners] = useState<Point[]>([]);
   const cornersRef = useRef<Point[]>([]);
+  // Tracks whether the user has manually adjusted the corners during
+  // this calibrate session. The background auto-detect effect respects
+  // this flag — it only snaps the corners to its detection when the
+  // user hasn't already placed them, so an in-progress drag is never
+  // yanked away by a late-arriving Florence response.
+  const userTouchedCornersRef = useRef(false);
   const [videoDims, setVideoDims] = useState<VideoDims | null>(null);
   const [boardCheck, setBoardCheck] = useState<BoardCheck | null>(null);
 
@@ -815,6 +822,80 @@ export function CaptureGame() {
     });
   }
 
+  /**
+   * Coarse pixel-difference metric between two same-size canvases.
+   * Stride-samples a small grid (~1k pixels) so it's microsecond-cheap
+   * to run on the inference hot path. The absolute scale doesn't matter
+   * — we only use it to compare consecutive frames against each other.
+   */
+  function coarseFrameDiff(
+    a: HTMLCanvasElement,
+    b: HTMLCanvasElement,
+  ): number {
+    const w = Math.min(a.width, b.width);
+    const h = Math.min(a.height, b.height);
+    if (w === 0 || h === 0) return Number.POSITIVE_INFINITY;
+    const aCtx = a.getContext("2d", { willReadFrequently: true });
+    const bCtx = b.getContext("2d", { willReadFrequently: true });
+    if (!aCtx || !bCtx) return Number.POSITIVE_INFINITY;
+    const STRIDE = Math.max(1, Math.floor(Math.min(w, h) / 32));
+    const aData = aCtx.getImageData(0, 0, w, h).data;
+    const bData = bCtx.getImageData(0, 0, w, h).data;
+    let sum = 0;
+    let n = 0;
+    for (let y = 0; y < h; y += STRIDE) {
+      for (let x = 0; x < w; x += STRIDE) {
+        const i = (y * w + x) * 4;
+        const dr = aData[i] - bData[i];
+        const dg = aData[i + 1] - bData[i + 1];
+        const db = aData[i + 2] - bData[i + 2];
+        sum += Math.abs(dr) + Math.abs(dg) + Math.abs(db);
+        n++;
+      }
+    }
+    return n === 0 ? Number.POSITIVE_INFINITY : sum / n;
+  }
+
+  /**
+   * Wait until the camera frame is "still" before grabbing it for
+   * inference. Without this, the pipeline reads frames mid-hand-motion —
+   * the player just slammed the clock 50 ms ago and their fingers are
+   * still over the board — which corrupts the diff and produces
+   * "unmatched" on a perfectly normal move.
+   *
+   * Algorithm: sample 5 frames at 100 ms intervals; declare stillness when
+   * two consecutive frames differ by less than `THRESH` (per-pixel mean
+   * absolute difference, summed RGB channels, on a coarse stride sample —
+   * empirically <8 means "no visible motion" on a 720p iPhone stream).
+   * If never still inside ~700 ms, return the most-recent frame anyway
+   * so we don't lock up — a noisy frame still beats no frame.
+   *
+   * In test mode we skip the wait entirely (static images).
+   */
+  async function awaitStableFrame(): Promise<HTMLCanvasElement | null> {
+    if (testModeRef.current) {
+      return grabPipelineFrame(true);
+    }
+    const THRESH = 8;
+    const MAX_FRAMES = 7;
+    const INTERVAL_MS = 100;
+    let prev: HTMLCanvasElement | null = null;
+    let latest: HTMLCanvasElement | null = null;
+    for (let i = 0; i < MAX_FRAMES; i++) {
+      const f = grabVideoFrame();
+      if (f) {
+        latest = f;
+        if (prev) {
+          const d = coarseFrameDiff(prev, f);
+          if (d < THRESH) return f;
+        }
+        prev = f;
+      }
+      await new Promise((r) => setTimeout(r, INTERVAL_MS));
+    }
+    return latest;
+  }
+
   function startSession() {
     chessRef.current = new Chess();
     baselineRef.current = null;
@@ -939,7 +1020,13 @@ export function CaptureGame() {
       lastDetectedCornersRef.current = bestCorners;
 
       // Require 3 consistent detections before accepting calibration.
-      if (stableDetectionCountRef.current >= 3) {
+      // Never overwrite a corner the user has manually placed — they
+      // can override auto-detect with the "Reset corners" or
+      // "Auto-detect" buttons.
+      if (
+        stableDetectionCountRef.current >= 3 &&
+        !userTouchedCornersRef.current
+      ) {
         setCorners(bestCorners);
       }
     } finally {
@@ -1026,7 +1113,9 @@ export function CaptureGame() {
         }
       }
 
-      setCorners(bestCorners);
+      if (!userTouchedCornersRef.current) {
+        setCorners(bestCorners);
+      }
       setVlmStatus({ kind: "ok", at: Date.now() });
     } catch (e) {
       setVlmStatus({
@@ -1087,7 +1176,9 @@ export function CaptureGame() {
         setVlmStatus({ kind: "error", reason: "polygon too small" });
         return;
       }
-      setCorners(result.corners);
+      if (!userTouchedCornersRef.current) {
+        setCorners(result.corners);
+      }
       setVlmStatus({ kind: "ok", at: Date.now() });
     } finally {
       vlmDetectingRef.current = false;
@@ -1095,6 +1186,30 @@ export function CaptureGame() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  /**
+   * On entering the calibrate phase, pre-place 4 corner markers at
+   * sensible defaults (a centred inset square in the video frame) as
+   * soon as we know the video dimensions. The user then drags each
+   * marker onto the matching board corner. This eliminates the dead
+   * state where the screen shows a camera feed with no markers and the
+   * user has no clue what to do.
+   *
+   * The background auto-detect (Florence-2 / VLM / CV) still runs and
+   * can replace these defaults — but only when `userTouchedCornersRef`
+   * is false, so a drag in progress is never overridden.
+   */
+  useEffect(() => {
+    if (phase !== "calibrating") {
+      userTouchedCornersRef.current = false;
+      return;
+    }
+    if (testMode) return;
+    if (corners.length === 4) return;
+    if (!videoDims) return;
+    setCorners(defaultCornersForDims(videoDims));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phase, testMode, videoDims, corners.length]);
 
   // Kick off a VLM corner detection after entering calibrating. The
   // camera stream is already running before the user taps Calibrate (the
@@ -1146,18 +1261,21 @@ export function CaptureGame() {
   }, [phase, videoDims, testFrames, testFrameIdx, tapMode]);
 
   useEffect(() => {
+    // Test-mode auto-advance: when the legacy TapCornersOverlay finishes
+    // placing 4 corners, jump to "ready" so the offline test harness
+    // doesn't need a separate Confirm step. In live mode the CalibrateScreen
+    // owns the transition (user taps Confirm setup), so we never auto-
+    // advance — the user explicitly confirms after seeing the rectified
+    // preview.
     if (phase !== "calibrating" || corners.length !== 4 || busy) return;
-    // Old behaviour: jump straight into "playing" once corners were found.
-    // That meant a misoriented or mis-cropped board still started the
-    // clock. Now we transition to "ready", where the player can verify
-    // the rectified board and start the game manually.
+    if (!testMode) return;
     const t = window.setTimeout(() => {
       setTapMode(false);
       setPhase("ready");
     }, 200);
     return () => window.clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [phase, corners.length, busy]);
+  }, [phase, corners.length, busy, testMode]);
 
   /**
    * Live verification loop. Once corners are detected and we're in
@@ -1358,7 +1476,14 @@ export function CaptureGame() {
       return;
     }
 
-    const frame = grabPipelineFrame(true);
+    // Wait for the player's hand to leave the board before sampling.
+    // The clock-tap usually happens within ~50-200 ms of the piece being
+    // placed; without this gate we'd diff a frame in which fingers are
+    // still in 4-8 cells. In test mode this is a no-op and we still
+    // advance the static-photo pointer.
+    const frame = testModeRef.current
+      ? grabPipelineFrame(true)
+      : await awaitStableFrame();
     if (!frame) return;
     const url = await canvasToBlobUrl(frame);
     if (!url) return;
@@ -1454,7 +1579,60 @@ export function CaptureGame() {
 
       const hasVlmAccess = !!(vlmConfigRef.current?.apiKey || VLM_PROXY_URL);
 
-      if (cvFullyConfident && cvResult.pick) {
+      // Replicate-VLM-first path. Skipped when CV is overwhelmingly
+      // confident (saves an API call on the 60-70% of moves where CV
+      // alone is right) and also skipped when the worker proxy isn't
+      // configured. The full legal-moves list is sent (not just the CV
+      // top-K) so the model is never gated by CV mistakes — the goal of
+      // VLM-first is to push the ceiling toward 99%, not just to break
+      // CV ties.
+      const allLegalSans = chessRef.current
+        .moves({ verbose: true })
+        .map((m) => m.san);
+      if (!cvFullyConfident && VLM_PROXY_URL && allLegalSans.length > 0) {
+        setVlmActive(true);
+        try {
+          const r = await identifyMoveViaReplicateVlm({
+            afterCanvas: warped,
+            previousFen: fenBefore,
+            legalMovesSan: allLegalSans,
+            proxyUrl: VLM_PROXY_URL,
+          });
+          if (r.kind === "matched") {
+            let applied: ChessMove | null = null;
+            try {
+              applied = chessRef.current.move(r.san) as ChessMove | null;
+            } catch {
+              applied = null;
+            }
+            if (applied) {
+              appliedMove = applied;
+              appliedFen = chessRef.current.fen();
+              viaVlm = true;
+            } else {
+              console.warn(
+                "Replicate VLM returned non-applyable SAN",
+                r.san,
+                "raw:",
+                r.raw,
+              );
+            }
+          } else if (r.kind === "rejected") {
+            console.warn(
+              "Replicate VLM rejected:",
+              r.reason,
+              "raw:",
+              r.raw.slice(0, 200),
+            );
+          } else {
+            console.warn("Replicate VLM error:", r.reason);
+          }
+        } finally {
+          setVlmActive(false);
+        }
+      }
+
+      if (!appliedMove && cvFullyConfident && cvResult.pick) {
         appliedMove = cvResult.pick.move;
         appliedFen = cvResult.pick.updatedFen;
         chessRef.current.move({
@@ -1462,7 +1640,7 @@ export function CaptureGame() {
           to: appliedMove.to,
           promotion: appliedMove.promotion ?? "q",
         });
-      } else if (hasVlmAccess && topKCandidates.length > 0) {
+      } else if (!appliedMove && hasVlmAccess && topKCandidates.length > 0) {
         setVlmActive(true);
         try {
           // Primary: per-cell tile verifier. Tiles are rectified, focused,
@@ -1984,7 +2162,52 @@ export function CaptureGame() {
             />
           )}
           {phase === "paused" && <PausedOverlay onResume={togglePause} />}
-          {phase === "calibrating" && tapMode && (
+          {phase === "calibrating" && !testMode && (
+            <CalibrateScreen
+              videoDims={videoDims}
+              onPreviewRef={attachPreviewVideo}
+              previewVideoRef={previewVideoRef}
+              corners={corners}
+              onDragCorner={(idx, pt) => {
+                userTouchedCornersRef.current = true;
+                setCorners((cs) => {
+                  if (cs.length !== 4) return cs;
+                  const next = [...cs];
+                  next[idx] = pt;
+                  return next;
+                });
+              }}
+              onConfirm={() => setPhase("ready")}
+              onCancel={backToSettings}
+              onResetCorners={() => {
+                userTouchedCornersRef.current = false;
+                if (videoDims) {
+                  setCorners(defaultCornersForDims(videoDims));
+                } else {
+                  setCorners([]);
+                }
+              }}
+              onAutoDetect={() => {
+                userTouchedCornersRef.current = false;
+                if (FLORENCE_BBOX_FETCHER) {
+                  void tryFlorenceCalibrate();
+                } else if (cornerDetectorRef.current) {
+                  void tryVlmCalibrate();
+                } else {
+                  void tryAutoCalibrate();
+                }
+              }}
+              autoDetectActive={vlmDetecting || busy}
+              hasAiDetector={
+                !!FLORENCE_BBOX_FETCHER || cornerDetectorRef.current !== null
+              }
+              lenses={availableLenses}
+              currentLensId={currentLensId}
+              onSwitchLens={switchLens}
+              cameraError={cameraError}
+            />
+          )}
+          {phase === "calibrating" && testMode && tapMode && (
             <TapCornersOverlay
               corners={corners}
               videoDims={videoDims}
@@ -2008,7 +2231,7 @@ export function CaptureGame() {
               hasAiDetector={!!FLORENCE_BBOX_FETCHER || cornerDetectorRef.current !== null}
             />
           )}
-          {phase === "calibrating" && !tapMode && (
+          {phase === "calibrating" && testMode && !tapMode && (
             <StartingOverlay
               testMode={testMode}
               cameraError={cameraError}
@@ -2030,39 +2253,36 @@ export function CaptureGame() {
           check={boardCheck}
           testMode={testMode}
           onPreviewRef={attachPreviewVideo}
+          previewVideoRef={previewVideoRef}
           lenses={availableLenses}
           currentLensId={currentLensId}
           onSwitchLens={switchLens}
           corners={corners}
           videoDims={videoDims}
-          onDragCorner={(idx, pt) =>
+          onDragCorner={(idx, pt) => {
+            userTouchedCornersRef.current = true;
             setCorners((cs) => {
               if (idx < 0 || idx >= cs.length) return cs;
               const next = [...cs];
               next[idx] = pt;
               return next;
-            })
-          }
+            });
+          }}
           vlmDetecting={vlmDetecting}
           vlmStatus={vlmStatus}
           hasAiDetector={!!FLORENCE_BBOX_FETCHER || cornerDetectorRef.current !== null}
-          onRetryAi={() =>
+          onRetryAi={() => {
+            userTouchedCornersRef.current = false;
             void (FLORENCE_BBOX_FETCHER
               ? tryFlorenceCalibrate()
-              : tryVlmCalibrate())
-          }
+              : tryVlmCalibrate());
+          }}
           onRecalibrate={() => {
-            setCorners([]);
             setBoardCheck(null);
             setVlmStatus({ kind: "idle" });
             setTapMode(false);
-            setPhase("calibrating");
-          }}
-          onTapManually={() => {
-            setCorners([]);
-            setBoardCheck(null);
-            setVlmStatus({ kind: "idle" });
-            setTapMode(true);
+            // Keep current corners — the calibrate screen will show
+            // them and the user can fine-tune from where they are.
             setPhase("calibrating");
           }}
           onCancel={backToSettings}
@@ -2759,21 +2979,331 @@ function CameraPreviewOverlay({
  * use. Each corner dot is draggable — touch + drag to nudge the
  * detection if auto-detect missed.
  */
+const CORNER_LABELS = ["a8", "h8", "h1", "a1"] as const;
+
+/**
+ * Sensible default corner positions for a fresh calibrate: an inset
+ * square covering the central ~70% of the video frame. The user drags
+ * each corner onto the actual board corner from there. Vastly better
+ * starting UX than "tap 4 times in sequence on a blank preview" —
+ * mobile users miss taps, lose track of which corner they're on, and
+ * have no spatial anchor.
+ *
+ * Order matches `TAP_LABELS`: a8 (top-left), h8 (top-right), h1
+ * (bottom-right), a1 (bottom-left). The downstream warp + chess-piece
+ * orientation depend on this order.
+ */
+function defaultCornersForDims(dims: VideoDims): Point[] {
+  const inset = 0.12;
+  const x0 = dims.w * inset;
+  const x1 = dims.w * (1 - inset);
+  const y0 = dims.h * inset;
+  const y1 = dims.h * (1 - inset);
+  return [
+    { x: x0, y: y0 },
+    { x: x1, y: y0 },
+    { x: x1, y: y1 },
+    { x: x0, y: y1 },
+  ];
+}
+
+/**
+ * Small live-warped preview of the current board, used in the
+ * calibrate + ready screens so the user can verify rectification in
+ * real time as they adjust corners. Draws into a square canvas at
+ * ~6 fps — plenty smooth to track corner drags, light on CPU.
+ */
+function LiveRectifiedPreview({
+  videoRef,
+  corners,
+  size = 168,
+  className,
+}: {
+  videoRef: React.RefObject<HTMLVideoElement | null>;
+  corners: Point[];
+  size?: number;
+  className?: string;
+}) {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  // Stash corners in a ref so the rAF loop sees latest values without
+  // re-creating the loop on every drag-pixel.
+  const cornersRef = useRef<Point[]>(corners);
+  useEffect(() => {
+    cornersRef.current = corners;
+  }, [corners]);
+
+  useEffect(() => {
+    let raf = 0;
+    let lastTs = 0;
+    const FPS_INTERVAL = 1000 / 6; // ~6 fps — corner-drag feels instant
+    const tick = (ts: number) => {
+      raf = requestAnimationFrame(tick);
+      if (ts - lastTs < FPS_INTERVAL) return;
+      lastTs = ts;
+      const v = videoRef.current;
+      const c = canvasRef.current;
+      const cs = cornersRef.current;
+      if (!v || !c || !v.videoWidth || cs.length !== 4) return;
+      // Pull the current video frame into a temp canvas so warpBoard
+      // (which expects HTMLCanvasElement | HTMLImageElement) has a
+      // source. Direct HTMLVideoElement isn't accepted by the warp
+      // path; the temp canvas is tiny overhead.
+      try {
+        const tmp = document.createElement("canvas");
+        tmp.width = v.videoWidth;
+        tmp.height = v.videoHeight;
+        const tctx = tmp.getContext("2d");
+        if (!tctx) return;
+        tctx.drawImage(v, 0, 0);
+        const warped = warpBoard(tmp, cs as [Point, Point, Point, Point], c.width);
+        const cctx = c.getContext("2d");
+        if (!cctx) return;
+        cctx.drawImage(warped, 0, 0, c.width, c.height);
+      } catch {
+        /* corners may be degenerate mid-drag — skip this frame */
+      }
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [videoRef]);
+
+  return (
+    <canvas
+      ref={canvasRef}
+      width={size}
+      height={size}
+      className={clsx(
+        "rounded-xl border border-white/20 bg-zinc-900",
+        className,
+      )}
+    />
+  );
+}
+
+/**
+ * New unified calibrate screen — replaces the StartingOverlay (auto-
+ * detect spinner) + TapCornersOverlay (tap-4-times) two-mode UI.
+ *
+ * Live camera preview takes the largest portion of the screen with 4
+ * draggable corner markers labelled a8 / h8 / h1 / a1. The user just
+ * drags each one onto the matching board corner. Auto-detect (Florence-
+ * 2 + CV) still runs in the background and snaps the markers into
+ * place if it succeeds, but only when the user hasn't already touched
+ * them — auto-detect never overrides a manual drag.
+ *
+ * A small live rectified preview sits below the camera, so the user
+ * gets immediate visual confirmation that the corners are right before
+ * advancing to the Ready screen.
+ */
+function CalibrateScreen({
+  videoDims,
+  onPreviewRef,
+  previewVideoRef,
+  corners,
+  onDragCorner,
+  onConfirm,
+  onCancel,
+  onResetCorners,
+  onAutoDetect,
+  autoDetectActive,
+  hasAiDetector,
+  lenses,
+  currentLensId,
+  onSwitchLens,
+  cameraError,
+}: {
+  videoDims: VideoDims | null;
+  onPreviewRef: (el: HTMLVideoElement | null) => void;
+  previewVideoRef: React.RefObject<HTMLVideoElement | null>;
+  corners: Point[];
+  onDragCorner: (idx: number, point: Point) => void;
+  onConfirm: () => void;
+  onCancel: () => void;
+  onResetCorners: () => void;
+  onAutoDetect: () => void;
+  autoDetectActive: boolean;
+  hasAiDetector: boolean;
+  lenses: MediaDeviceInfo[];
+  currentLensId: string | null;
+  onSwitchLens: (deviceId: string) => void;
+  cameraError: string | null;
+}) {
+  const lensLabel = (label: string): string =>
+    labelLensTier(label) === "ultraWide" ? "0.5×" : "1×";
+  const ready = corners.length === 4;
+  return (
+    <div className="absolute inset-0 z-40 flex flex-col bg-zinc-950 text-zinc-100">
+      {/* Header */}
+      <div className="flex shrink-0 items-center justify-between px-5 pb-1 pt-5">
+        <button
+          onClick={onCancel}
+          className="rounded-full bg-white/5 px-3 py-1 text-[11px] uppercase tracking-widest text-zinc-300 hover:bg-white/10"
+        >
+          Cancel
+        </button>
+        <div className="text-[10px] font-semibold uppercase tracking-[0.32em] text-emerald-300">
+          Set up the board
+        </div>
+        <div className="w-[68px]" aria-hidden />
+      </div>
+
+      {/* Camera + corner markers */}
+      <div className="relative mx-auto mt-2 flex w-full max-w-[440px] flex-1 items-center justify-center px-4">
+        <div
+          className="relative w-full max-h-full overflow-hidden rounded-2xl border border-white/15 bg-black"
+          style={
+            videoDims
+              ? { aspectRatio: `${videoDims.w}/${videoDims.h}` }
+              : { aspectRatio: "3/4" }
+          }
+        >
+          <video
+            ref={onPreviewRef}
+            muted
+            playsInline
+            autoPlay
+            className="absolute inset-0 h-full w-full object-contain"
+          />
+          {ready && videoDims && (
+            <CornerOverlaySvg
+              corners={corners}
+              videoDims={videoDims}
+              onDragCorner={onDragCorner}
+              labels={CORNER_LABELS}
+            />
+          )}
+          {autoDetectActive && (
+            <div className="pointer-events-none absolute left-3 top-3 inline-flex items-center gap-1.5 rounded-full bg-sky-500/25 px-2.5 py-0.5 text-[10px] font-medium uppercase tracking-[0.18em] text-sky-100 backdrop-blur">
+              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-sky-300" />
+              AI looking for corners…
+            </div>
+          )}
+          {!ready && (
+            <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/30 text-center text-[12px] text-zinc-200">
+              <span className="rounded-full bg-black/55 px-3 py-1.5">
+                Waiting for camera…
+              </span>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Instruction + lens toggle + live rectified preview */}
+      <div className="mx-auto mt-3 flex w-full max-w-[440px] items-center gap-3 px-4">
+        <LiveRectifiedPreview
+          videoRef={previewVideoRef}
+          corners={corners}
+          size={112}
+          className="shrink-0"
+        />
+        <div className="min-w-0 flex-1 space-y-1">
+          <div className="text-[13px] font-medium leading-snug text-zinc-100">
+            Drag the four dots onto the corners of the playing surface.
+          </div>
+          <div className="text-[11px] leading-snug text-zinc-400">
+            {ready
+              ? "The mini-preview shows your rectified board. When it looks square and chess-shaped, tap Confirm."
+              : "Hold steady — the camera is loading."}
+          </div>
+          {lenses.length > 1 && (
+            <div className="flex items-center gap-1 pt-1">
+              <span className="text-[10px] uppercase tracking-[0.18em] text-zinc-500">
+                Lens
+              </span>
+              <div className="flex items-center gap-1 rounded-full border border-white/15 bg-black/40 p-0.5">
+                {lenses.map((l, i) => {
+                  const label = lensLabel(l.label);
+                  const selected = l.deviceId === currentLensId;
+                  return (
+                    <button
+                      key={l.deviceId || `lens-${i}`}
+                      type="button"
+                      onClick={() => onSwitchLens(l.deviceId)}
+                      className={clsx(
+                        "rounded-full px-2.5 py-0.5 text-[11px] transition",
+                        selected
+                          ? "bg-white text-black"
+                          : "text-zinc-200 hover:bg-white/10",
+                      )}
+                    >
+                      {label}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {cameraError && (
+        <div className="mx-auto mt-2 w-full max-w-[440px] px-4">
+          <div className="rounded-xl bg-amber-500/10 px-3 py-2 text-[12px] text-amber-100">
+            Camera unavailable: {cameraError}
+          </div>
+        </div>
+      )}
+
+      {/* Action footer */}
+      <div className="mx-auto mt-3 flex w-full max-w-[440px] shrink-0 flex-col gap-2 px-4 pb-5">
+        <button
+          onClick={onConfirm}
+          disabled={!ready}
+          className={clsx(
+            "rounded-2xl px-4 py-3.5 text-base font-semibold transition",
+            ready
+              ? "bg-emerald-500/95 text-emerald-950 shadow-lg shadow-emerald-500/15 hover:bg-emerald-400"
+              : "cursor-not-allowed bg-white/5 text-zinc-500",
+          )}
+        >
+          {ready ? "Confirm setup" : "Waiting for camera…"}
+        </button>
+        <div className="flex gap-2 text-[12px]">
+          {hasAiDetector && (
+            <button
+              onClick={onAutoDetect}
+              disabled={autoDetectActive}
+              className="flex-1 rounded-xl border border-white/10 bg-white/5 px-3 py-2 font-medium text-zinc-200 hover:bg-white/10 disabled:cursor-progress disabled:opacity-60"
+            >
+              {autoDetectActive ? "Detecting…" : "Auto-detect"}
+            </button>
+          )}
+          <button
+            onClick={onResetCorners}
+            className="flex-1 rounded-xl border border-white/10 bg-white/5 px-3 py-2 font-medium text-zinc-200 hover:bg-white/10"
+          >
+            Reset corners
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function CornerOverlaySvg({
   corners,
   videoDims,
   onDragCorner,
+  labels,
+  activeIdx,
 }: {
   corners: Point[];
   videoDims: VideoDims;
   onDragCorner: (idx: number, point: Point) => void;
+  /** Optional per-corner text labels (e.g. ["a8", "h8", "h1", "a1"]). */
+  labels?: readonly string[];
+  /** Optional highlight for one corner — used to indicate which to grab. */
+  activeIdx?: number;
 }) {
   const svgRef = useRef<SVGSVGElement | null>(null);
   const draggingIdxRef = useRef<number | null>(null);
 
   const stroke = Math.max(2, videoDims.w / 400);
-  const dotR = Math.max(12, videoDims.w / 80);
-  const hitR = dotR * 1.6;
+  const dotR = Math.max(14, videoDims.w / 70);
+  // Generous hit radius — mobile finger placement is imprecise and
+  // missing the marker is the single most common stalling failure.
+  const hitR = dotR * 2.2;
+  const labelFontPx = Math.max(16, videoDims.w / 45);
 
   const toViewBox = useCallback(
     (clientX: number, clientY: number): Point | null => {
@@ -2840,27 +3370,67 @@ function CornerOverlaySvg({
         strokeWidth={stroke}
         style={{ pointerEvents: "none" }}
       />
-      {corners.map((p, i) => (
-        <g key={i}>
-          <circle
-            cx={p.x}
-            cy={p.y}
-            r={hitR}
-            fill="transparent"
-            style={{ cursor: "grab", touchAction: "none" }}
-            onPointerDown={handlePointerDown(i)}
-          />
-          <circle
-            cx={p.x}
-            cy={p.y}
-            r={dotR}
-            fill="rgba(16,185,129,0.95)"
-            stroke="white"
-            strokeWidth={stroke * 0.6}
-            style={{ pointerEvents: "none" }}
-          />
-        </g>
-      ))}
+      {corners.map((p, i) => {
+        const isActive = activeIdx === i;
+        const label = labels?.[i];
+        // Label sits "outside" the quad — choose a direction by which
+        // half of the frame the corner is in. Keeps labels readable
+        // instead of bunched into the board interior.
+        const dx = p.x < videoDims.w / 2 ? -labelFontPx * 0.7 : labelFontPx * 0.7;
+        const dy = p.y < videoDims.h / 2 ? -labelFontPx * 0.5 : labelFontPx * 1.1;
+        return (
+          <g key={i}>
+            <circle
+              cx={p.x}
+              cy={p.y}
+              r={hitR}
+              fill="transparent"
+              style={{ cursor: "grab", touchAction: "none" }}
+              onPointerDown={handlePointerDown(i)}
+            />
+            <circle
+              cx={p.x}
+              cy={p.y}
+              r={dotR + (isActive ? Math.max(4, dotR * 0.4) : 0)}
+              fill={
+                isActive
+                  ? "rgba(250,204,21,0.25)"
+                  : "rgba(16,185,129,0.18)"
+              }
+              style={{ pointerEvents: "none" }}
+            />
+            <circle
+              cx={p.x}
+              cy={p.y}
+              r={dotR}
+              fill={
+                isActive
+                  ? "rgba(250,204,21,0.98)"
+                  : "rgba(16,185,129,0.98)"
+              }
+              stroke="white"
+              strokeWidth={stroke * 0.8}
+              style={{ pointerEvents: "none" }}
+            />
+            {label && (
+              <text
+                x={p.x + dx}
+                y={p.y + dy}
+                fontSize={labelFontPx}
+                fontWeight="bold"
+                fill="white"
+                stroke="rgba(0,0,0,0.85)"
+                strokeWidth={Math.max(2, videoDims.w / 350)}
+                paintOrder="stroke"
+                textAnchor={p.x < videoDims.w / 2 ? "end" : "start"}
+                style={{ pointerEvents: "none" }}
+              >
+                {label}
+              </text>
+            )}
+          </g>
+        );
+      })}
     </svg>
   );
 }
@@ -2869,6 +3439,7 @@ function ReadyScreen({
   check,
   testMode,
   onPreviewRef,
+  previewVideoRef,
   lenses,
   currentLensId,
   onSwitchLens,
@@ -2880,13 +3451,13 @@ function ReadyScreen({
   hasAiDetector,
   onRetryAi,
   onRecalibrate,
-  onTapManually,
   onCancel,
   onStart,
 }: {
   check: BoardCheck | null;
   testMode: boolean;
   onPreviewRef: (el: HTMLVideoElement | null) => void;
+  previewVideoRef: React.RefObject<HTMLVideoElement | null>;
   lenses: MediaDeviceInfo[];
   currentLensId: string | null;
   onSwitchLens: (deviceId: string) => void;
@@ -2901,16 +3472,16 @@ function ReadyScreen({
   hasAiDetector: boolean;
   onRetryAi: () => void;
   onRecalibrate: () => void;
-  onTapManually: () => void;
   onCancel: () => void;
   onStart: () => void;
 }) {
   const lensLabel = (label: string): string =>
     labelLensTier(label) === "ultraWide" ? "0.5×" : "1×";
 
-  // One-line condensed status — replaces the 3-row check rail. The
-  // detail text only appears when something's wrong, so the screen
-  // stays quiet on the happy path.
+  // Soft, informational status. The Start button never gates on this —
+  // the user trusts their eyes via the rectified preview rather than a
+  // brittle heuristic. The text just tells them whether the heuristic
+  // agrees ("looks good") or has a concern ("might be off").
   let statusKind: "loading" | "ok" | "warn";
   let statusText: string;
   if (!check) {
@@ -2918,21 +3489,19 @@ function ReadyScreen({
     statusText = "Reading the board…";
   } else if (check.allClear) {
     statusKind = "ok";
-    statusText = "Board ready — 16 white + 16 black, starting position";
+    statusText = "Looks like a starting position — 16W · 16B · 32 empty";
   } else if (!check.piecesAllDetected) {
     statusKind = "warn";
-    statusText = `Saw ${check.pieceCount.white}W · ${check.pieceCount.black}B · ${check.pieceCount.empty} empty — should be 16 + 16 + 32`;
+    statusText = `Saw ${check.pieceCount.white}W · ${check.pieceCount.black}B · ${check.pieceCount.empty} empty — verify in the preview`;
   } else {
     statusKind = "warn";
-    statusText = `${check.startingPositionMatch}/64 squares match starting position`;
+    statusText = `${check.startingPositionMatch}/64 squares match — verify in the preview`;
   }
   const aiBadge = vlmDetecting
     ? "AI placing corners…"
     : vlmStatus.kind === "ok"
       ? "AI placed corners"
-      : vlmStatus.kind === "error"
-        ? "Using CV fallback"
-        : null;
+      : null;
 
   return (
     <div className="absolute inset-0 z-40 flex flex-col bg-zinc-950 text-zinc-100">
@@ -2950,12 +3519,30 @@ function ReadyScreen({
         <div className="w-[68px]" aria-hidden />
       </div>
 
-      {/* Live camera — takes whatever vertical space is left between
-          header and the action footer. */}
-      {!testMode && (
-        <div className="relative mx-auto mt-2 flex w-full max-w-[440px] flex-1 items-center justify-center px-4">
+      <div className="mx-auto mt-2 flex w-full max-w-[440px] flex-1 flex-col items-center gap-3 px-4">
+        {/* Live rectified preview — the HERO. If this looks like a
+            starting position, the calibration is correct. The smaller
+            camera view sits underneath for fine-tuning the corners. */}
+        {!testMode && (
+          <div className="flex w-full flex-col items-center gap-1">
+            <LiveRectifiedPreview
+              videoRef={previewVideoRef}
+              corners={corners}
+              size={Math.min(320, typeof window !== "undefined" ? window.innerWidth - 56 : 280)}
+              className="shadow-lg shadow-emerald-500/5"
+            />
+            <div className="text-[10px] uppercase tracking-[0.2em] text-zinc-500">
+              Rectified board
+            </div>
+          </div>
+        )}
+
+        {/* Camera + corner overlay — small. The user can drag here to
+            fine-tune the corners without leaving the screen; the
+            rectified preview above updates in real time. */}
+        {!testMode && (
           <div
-            className="relative w-full max-h-full overflow-hidden rounded-2xl border border-white/15 bg-black"
+            className="relative w-full max-w-[280px] overflow-hidden rounded-xl border border-white/10 bg-black"
             style={
               videoDims
                 ? { aspectRatio: `${videoDims.w}/${videoDims.h}` }
@@ -2974,17 +3561,16 @@ function ReadyScreen({
                 corners={corners}
                 videoDims={videoDims}
                 onDragCorner={onDragCorner}
+                labels={CORNER_LABELS}
               />
             )}
             {aiBadge && (
               <div
                 className={clsx(
-                  "pointer-events-none absolute left-3 top-3 inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-[10px] font-medium uppercase tracking-[0.18em] backdrop-blur",
+                  "pointer-events-none absolute left-2 top-2 inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[9px] font-medium uppercase tracking-[0.18em] backdrop-blur",
                   vlmDetecting
                     ? "bg-sky-500/20 text-sky-100"
-                    : vlmStatus.kind === "ok"
-                      ? "bg-emerald-500/20 text-emerald-100"
-                      : "bg-zinc-700/60 text-zinc-200",
+                    : "bg-emerald-500/20 text-emerald-100",
                 )}
               >
                 {vlmDetecting && (
@@ -2994,13 +3580,11 @@ function ReadyScreen({
               </div>
             )}
           </div>
-        </div>
-      )}
+        )}
 
-      {/* Lens + drag hint */}
-      <div className="mx-auto mt-3 flex w-full max-w-[440px] items-center justify-between px-4 text-[11px] text-zinc-400">
-        {lenses.length > 1 ? (
-          <div className="flex items-center gap-1 rounded-full border border-white/15 bg-black/70 p-1 text-zinc-100">
+        {/* Lens toggle */}
+        {!testMode && lenses.length > 1 && (
+          <div className="flex items-center gap-1 rounded-full border border-white/15 bg-black/40 p-0.5">
             {lenses.map((l, i) => {
               const label = lensLabel(l.label);
               const selected = l.deviceId === currentLensId;
@@ -3010,7 +3594,7 @@ function ReadyScreen({
                   type="button"
                   onClick={() => onSwitchLens(l.deviceId)}
                   className={clsx(
-                    "rounded-full px-3 py-0.5 transition",
+                    "rounded-full px-3 py-0.5 text-[11px] transition",
                     selected
                       ? "bg-white text-black"
                       : "text-zinc-200 hover:bg-white/10",
@@ -3021,13 +3605,10 @@ function ReadyScreen({
               );
             })}
           </div>
-        ) : (
-          <span />
         )}
-        <span className="text-right">Drag corners to fine-tune</span>
       </div>
 
-      {/* Status line */}
+      {/* Status line — informational only, never gates the Start button. */}
       <div className="mx-auto mt-3 w-full max-w-[440px] px-4">
         <div
           className={clsx(
@@ -3056,81 +3637,27 @@ function ReadyScreen({
       <div className="mx-auto mt-3 flex w-full max-w-[440px] shrink-0 flex-col gap-2 px-4 pb-5">
         <button
           onClick={onStart}
-          className={clsx(
-            "rounded-2xl px-4 py-3.5 text-base font-semibold transition",
-            check?.allClear
-              ? "bg-emerald-500/95 text-emerald-950 shadow-lg shadow-emerald-500/15 hover:bg-emerald-400"
-              : "border border-amber-400/40 bg-amber-500/15 text-amber-100 hover:bg-amber-500/25",
-          )}
+          className="rounded-2xl bg-emerald-500/95 px-4 py-3.5 text-base font-semibold text-emerald-950 shadow-lg shadow-emerald-500/15 transition hover:bg-emerald-400"
         >
-          {check?.allClear ? "Start game" : "Start anyway"}
+          Start game
         </button>
         <div className="flex gap-2 text-[12px]">
-          <button
-            onClick={onTapManually}
-            className="flex-1 rounded-xl border border-white/10 bg-white/5 px-3 py-2 font-medium text-zinc-200 hover:bg-white/10"
-          >
-            Tap corners myself
-          </button>
           <button
             onClick={onRecalibrate}
             className="flex-1 rounded-xl border border-white/10 bg-white/5 px-3 py-2 font-medium text-zinc-200 hover:bg-white/10"
           >
-            Re-detect
+            ← Adjust corners
           </button>
           {hasAiDetector && !vlmDetecting && (
             <button
               onClick={onRetryAi}
               className="rounded-xl border border-white/10 bg-white/5 px-3 py-2 font-medium text-zinc-300 hover:bg-white/10"
-              title="Re-run the AI corner detector"
+              title="Re-run AI corner detection"
             >
-              AI
+              Re-run AI
             </button>
           )}
         </div>
-      </div>
-    </div>
-  );
-}
-
-function CheckRow({
-  ok,
-  label,
-  detail,
-}: {
-  ok: boolean;
-  label: string;
-  detail: string | null;
-}) {
-  return (
-    <div className="flex items-start gap-2">
-      <span
-        className={clsx(
-          "mt-[3px] flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded-full",
-          ok ? "bg-emerald-500/90 text-emerald-950" : "bg-zinc-700 text-zinc-300",
-        )}
-        aria-hidden
-      >
-        {ok ? (
-          <svg viewBox="0 0 12 12" className="h-2.5 w-2.5" fill="currentColor">
-            <path d="M4.5 8.4 2.1 6l-.7.7 3.1 3.1 6-6-.7-.7Z" />
-          </svg>
-        ) : (
-          <span className="h-1 w-1 rounded-full bg-current" />
-        )}
-      </span>
-      <div className="min-w-0">
-        <div
-          className={clsx(
-            "font-medium",
-            ok ? "text-zinc-100" : "text-zinc-300",
-          )}
-        >
-          {label}
-        </div>
-        {detail && (
-          <div className="text-[11px] leading-snug text-zinc-400">{detail}</div>
-        )}
       </div>
     </div>
   );
@@ -3398,11 +3925,19 @@ function StartingOverlay({
   onTapManually: () => void;
   onCancel: () => void;
 }) {
-  const [showHint, setShowHint] = useState(false);
+  const [autoFallbackPending, setAutoFallbackPending] = useState(true);
+  // Auto-switch to manual tap after 6 s of failed auto-detection.
+  // On live camera frames Florence + CV can quietly fail forever; this
+  // guarantees the user is never stuck staring at "Looking at the
+  // board…" indefinitely.
   useEffect(() => {
-    const t = window.setTimeout(() => setShowHint(true), 5000);
+    if (testMode) return;
+    const t = window.setTimeout(() => {
+      setAutoFallbackPending(false);
+      onTapManually();
+    }, 6000);
     return () => window.clearTimeout(t);
-  }, []);
+  }, [testMode, onTapManually]);
   const label = vlmDetecting
     ? "Detecting board with AI…"
     : hasAiDetector
@@ -3419,11 +3954,13 @@ function StartingOverlay({
           <div className="text-sm font-semibold tracking-tight text-zinc-50">
             {label}
           </div>
-          {showHint && !cameraError && (
+          {!cameraError && (
             <div className="text-xs leading-snug text-zinc-300">
               {testMode
                 ? "Photo 1 should show the starting position with all 32 pieces."
-                : "Make sure the whole board is in frame and well lit."}
+                : autoFallbackPending
+                  ? "Hold the camera steady over the full board. Switching to manual placement in a few seconds if auto-detect fails."
+                  : "Tap the 4 corners of the playing surface."}
             </div>
           )}
           {cameraError && (
@@ -3435,9 +3972,9 @@ function StartingOverlay({
         {!testMode && (
           <button
             onClick={onTapManually}
-            className="rounded-full border border-white/15 bg-white/5 px-4 py-1.5 text-xs font-medium text-zinc-100 hover:bg-white/10"
+            className="rounded-xl border border-emerald-400/40 bg-emerald-500/15 px-4 py-2 text-sm font-semibold text-emerald-100 hover:bg-emerald-500/25"
           >
-            Tap the corners myself
+            Tap the 4 corners myself
           </button>
         )}
         <button

@@ -94,7 +94,21 @@ export default {
     const isSam2 = url.pathname === "/replicate/sam2" && req.method === "POST";
     const isFlorence2 =
       url.pathname === "/replicate/florence2" && req.method === "POST";
-    if (!isVerify && !isOpenAi && !isGemini && !isSam2 && !isFlorence2) {
+    // /replicate/vlm — generic forwarder to any Replicate model's prediction
+    // endpoint. Client supplies { model: "owner/name", input: {...} }; the
+    // worker injects the Replicate token and waits synchronously for the
+    // prediction. Used by the per-move VLM identifier (anthropic/claude-
+    // sonnet-4-6) so the entire path stays inside Replicate.
+    const isReplicateVlm =
+      url.pathname === "/replicate/vlm" && req.method === "POST";
+    if (
+      !isVerify &&
+      !isOpenAi &&
+      !isGemini &&
+      !isSam2 &&
+      !isFlorence2 &&
+      !isReplicateVlm
+    ) {
       return new Response("Not found", { status: 404, headers: baseCors });
     }
     if (isOpenAi && !env.OPENAI_API_KEY) {
@@ -109,7 +123,10 @@ export default {
         headers: baseCors,
       });
     }
-    if ((isSam2 || isFlorence2) && !env.REPLICATE_API_TOKEN) {
+    if (
+      (isSam2 || isFlorence2 || isReplicateVlm) &&
+      !env.REPLICATE_API_TOKEN
+    ) {
       return new Response("Replicate not configured on this worker", {
         status: 501,
         headers: baseCors,
@@ -171,12 +188,48 @@ export default {
         headers: { "Content-Type": "application/json" },
         body,
       });
+    } else if (isReplicateVlm) {
+      // /replicate/vlm — generic forwarder. Client sends
+      //   { model: "owner/name", input: {...} }
+      // and we POST to the per-model predictions endpoint. Unlike SAM2 /
+      // Florence-2 (where we pin a version hash so the output shape is
+      // stable), VLM models on Replicate use the latest version path so
+      // we don't have to bump version hashes every time the upstream
+      // model is updated. Synchronous via Prefer: wait — Sonnet finishes
+      // in ~1-2 s for a single image.
+      const clientBody = JSON.parse(body) as {
+        model?: unknown;
+        input?: unknown;
+      };
+      if (
+        typeof clientBody.model !== "string" ||
+        !/^[a-z0-9_.-]+\/[a-z0-9_.-]+$/i.test(clientBody.model)
+      ) {
+        return new Response('Missing or invalid "model" field', {
+          status: 400,
+          headers: baseCors,
+        });
+      }
+      if (!clientBody.input) {
+        return new Response('Missing "input" field', {
+          status: 400,
+          headers: baseCors,
+        });
+      }
+      const target = `https://api.replicate.com/v1/models/${clientBody.model}/predictions`;
+      upstream = await fetch(target, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${env.REPLICATE_API_TOKEN}`,
+          Prefer: "wait",
+        },
+        body: JSON.stringify({ input: clientBody.input }),
+      });
     } else {
-      // Both Replicate routes share the same shape: client sends
-      //   { input: { image, ... } }
-      // we attach a pinned version hash for the chosen model and ask
-      // Replicate to block until the prediction finishes (Prefer: wait)
-      // so the worker returns the final prediction in one round-trip.
+      // Both pinned-version Replicate routes share the same shape:
+      // client sends { input: { image, ... } }; we attach a pinned
+      // version hash for the chosen model. Synchronous via Prefer: wait.
       const clientBody = JSON.parse(body) as { input?: unknown };
       if (!clientBody.input) {
         return new Response('Missing "input" field', {
