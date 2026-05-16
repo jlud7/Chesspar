@@ -1,27 +1,23 @@
 "use client";
 
 /**
- * Chesspar v2 — main capture component.
+ * Chesspar v2 capture — diff-first hybrid + bulletproof calibration.
  *
- * Architecture (per the research PDFs at the repo root):
- *   1. Calibrate: snap one photo of the starting position. Florence-2
- *      localizes the playing surface; CV refines to 4 corners; we test
- *      all 4 rotations against a starting-position scorer; on the rare
- *      ambiguous case Gemini picks the right rotation. No manual rotate.
- *   2. Play: each move, capture a 5-frame burst, pick the sharpest,
- *      warp with the cached homography, HSV-V diff against the previous
- *      frame, beam-search legal moves whose template matches, score
- *      confidence, emit if ≥ threshold, else escalate to Gemini, else
- *      tap-to-confirm.
- *
- * State machine (`phase`):
- *   "needCamera"  → user must grant camera access
- *   "framing"     → live preview while user aims at the board
- *   "locking"     → calibration in flight (Florence-2 + rotation)
- *   "confirm"     → show rectified starting position, ask user to confirm
- *   "playing"     → main game loop
- *   "abstain"     → modal showing top-2 candidates for tap-to-confirm
- *   "ended"       → game over, PGN ready for export
+ * Key UX invariants enforced here (each fixed a real-world failure):
+ *   1. The <video> element NEVER unmounts during a session. We overlay
+ *      confirmation and abstention chrome on top of it instead of
+ *      replacing the preview. Otherwise the camera stream attaches to
+ *      a stale node and the next phase shows a black box.
+ *   2. The live preview uses object-contain so the user sees their
+ *      WHOLE camera frame — no cropped-right-side surprises.
+ *   3. On iPhones with multiple back cameras we default to ultra-wide
+ *      (0.5x). The camera chip in the top-right lets the user switch.
+ *   4. Status text is never duplicated. The confirm overlay has its
+ *      own message strip; the body StatusBar is suppressed in that
+ *      phase.
+ *   5. Locks below the starting-position threshold are REJECTED with a
+ *      specific reason — we never lock on bad corners and then quietly
+ *      emit wrong moves the rest of the game.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -30,6 +26,7 @@ import { Chess } from "chess.js";
 import { LivePreview } from "./LivePreview";
 import { MoveList } from "./MoveList";
 import { AbstentionPrompt } from "./AbstentionPrompt";
+import { CameraSwitcher } from "./CameraSwitcher";
 import { BurstCamera } from "@/lib/v2/burst-capture";
 import { lockBoardFromImage } from "@/lib/v2/board-lock";
 import { runMovePipeline, applyMove } from "@/lib/v2/move-pipeline";
@@ -71,11 +68,13 @@ export function Capture() {
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [confirmPreview, setConfirmPreview] = useState<string | null>(null);
+  const [confirmDetail, setConfirmDetail] = useState<string | null>(null);
   const [lockedFen, setLockedFen] = useState<string>(
     "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
   );
   const [moves, setMoves] = useState<string[]>([]);
   const [abstention, setAbstention] = useState<AbstentionState | null>(null);
+  const [currentDeviceId, setCurrentDeviceId] = useState<string | null>(null);
   const [lastDecision, setLastDecision] = useState<{
     san?: string;
     pConf?: number;
@@ -92,7 +91,6 @@ export function Capture() {
     [],
   );
 
-  // ----- camera lifecycle -----
   useEffect(() => {
     return () => {
       cameraRef.current?.detach();
@@ -108,6 +106,7 @@ export function Capture() {
       const cam = new BurstCamera();
       await cam.attach(videoRef.current);
       cameraRef.current = cam;
+      setCurrentDeviceId(cam.deviceId);
       setPhase("framing");
     } catch (e) {
       setStatusMsg(
@@ -120,7 +119,23 @@ export function Capture() {
     }
   }, []);
 
-  // ----- calibration: capture starting position + lock -----
+  const switchCamera = useCallback(async (deviceId: string) => {
+    const cam = cameraRef.current;
+    if (!cam) return;
+    setBusy(true);
+    try {
+      await cam.switchTo(deviceId);
+      setCurrentDeviceId(cam.deviceId);
+    } catch (e) {
+      setStatusMsg(
+        e instanceof Error ? `Camera switch failed: ${e.message}` : "Switch failed",
+      );
+    } finally {
+      setBusy(false);
+    }
+  }, []);
+
+  // ----- calibration -----
   const captureForLock = useCallback(async () => {
     const cam = cameraRef.current;
     if (!cam) return;
@@ -156,19 +171,16 @@ export function Capture() {
       const startingFen = `${result.lock.startingFen} w KQkq - 0 1`;
       fenRef.current = startingFen;
       setLockedFen(startingFen);
-      // If the starting check score is low, surface a warning but still
-      // let the user confirm — sometimes mid-game calibration is desired.
-      if (result.startingCheck.score < 0.7) {
-        setStatusMsg(
-          `Looks unusual (${Math.round(result.startingCheck.score * 100)}% match). If this is the starting position, recapture in better light or angle.`,
-        );
-      } else {
-        setStatusMsg(
-          result.magicEscalation
-            ? "Locked (orientation confirmed by VLM)."
-            : "Locked. Confirm starting position.",
-        );
-      }
+      const detectorLabel =
+        result.detector === "gemini"
+          ? "Gemini corners"
+          : result.detector === "florence-cv"
+            ? "Florence + CV"
+            : "CV";
+      setConfirmDetail(
+        `${detectorLabel} · ${Math.round(result.startingCheck.score * 100)}% match${result.magicRotationEscalation ? " · VLM-oriented" : ""}`,
+      );
+      setStatusMsg(null);
       setPhase("confirm");
     } catch (e) {
       setStatusMsg(
@@ -184,6 +196,7 @@ export function Capture() {
 
   const retake = useCallback(() => {
     setConfirmPreview(null);
+    setConfirmDetail(null);
     lockRef.current = null;
     prevRectifiedRef.current = null;
     setStatusMsg(null);
@@ -192,12 +205,13 @@ export function Capture() {
 
   const confirmLock = useCallback(() => {
     setStatusMsg(null);
+    setConfirmDetail(null);
     setMoves([]);
     setLastDecision(null);
     setPhase("playing");
   }, []);
 
-  // ----- gameplay: capture a move -----
+  // ----- gameplay -----
   const captureMove = useCallback(async () => {
     const cam = cameraRef.current;
     const lock = lockRef.current;
@@ -224,25 +238,23 @@ export function Capture() {
         config,
       });
       if (result.decision.kind === "matched") {
-        const newFen = applyMove(fenRef.current, result.decision.pick.san);
+        const san = result.decision.pick.san;
+        const newFen = applyMove(fenRef.current, san);
         if (!newFen) {
-          setStatusMsg(
-            `Inferred ${result.decision.pick.san} but couldn't apply it. Try again.`,
-          );
+          setStatusMsg(`Inferred ${san} but couldn't apply it. Try again.`);
           setBusy(false);
           return;
         }
         fenRef.current = newFen;
         prevRectifiedRef.current = result.rectified;
-        setMoves((m) => [...m, result.decision.kind === "matched" ? result.decision.pick.san : ""].filter(Boolean));
+        setMoves((m) => [...m, san]);
         setLastDecision({
-          san: result.decision.pick.san,
+          san,
           pConf: result.decision.pConfident,
           latencyMs: result.decision.latencyMs,
           escalation: result.decision.escalation,
         });
         setStatusMsg(null);
-        // Auto-end on game-over (checkmate / stalemate / threefold etc.).
         if (gameIsOver(newFen)) setPhase("ended");
       } else if (result.decision.kind === "abstain") {
         setAbstention({
@@ -267,35 +279,36 @@ export function Capture() {
     }
   }, [config]);
 
-  const handleAbstentionPick = useCallback((san: string) => {
-    const newFen = applyMove(fenRef.current, san);
-    if (!newFen) {
-      setStatusMsg(`Couldn't apply ${san} — try capturing again.`);
+  const handleAbstentionPick = useCallback(
+    (san: string) => {
+      const newFen = applyMove(fenRef.current, san);
+      if (!newFen) {
+        setStatusMsg(`Couldn't apply ${san} — try capturing again.`);
+        setAbstention(null);
+        setPhase("playing");
+        return;
+      }
+      fenRef.current = newFen;
+      if (abstention?.postRectified) {
+        prevRectifiedRef.current = abstention.postRectified;
+      }
+      setMoves((m) => [...m, san]);
       setAbstention(null);
-      setPhase("playing");
-      return;
-    }
-    fenRef.current = newFen;
-    if (abstention?.postRectified) {
-      prevRectifiedRef.current = abstention.postRectified;
-    }
-    setMoves((m) => [...m, san]);
-    setAbstention(null);
-    setStatusMsg(null);
-    setPhase(gameIsOver(newFen) ? "ended" : "playing");
-  }, [abstention]);
+      setStatusMsg(null);
+      setPhase(gameIsOver(newFen) ? "ended" : "playing");
+    },
+    [abstention],
+  );
 
   const cancelAbstention = useCallback(() => {
     setAbstention(null);
     setPhase("playing");
   }, []);
 
-  const resign = useCallback(() => {
-    setPhase("ended");
-  }, []);
+  const resign = useCallback(() => setPhase("ended"), []);
 
   const downloadPgn = useCallback(() => {
-    const pgn = buildPgn(moves, { result: phase === "ended" ? "*" : "*" });
+    const pgn = buildPgn(moves, { result: "*" });
     const blob = new Blob([pgn], { type: "application/x-chess-pgn" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -303,47 +316,63 @@ export function Capture() {
     a.download = `chesspar-${Date.now()}.pgn`;
     a.click();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
-  }, [moves, phase]);
+  }, [moves]);
 
-  // ----- layout -----
+  const showConfirmOverlay = phase === "confirm" && !!confirmPreview;
+
   return (
     <main className="relative flex min-h-screen flex-col bg-zinc-950 text-zinc-100">
-      <Header phase={phase} onResign={resign} onDownload={downloadPgn} hasMoves={moves.length > 0} />
+      <Header
+        phase={phase}
+        onResign={resign}
+        onDownload={downloadPgn}
+        hasMoves={moves.length > 0}
+      />
 
       <div className="relative flex flex-1 flex-col">
+        {/*
+          The video element is rendered exactly once and stays mounted
+          for the whole session. Overlays slot on top of it; we never
+          replace it. This was the root cause of the "black preview"
+          regression after the confirm step.
+        */}
         <div className="relative h-[55vh] w-full sm:h-[60vh]">
-          {phase === "confirm" && confirmPreview ? (
-            <ConfirmView
-              previewUrl={confirmPreview}
-              onConfirm={confirmLock}
-              onRetake={retake}
-              statusMsg={statusMsg}
-              busy={busy}
+          <LivePreview ref={videoRef}>
+            <CameraSwitcher
+              currentDeviceId={currentDeviceId}
+              onPick={switchCamera}
             />
-          ) : (
-            <LivePreview ref={videoRef}>
-              <FramingOverlay phase={phase} />
-            </LivePreview>
-          )}
+            <FramingOverlay phase={phase} />
+            {showConfirmOverlay && (
+              <ConfirmOverlay
+                previewUrl={confirmPreview!}
+                detail={confirmDetail}
+                onConfirm={confirmLock}
+                onRetake={retake}
+                busy={busy}
+              />
+            )}
+          </LivePreview>
         </div>
 
         <div className="flex-1 px-4 pb-32 pt-4 sm:px-8">
-          <StatusBar
-            phase={phase}
-            statusMsg={statusMsg}
-            lastDecision={lastDecision}
-            busy={busy}
-            proxyConfigured={!!PROXY_URL}
-          />
-          {phase === "playing" || phase === "abstain" || phase === "ended" ? (
+          {!showConfirmOverlay && (
+            <StatusBar
+              phase={phase}
+              statusMsg={statusMsg}
+              lastDecision={lastDecision}
+              busy={busy}
+              proxyConfigured={!!PROXY_URL}
+            />
+          )}
+          {(phase === "playing" || phase === "abstain" || phase === "ended") && (
             <div className="mt-4">
               <MoveList moves={moves} abstainingOn={phase === "abstain"} />
               <FenBox fen={lockedFen} currentFen={fenRef.current} />
             </div>
-          ) : null}
+          )}
         </div>
 
-        {/* Floating bottom action bar */}
         <ActionBar
           phase={phase}
           busy={busy}
@@ -409,7 +438,7 @@ function Header({
 function FramingOverlay({ phase }: { phase: Phase }) {
   if (phase === "needCamera") {
     return (
-      <div className="absolute inset-0 flex flex-col items-center justify-center bg-zinc-950/70 p-6 text-center">
+      <div className="absolute inset-0 z-10 flex flex-col items-center justify-center bg-zinc-950/70 p-6 text-center">
         <p className="text-[11px] font-semibold uppercase tracking-[0.3em] text-emerald-300">
           Setup
         </p>
@@ -417,8 +446,8 @@ function FramingOverlay({ phase }: { phase: Phase }) {
           Point your phone at the board.
         </h2>
         <p className="mt-3 max-w-md text-sm text-zinc-400">
-          Set the phone above the board with all four corners visible. Tap
-          start to enable the camera.
+          Set the phone above the board so all four corners are visible.
+          Tap start to enable the camera.
         </p>
       </div>
     );
@@ -426,11 +455,8 @@ function FramingOverlay({ phase }: { phase: Phase }) {
   if (phase === "framing") {
     return (
       <>
-        {/* Trapezoid framing guide — visual hint, NOT a constraint. The
-            board doesn't have to fit inside this rectangle; corner
-            detection works on any quad in the frame. */}
-        <div className="pointer-events-none absolute inset-6 rounded-lg border-2 border-dashed border-emerald-300/50" />
-        <div className="pointer-events-none absolute left-1/2 top-3 -translate-x-1/2 rounded-full bg-zinc-950/60 px-3 py-1 text-[11px] font-medium uppercase tracking-widest text-emerald-300">
+        <div className="pointer-events-none absolute inset-6 z-10 rounded-lg border-2 border-dashed border-emerald-300/50" />
+        <div className="pointer-events-none absolute left-1/2 top-3 z-10 -translate-x-1/2 rounded-full bg-zinc-950/60 px-3 py-1 text-[11px] font-medium uppercase tracking-widest text-emerald-300">
           Frame the board
         </div>
       </>
@@ -438,7 +464,7 @@ function FramingOverlay({ phase }: { phase: Phase }) {
   }
   if (phase === "locking") {
     return (
-      <div className="absolute inset-0 flex items-center justify-center bg-zinc-950/60">
+      <div className="absolute inset-0 z-10 flex items-center justify-center bg-zinc-950/60">
         <div className="rounded-full bg-zinc-900/80 px-4 py-2 text-sm font-medium text-emerald-300">
           Locking board…
         </div>
@@ -448,53 +474,52 @@ function FramingOverlay({ phase }: { phase: Phase }) {
   return null;
 }
 
-function ConfirmView({
+function ConfirmOverlay({
   previewUrl,
+  detail,
   onConfirm,
   onRetake,
-  statusMsg,
   busy,
 }: {
   previewUrl: string;
+  detail: string | null;
   onConfirm: () => void;
   onRetake: () => void;
-  statusMsg: string | null;
   busy: boolean;
 }) {
   return (
-    <div className="relative flex h-full items-center justify-center bg-zinc-950 p-4">
-      <div className="flex flex-col items-center gap-3">
-        <p className="text-[11px] font-semibold uppercase tracking-[0.3em] text-emerald-300">
-          Confirm starting position
+    <div className="absolute inset-0 z-20 flex flex-col items-center justify-center gap-3 bg-zinc-950/85 p-4 backdrop-blur-sm">
+      <p className="text-[11px] font-semibold uppercase tracking-[0.3em] text-emerald-300">
+        Confirm starting position
+      </p>
+      <div className="overflow-hidden rounded-xl border border-emerald-400/30 shadow-2xl">
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        <img
+          src={previewUrl}
+          alt="Rectified starting position"
+          className="block max-h-[42vh] w-auto"
+        />
+      </div>
+      {detail && (
+        <p className="text-[11px] uppercase tracking-widest text-zinc-500">
+          {detail}
         </p>
-        <div className="overflow-hidden rounded-xl border border-emerald-400/30 shadow-2xl">
-          <img
-            src={previewUrl}
-            alt="Rectified starting position"
-            className="block max-h-[44vh] w-auto"
-          />
-        </div>
-        {statusMsg && (
-          <p className="max-w-sm text-center text-[12px] leading-snug text-zinc-400">
-            {statusMsg}
-          </p>
-        )}
-        <div className="flex gap-2">
-          <button
-            onClick={onRetake}
-            disabled={busy}
-            className="rounded-full border border-white/10 bg-white/5 px-4 py-2 text-sm text-zinc-200 transition hover:bg-white/10 disabled:opacity-50"
-          >
-            Retake
-          </button>
-          <button
-            onClick={onConfirm}
-            disabled={busy}
-            className="rounded-full bg-emerald-500 px-5 py-2 text-sm font-semibold text-emerald-950 transition hover:bg-emerald-400 disabled:opacity-50"
-          >
-            Looks good — start game
-          </button>
-        </div>
+      )}
+      <div className="flex gap-2">
+        <button
+          onClick={onRetake}
+          disabled={busy}
+          className="rounded-full border border-white/10 bg-white/5 px-4 py-2 text-sm text-zinc-200 transition hover:bg-white/10 disabled:opacity-50"
+        >
+          Retake
+        </button>
+        <button
+          onClick={onConfirm}
+          disabled={busy}
+          className="rounded-full bg-emerald-500 px-5 py-2 text-sm font-semibold text-emerald-950 transition hover:bg-emerald-400 disabled:opacity-50"
+        >
+          Looks good — start game
+        </button>
       </div>
     </div>
   );
@@ -528,9 +553,7 @@ function StatusBar({
   if (phase === "playing" && lastDecision?.san) {
     return (
       <div className="flex flex-wrap items-center gap-2 rounded-xl border border-emerald-400/20 bg-emerald-400/5 px-4 py-3 text-[13px] text-emerald-100">
-        <span className="font-mono font-semibold">
-          {lastDecision.san}
-        </span>
+        <span className="font-mono font-semibold">{lastDecision.san}</span>
         <span className="text-emerald-300/60">·</span>
         <span className="text-emerald-200/80">
           {Math.round((lastDecision.pConf ?? 0) * 100)}% confidence
@@ -551,15 +574,15 @@ function StatusBar({
   if (phase === "playing" && !proxyConfigured) {
     return (
       <div className="rounded-xl border border-white/5 bg-white/5 px-4 py-3 text-[12px] text-zinc-400">
-        Running without VLM escalation. Set `NEXT_PUBLIC_VLM_PROXY_URL` to
-        enable Gemini tie-breaks on ambiguous moves.
+        Running without VLM escalation. Set <code className="font-mono">NEXT_PUBLIC_VLM_PROXY_URL</code> to enable Gemini tiebreaks.
       </div>
     );
   }
   if (phase === "playing") {
     return (
       <div className="rounded-xl border border-white/5 bg-white/5 px-4 py-3 text-[12px] text-zinc-400">
-        Make your move, then tap <span className="font-medium text-zinc-200">Capture move</span> below.
+        Make your move, then tap{" "}
+        <span className="font-medium text-zinc-200">Capture move</span> below.
       </div>
     );
   }
@@ -616,14 +639,13 @@ function ActionBar({
       </div>
     );
   }
+  if (phase === "confirm" || phase === "locking") return null;
   const label =
     phase === "needCamera"
       ? "Start camera"
       : phase === "framing"
         ? "Capture starting position"
-        : phase === "confirm" || phase === "locking"
-          ? null
-          : "Capture move";
+        : "Capture move";
   const handler =
     phase === "needCamera"
       ? onStart
@@ -632,7 +654,7 @@ function ActionBar({
         : phase === "playing"
           ? onMove
           : undefined;
-  if (!label || !handler) return null;
+  if (!handler) return null;
   return (
     <div className="fixed inset-x-0 bottom-0 z-30 flex justify-center border-t border-white/5 bg-zinc-950/95 px-4 py-5 backdrop-blur">
       <button

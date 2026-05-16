@@ -1,26 +1,33 @@
 /**
- * Board lock — one-shot session calibration that produces a cached
- * homography from image-space to canonical board space, with
- * bulletproof orientation auto-detection.
+ * Board lock — one-shot session calibration with bulletproof corner +
+ * orientation detection.
  *
- * Per the PDFs, the single biggest CV failure mode in the previous
- * Chesspar build was re-fitting the board geometry every frame and
- * drifting by a few pixels each move. v2 solves the geometry exactly
- * once per session (Florence-2 + CV refinement) and reuses it.
+ * Strategy (in order of preference):
+ *   1. Gemini 2.5 Pro magic corner detector — asks the model for the
+ *      4 corners of the playing surface directly. Beats Florence-2 +
+ *      CV refinement on cluttered scenes (board edges next to user's
+ *      leg, captured pieces, etc.).
+ *   2. Florence-2 polygon + CV grid-fit — fallback when Gemini fails
+ *      or there is no proxy URL.
+ *   3. CV-only via dark-square material detection — last resort.
  *
- * Orientation is solved with the multi-cue starting-position scorer
- * over all 4 rotations, then — on the rare not-decisive case — a
- * Gemini magic fallback. The user never sees a rotate button.
+ * After corners are found, we run all 4 rotations through the starting-
+ * position scorer. Best score wins. If still ambiguous, Gemini picks
+ * via a 2×2 mosaic.
+ *
+ * Locks below 0.6 starting-position score get REJECTED — the user is
+ * told to re-aim with a specific reason, rather than locking on broken
+ * corners and silently producing wrong PGNs.
  */
 
 import { warpBoard } from "../board-image";
 import {
   autoDetectBoardCorners,
   detectBoardCornersViaFlorence,
-  rotateCorners,
   type ChessboardBboxFetcher,
 } from "../board-detection";
 import { getChessboardBbox } from "../florence";
+import { detectCornersMagic } from "./magic-corners";
 import {
   magicRotationFallback,
   pickBestRotation,
@@ -35,30 +42,28 @@ export type LockAttempt =
       kind: "locked";
       lock: BoardLock;
       rectified: HTMLCanvasElement;
-      /** Starting-position validation on the chosen rotation. */
       startingCheck: StartingCheck;
-      /** True if Gemini was consulted to decide orientation. */
-      magicEscalation: boolean;
-      /** All 4 rotations + scores, kept for debug. */
+      magicCornerEscalation: boolean;
+      magicRotationEscalation: boolean;
       rotationDebug: RotationPick;
+      /** Diagnostic message for the UI (e.g. which detector succeeded). */
+      detector: "gemini" | "florence-cv" | "cv-only";
     }
   | {
       kind: "failed";
       reason: string;
     };
 
-/**
- * Cold-start calibration. Locates the board in `source`, picks the
- * rotation that matches the starting position, returns the locked
- * homography ready for use by the rest of the pipeline.
- */
+/** Minimum starting-position score required to accept a lock. Below this
+ *  we reject and ask the user to retake — better than locking on bad
+ *  corners and emitting wrong moves for the rest of the game. */
+const MIN_LOCK_SCORE = 0.6;
+
 export async function lockBoardFromImage(
   source: HTMLCanvasElement,
   opts: {
     proxyUrl: string;
-    /** Canonical rectified board size. Default 512. */
     size?: number;
-    /** Starting FEN (piece placement) seeded into the lock. */
     startingFen?: string;
   },
 ): Promise<LockAttempt> {
@@ -66,61 +71,68 @@ export async function lockBoardFromImage(
   const startingFen =
     opts.startingFen ?? "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR";
 
-  const fetcher: ChessboardBboxFetcher | null = opts.proxyUrl
-    ? async (canvas) => {
-        const r = await getChessboardBbox(canvas, opts.proxyUrl);
-        return r.kind === "detected" ? r.bbox : null;
-      }
-    : null;
+  // ---- 1) Try Gemini magic corner detector first when we have a proxy ----
+  let corners: Corners | null = null;
+  let detector: "gemini" | "florence-cv" | "cv-only" = "cv-only";
 
-  let detection;
-  try {
-    detection = fetcher
-      ? await detectBoardCornersViaFlorence(source, fetcher)
-      : autoDetectBoardCorners(source);
-  } catch (e) {
-    return {
-      kind: "failed",
-      reason: `Corner detection failed: ${e instanceof Error ? e.message : e}. Try better lighting or a less oblique angle.`,
-    };
-  }
-  if (!detection) {
-    return {
-      kind: "failed",
-      reason:
-        "Could not find the board. Make sure the whole board is in frame, well-lit, and at a moderate angle (not flat).",
-    };
+  if (opts.proxyUrl) {
+    const magic = await detectCornersMagic({
+      proxyUrl: opts.proxyUrl,
+      image: source,
+    });
+    if (magic.kind === "detected") {
+      corners = magic.corners;
+      detector = "gemini";
+    }
   }
 
-  // Multi-cue rotation pick over all 4 rotations.
-  const rotationPick = pickBestRotation(
-    source,
-    detection.corners as Corners,
-    size,
-  );
+  // ---- 2) Fall back to Florence-2 + CV ----
+  if (!corners) {
+    const fetcher: ChessboardBboxFetcher | null = opts.proxyUrl
+      ? async (canvas) => {
+          const r = await getChessboardBbox(canvas, opts.proxyUrl);
+          return r.kind === "detected" ? r.bbox : null;
+        }
+      : null;
+    let detection;
+    try {
+      detection = fetcher
+        ? await detectBoardCornersViaFlorence(source, fetcher)
+        : autoDetectBoardCorners(source);
+    } catch (e) {
+      return {
+        kind: "failed",
+        reason: `Corner detection threw: ${e instanceof Error ? e.message : e}`,
+      };
+    }
+    if (!detection) {
+      return {
+        kind: "failed",
+        reason:
+          "Could not find the board. Try a less-cluttered background, all 4 corners visible, and the board occupying most of the frame.",
+      };
+    }
+    corners = detection.corners as Corners;
+    detector = opts.proxyUrl ? "florence-cv" : "cv-only";
+  }
 
+  // ---- 3) Pick best rotation across all 4 ----
+  const rotationPick = pickBestRotation(source, corners, size);
   let chosen: RotationPick = rotationPick;
-  let magicEscalation = false;
-
-  // Escalate to Gemini if the geometric pick is ambiguous. Per the PDFs,
-  // a VLM lateral-thinks "which of these is the start position?" very
-  // reliably; the cost is ~$0.001 and only fires on edge cases.
+  let magicRotationEscalation = false;
   if (!rotationPick.decisive && opts.proxyUrl) {
     const magic = await magicRotationFallback({
       proxyUrl: opts.proxyUrl,
       alternatives: rotationPick.alternatives,
     });
     if (magic) {
-      magicEscalation = true;
+      magicRotationEscalation = true;
       const alt = rotationPick.alternatives.find(
         (a) => a.rotation === magic.rotation,
       );
       if (alt) {
         chosen = {
-          corners: rotateCorners(
-            detection.corners,
-            magic.rotation,
-          ) as unknown as Corners,
+          corners: cyclicRotate(corners, magic.rotation),
           rotation: magic.rotation,
           rectified: alt.rectified,
           startingScore: alt.score,
@@ -134,6 +146,14 @@ export async function lockBoardFromImage(
 
   const startingCheck = validateStartingPosition(chosen.rectified);
 
+  // ---- 4) Reject low-quality locks rather than ship bad corners ----
+  if (startingCheck.score < MIN_LOCK_SCORE) {
+    return {
+      kind: "failed",
+      reason: `Board found, but starting position match is only ${Math.round(startingCheck.score * 100)}% (need ≥ ${Math.round(MIN_LOCK_SCORE * 100)}%). Make sure: (1) standard starting position is set up, (2) all 4 corners are visible, (3) lighting is even, (4) phone is held steady. Then tap Retake.`,
+    };
+  }
+
   const lock: BoardLock = {
     corners: chosen.corners,
     whiteAtBottom: true,
@@ -144,15 +164,23 @@ export async function lockBoardFromImage(
     lock,
     rectified: chosen.rectified,
     startingCheck,
-    magicEscalation,
+    magicCornerEscalation: detector === "gemini",
+    magicRotationEscalation,
     rotationDebug: chosen,
+    detector,
   };
 }
 
-/**
- * Warp the current frame to a canonical `size × size` board image using
- * the cached corners. Hot path — runs every move, takes a few ms.
- */
+/** Rotate corners by `k` quarters in cyclic order. Same semantics as
+ *  the existing `rotateCorners` from board-detection but accepts a
+ *  readonly `Corners`. */
+function cyclicRotate(corners: Corners, k: number): Corners {
+  const arr = [...corners];
+  const shift = ((k % 4) + 4) % 4;
+  for (let i = 0; i < shift; i++) arr.push(arr.shift()!);
+  return [arr[0], arr[1], arr[2], arr[3]] as Corners;
+}
+
 export function rectifyWithLock(
   source: HTMLCanvasElement,
   lock: BoardLock,
@@ -165,11 +193,6 @@ export function rectifyWithLock(
   );
 }
 
-/**
- * Cheap board-lock health check. Sample a thin band around each corner
- * in the rectified frame; on a healthy lock those bands show "board
- * edge" contrast. Returns [0, 1].
- */
 export function boardLockHealth(rectified: HTMLCanvasElement): number {
   const w = rectified.width;
   const h = rectified.height;
