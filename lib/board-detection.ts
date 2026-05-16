@@ -1284,16 +1284,21 @@ export function refineCornersForFrame(
     maxAvgDriftFraction?: number;
     minDriftToTriggerSwap?: number;
   } = {},
-): { corners: [Point, Point, Point, Point]; drifted: boolean } {
+): {
+  corners: [Point, Point, Point, Point];
+  drifted: boolean;
+  detected: boolean;
+  driftFraction?: number;
+} {
   const maxAvgDriftFraction = options.maxAvgDriftFraction ?? 0.1;
   const minDriftToTriggerSwap = options.minDriftToTriggerSwap ?? 0.03;
   const detected = detectBoardViaRedness(frame);
-  if (!detected) return { corners: saved, drifted: false };
+  if (!detected) return { corners: saved, drifted: false, detected: false };
   const w =
     frame instanceof HTMLImageElement ? frame.naturalWidth : frame.width;
   const h =
     frame instanceof HTMLImageElement ? frame.naturalHeight : frame.height;
-  if (!w || !h) return { corners: saved, drifted: false };
+  if (!w || !h) return { corners: saved, drifted: false, detected: false };
   const diag = Math.hypot(w, h);
 
   let bestAligned = detected.corners;
@@ -1315,16 +1320,16 @@ export function refineCornersForFrame(
   }
   const driftFraction = bestAvg / diag;
   if (driftFraction > maxAvgDriftFraction) {
-    return { corners: saved, drifted: false };
+    return { corners: saved, drifted: false, detected: true, driftFraction };
   }
   // Below the swap threshold the detection is treated as noise and the
   // saved corners are kept verbatim. Returning `saved` (rather than the
   // wobbly `bestAligned`) keeps the warp stable across frames so the
   // occupancy-diff move matcher doesn't see ghost square changes.
   if (driftFraction <= minDriftToTriggerSwap) {
-    return { corners: saved, drifted: false };
+    return { corners: saved, drifted: false, detected: true, driftFraction };
   }
-  return { corners: bestAligned, drifted: true };
+  return { corners: bestAligned, drifted: true, detected: true, driftFraction };
 }
 
 /**

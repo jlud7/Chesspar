@@ -310,7 +310,11 @@ export function Capture() {
     setPhase("playing");
   }, []);
 
-  const resign = useCallback(() => setPhase("ended"), []);
+  const resign = useCallback(() => {
+    if (busy) return;
+    setStatusMsg(null);
+    setPhase("ended");
+  }, [busy]);
 
   const downloadPgn = useCallback(() => {
     const pgn = buildPgn(moves, { result: "*" });
@@ -326,12 +330,13 @@ export function Capture() {
   const showConfirmOverlay = phase === "confirm" && !!confirmPreview;
 
   return (
-    <main className="relative flex min-h-screen flex-col bg-zinc-950 text-zinc-100">
+    <main className="relative flex min-h-dvh flex-col bg-zinc-950 text-zinc-100">
       <Header
         phase={phase}
         onResign={resign}
         onDownload={downloadPgn}
         hasMoves={moves.length > 0}
+        busy={busy}
       />
 
       <div className="relative flex flex-1 flex-col">
@@ -341,7 +346,7 @@ export function Capture() {
           replace it. This was the root cause of the "black preview"
           regression after the confirm step.
         */}
-        <div className="relative h-[55vh] w-full sm:h-[60vh]">
+        <div className="relative h-[60dvh] max-h-[720px] min-h-[360px] w-full">
           <LivePreview ref={videoRef}>
             <CameraSwitcher
               currentDeviceId={currentDeviceId}
@@ -404,11 +409,13 @@ function Header({
   onResign,
   onDownload,
   hasMoves,
+  busy,
 }: {
   phase: Phase;
   onResign: () => void;
   onDownload: () => void;
   hasMoves: boolean;
+  busy: boolean;
 }) {
   return (
     <header className="flex items-center justify-between border-b border-white/5 px-4 py-3 sm:px-6">
@@ -430,7 +437,8 @@ function Header({
         {phase === "playing" && (
           <button
             onClick={onResign}
-            className="rounded-full bg-white/5 px-3 py-1.5 text-[11px] uppercase tracking-widest text-zinc-300 transition hover:bg-white/10"
+            disabled={busy}
+            className="rounded-full bg-white/5 px-3 py-1.5 text-[11px] uppercase tracking-widest text-zinc-300 transition hover:bg-white/10 disabled:opacity-40"
           >
             End game
           </button>

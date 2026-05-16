@@ -36,6 +36,7 @@ export type FlashCandidate = {
 export type FlashClassifierResult =
   | {
       kind: "matched";
+      uci: string;
       san: string;
       confidence: number;
       latencyMs: number;
@@ -56,10 +57,11 @@ export type FlashClassifierResult =
 /**
  * Default model id. The user can override via the `model` option on
  * each call (or by setting NEXT_PUBLIC_GEMINI_FLASH_MODEL at build
- * time). Bump this if Google retires the preview alias.
+ * time). Use the stable Flash model by default; preview aliases are
+ * intentionally avoided in production.
  */
 const DEFAULT_MODEL =
-  process.env.NEXT_PUBLIC_GEMINI_FLASH_MODEL || "gemini-3-flash-preview";
+  process.env.NEXT_PUBLIC_GEMINI_FLASH_MODEL || "gemini-2.5-flash";
 
 export async function classifyMoveWithFlash(opts: {
   proxyUrl: string;
@@ -67,7 +69,7 @@ export async function classifyMoveWithFlash(opts: {
   candidates: FlashCandidate[];
   /** Rectified, top-down view of the board AFTER the move. */
   postImage: HTMLCanvasElement;
-  /** Optional override; defaults to gemini-3-flash-preview. */
+  /** Optional override; defaults to gemini-2.5-flash. */
   model?: string;
   /** Thinking budget for Gemini 2.5+/3 Flash models. 0 = no thinking,
    *  fastest response. Raise if you need more accuracy on close calls. */
@@ -89,6 +91,7 @@ export async function classifyMoveWithFlash(opts: {
   if (opts.candidates.length === 1) {
     return {
       kind: "matched",
+      uci: opts.candidates[0].uci,
       san: opts.candidates[0].san,
       confidence: 1,
       latencyMs: performance.now() - t0,
@@ -98,15 +101,20 @@ export async function classifyMoveWithFlash(opts: {
 
   const model = opts.model ?? DEFAULT_MODEL;
   const sanList = opts.candidates.map((c) => c.san);
+  const uciList = opts.candidates.map((c) => c.uci);
+  const candidateLines = opts.candidates
+    .map((c) => `${c.uci} (${c.san})`)
+    .join("\n");
   const dataUrl = opts.postImage.toDataURL("image/jpeg", 0.9);
 
   // The smallest prompt that still constrains the answer. Every word
   // here was kept because removing it changed observed behaviour on
   // the test set.
   const prompt = `Previous FEN: ${opts.previousFen}
-One legal move occurred. Pick which from this list:
-${sanList.join(", ")}
-Return JSON only.`;
+The image shows the board after exactly one legal move. White is at the bottom.
+Legal moves:
+${candidateLines}
+Return JSON only: {"move":"<uci or ABSTAIN>","san":"<san>","confidence":0.0}`;
 
   const body = {
     contents: [
@@ -129,10 +137,11 @@ Return JSON only.`;
       responseSchema: {
         type: "OBJECT",
         properties: {
+          move: { type: "STRING", enum: [...uciList, "ABSTAIN"] },
           san: { type: "STRING", enum: [...sanList, "ABSTAIN"] },
           confidence: { type: "NUMBER" },
         },
-        required: ["san", "confidence"],
+        required: ["move", "san", "confidence"],
       },
       // thinkingConfig is the Gemini 2.5+/3 control for chain-of-thought
       // depth. 0 = instant response. Most chess move-id queries don't
@@ -186,7 +195,7 @@ Return JSON only.`;
   if (!raw) {
     return { kind: "error", reason: "Gemini returned no text", latencyMs };
   }
-  let parsed: { san?: string; confidence?: number };
+  let parsed: { move?: string; san?: string; confidence?: number };
   try {
     parsed = JSON.parse(raw);
   } catch {
@@ -196,9 +205,12 @@ Return JSON only.`;
       latencyMs,
     };
   }
-  const conf =
-    typeof parsed.confidence === "number" ? parsed.confidence : 0.5;
-  if (!parsed.san || parsed.san === "ABSTAIN") {
+  const conf = normalizeConfidence(parsed.confidence);
+  if (
+    parsed.move === "ABSTAIN" ||
+    parsed.san === "ABSTAIN" ||
+    (!parsed.move && !parsed.san)
+  ) {
     return {
       kind: "abstain",
       reason: "model abstained",
@@ -206,18 +218,28 @@ Return JSON only.`;
       raw,
     };
   }
+  const byUci =
+    parsed.move && parsed.move !== "ABSTAIN"
+      ? opts.candidates.find((c) => c.uci === parsed.move)
+      : undefined;
+  const bySan =
+    parsed.san && parsed.san !== "ABSTAIN"
+      ? opts.candidates.find((c) => c.san === parsed.san)
+      : undefined;
+  const matched = byUci ?? bySan;
   // The structured-output enum should make out-of-list answers
   // impossible, but defend anyway.
-  if (!sanList.includes(parsed.san)) {
+  if (!matched) {
     return {
       kind: "error",
-      reason: `model returned out-of-enum value: ${parsed.san}`,
+      reason: `model returned out-of-enum value: ${parsed.move ?? parsed.san}`,
       latencyMs,
     };
   }
   return {
     kind: "matched",
-    san: parsed.san,
+    uci: matched.uci,
+    san: matched.san,
     confidence: conf,
     latencyMs,
     raw,
@@ -227,6 +249,12 @@ Return JSON only.`;
 function dataUrlToBase64(d: string): string {
   const i = d.indexOf(",");
   return i >= 0 ? d.slice(i + 1) : d;
+}
+
+function normalizeConfidence(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return 0.5;
+  const scaled = value > 1 && value <= 100 ? value / 100 : value;
+  return Math.max(0, Math.min(1, scaled));
 }
 
 type GeminiResponse = {

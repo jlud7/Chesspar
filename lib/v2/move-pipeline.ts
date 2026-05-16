@@ -13,7 +13,7 @@
  */
 
 import { Chess, type Move } from "chess.js";
-import { rectifyWithLock, refreshBoardLock } from "./board-lock";
+import { rectifyWithContext, refreshBoardLock } from "./board-lock";
 import {
   classifyMoveWithFlash,
   type FlashCandidate,
@@ -49,7 +49,7 @@ export type PipelineOutput = {
     flashConfidence?: number;
     flashLatencyMs?: number;
     flashRaw?: string;
-    cornerRefresh: "claude" | "gemini" | "kept";
+    cornerRefresh: "cv" | "claude" | "gemini" | "kept";
   };
 };
 
@@ -59,14 +59,14 @@ export async function runMovePipeline(
   const t0 = performance.now();
   const size = input.config.canonicalSize;
 
-  // Per-capture corner refresh — solves the "phone shifted between
-  // moves" failure mode that the locked-once approach can't recover
-  // from. ~1 s + ~$0.001/move via Claude or Gemini.
+  // Per-capture geometry refresh, but orientation remains locked to the
+  // calibrated board. This prevents mid-game VLM corner relabeling from
+  // rotating or mirroring the board underneath the legal-move classifier.
   const refreshed = await refreshBoardLock(input.burst.frame, input.lock, {
     proxyUrl: input.config.proxyUrl,
   });
   const liveLock = refreshed.lock;
-  const rectified = rectifyWithLock(input.burst.frame, liveLock, size);
+  const rectified = rectifyWithContext(input.burst.frame, liveLock, size);
 
   const game = new Chess(input.previousFen);
   const legal = game.moves({ verbose: true });
@@ -141,8 +141,20 @@ export async function runMovePipeline(
   }
 
   // matched
-  const pickIdx = candidates.findIndex((c) => c.san === flash.san);
-  const pick = candidates[Math.max(0, pickIdx)];
+  const pickIdx = candidates.findIndex((c) => c.uci === flash.uci);
+  if (pickIdx < 0) {
+    return {
+      decision: {
+        kind: "error",
+        reason: `Move classifier returned ${flash.uci}, which is not legal in the previous position.`,
+        latencyMs,
+      },
+      rectified,
+      lock: liveLock,
+      trace,
+    };
+  }
+  const pick = candidates[pickIdx];
   const alternates = candidates.filter((_, i) => i !== pickIdx).slice(0, 3);
 
   if (flash.confidence >= input.config.emitThreshold) {

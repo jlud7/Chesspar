@@ -18,12 +18,41 @@ export function warpBoard(
   corners: [Point, Point, Point, Point],
   size: number,
 ): HTMLCanvasElement {
-  const rectifiedCorners: [Point, Point, Point, Point] = [
+  return warpBoardToRect(source, corners, size, [
     { x: 0, y: 0 },
     { x: size, y: 0 },
     { x: size, y: size },
     { x: 0, y: size },
-  ];
+  ]);
+}
+
+/**
+ * Warp a board into a square output while leaving margin around the
+ * 8x8 grid. This keeps tall edge pieces visible instead of clipping
+ * them exactly at the playing-surface boundary.
+ */
+export function warpBoardWithMargin(
+  source: HTMLImageElement | HTMLCanvasElement,
+  corners: [Point, Point, Point, Point],
+  size: number,
+  marginFraction: number,
+): HTMLCanvasElement {
+  const margin = Math.max(0, Math.min(0.24, marginFraction));
+  const pad = size * margin;
+  return warpBoardToRect(source, corners, size, [
+    { x: pad, y: pad },
+    { x: size - pad, y: pad },
+    { x: size - pad, y: size - pad },
+    { x: pad, y: size - pad },
+  ]);
+}
+
+function warpBoardToRect(
+  source: HTMLImageElement | HTMLCanvasElement,
+  corners: [Point, Point, Point, Point],
+  size: number,
+  rectifiedCorners: [Point, Point, Point, Point],
+): HTMLCanvasElement {
   const H = computeHomography(rectifiedCorners, corners);
 
   const srcCanvas = sourceToCanvas(source);

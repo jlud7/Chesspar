@@ -5,25 +5,25 @@ const PIPELINE = [
     n: "01",
     title: "Lock the board",
     body:
-      "One photo. Florence-2 finds the playing surface. The four corners cache for the rest of the session.",
+      "One photo validates the starting setup, locks board geometry, and fixes orientation for the session.",
   },
   {
     n: "02",
-    title: "Tap to capture",
+    title: "Track legal state",
     body:
-      "Each move, a 5-frame burst picks the sharpest still. No motion blur, no manual focus.",
+      "chess.js owns the canonical FEN, generates legal moves, and applies only validated moves.",
   },
   {
     n: "03",
-    title: "Diff-first inference",
+    title: "Classify one move",
     body:
-      "We look at which 2–4 squares changed, not all 64. Legal moves whose template matches get scored.",
+      "Each capture asks Gemini Flash one constrained question: which legal UCI move matches this image?",
   },
   {
     n: "04",
-    title: "VLM tiebreak",
+    title: "Keep vision noisy",
     body:
-      "On the rare ambiguous capture, Gemini 2.5 Pro adjudicates against the candidate list.",
+      "The model is only a visual classifier. It never owns legality, FEN generation, or game state.",
   },
   {
     n: "05",
@@ -91,10 +91,10 @@ export default function HomePage() {
           Under the hood
         </div>
         <h2 className="mt-3 max-w-3xl text-balance text-[clamp(1.75rem,4vw,2.75rem)] font-semibold leading-tight tracking-tight text-zinc-50">
-          Diff-first hybrid.
+          Legal-move classification.
           <span className="text-zinc-500">
             {" "}
-            Legality and beam search beat raw model intelligence.
+            Previous FEN plus legal moves beats full-board reconstruction.
           </span>
         </h2>
         <ol className="mt-10 grid gap-3 md:grid-cols-5">

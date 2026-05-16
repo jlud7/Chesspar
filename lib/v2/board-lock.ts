@@ -20,10 +20,11 @@
  * corners and silently producing wrong PGNs.
  */
 
-import { warpBoard } from "../board-image";
+import { warpBoard, warpBoardWithMargin } from "../board-image";
 import {
   autoDetectBoardCorners,
   detectBoardCornersViaFlorence,
+  refineCornersForFrame,
   type ChessboardBboxFetcher,
 } from "../board-detection";
 import { getChessboardBbox } from "../florence";
@@ -58,6 +59,9 @@ export type LockAttempt =
  *  we reject and ask the user to retake — better than locking on bad
  *  corners and emitting wrong moves for the rest of the game. */
 const MIN_LOCK_SCORE = 0.6;
+const BOARD_CONTEXT_MARGIN = 0.14;
+const MIN_REFRESH_DRIFT_FRACTION = 0.015;
+const MAX_REFRESH_DRIFT_FRACTION = 0.18;
 
 export async function lockBoardFromImage(
   source: HTMLCanvasElement,
@@ -162,7 +166,9 @@ export async function lockBoardFromImage(
   return {
     kind: "locked",
     lock,
-    rectified: chosen.rectified,
+    rectified: rectifyWithLock(source, lock, size, {
+      marginFraction: BOARD_CONTEXT_MARGIN,
+    }),
     startingCheck,
     magicCornerEscalation: detector === "claude" || detector === "gemini",
     magicRotationEscalation,
@@ -172,10 +178,10 @@ export async function lockBoardFromImage(
 }
 
 /**
- * Per-capture corner refresh — re-detect the board in a new frame so
- * the cached homography survives the user shifting their phone between
- * moves. Returns a fresh `BoardLock` if detection succeeded, or the
- * existing one untouched if it didn't (so we degrade gracefully).
+ * Per-capture geometry refresh — re-detect the board in a new frame so
+ * the cached homography survives small phone shifts between moves. The
+ * saved corner ordering stays authoritative, so orientation does not get
+ * re-inferred mid-game.
  *
  * Called by `runMovePipeline` before warping each post-move frame.
  */
@@ -183,14 +189,41 @@ export async function refreshBoardLock(
   source: HTMLCanvasElement,
   current: BoardLock,
   opts: { proxyUrl: string },
-): Promise<{ lock: BoardLock; detector: "claude" | "gemini" | "kept" }> {
+): Promise<{ lock: BoardLock; detector: "cv" | "claude" | "gemini" | "kept" }> {
+  const cv = refineCornersForFrame(
+    source,
+    current.corners as [Point, Point, Point, Point],
+    {
+      minDriftToTriggerSwap: MIN_REFRESH_DRIFT_FRACTION,
+      maxAvgDriftFraction: MAX_REFRESH_DRIFT_FRACTION,
+    },
+  );
+  if (cv.drifted) {
+    return {
+      lock: {
+        ...current,
+        corners: cv.corners as Corners,
+      },
+      detector: "cv",
+    };
+  }
+  if (cv.detected) return { lock: current, detector: "kept" };
+
   if (!opts.proxyUrl) return { lock: current, detector: "kept" };
   const magic = await detectCornersMagic({ proxyUrl: opts.proxyUrl, image: source });
   if (magic.kind !== "detected") return { lock: current, detector: "kept" };
+  const aligned = alignCornersToCurrent(magic.corners, current.corners, source);
+  if (!aligned) return { lock: current, detector: "kept" };
+  if (
+    aligned.driftFraction < MIN_REFRESH_DRIFT_FRACTION ||
+    aligned.driftFraction > MAX_REFRESH_DRIFT_FRACTION
+  ) {
+    return { lock: current, detector: "kept" };
+  }
   return {
     lock: {
       ...current,
-      corners: magic.corners,
+      corners: aligned.corners,
     },
     detector: magic.detector,
   };
@@ -210,12 +243,74 @@ export function rectifyWithLock(
   source: HTMLCanvasElement,
   lock: BoardLock,
   size: number,
+  opts: { marginFraction?: number } = {},
 ): HTMLCanvasElement {
+  if (opts.marginFraction && opts.marginFraction > 0) {
+    return warpBoardWithMargin(
+      source,
+      lock.corners as unknown as [Point, Point, Point, Point],
+      size,
+      opts.marginFraction,
+    );
+  }
   return warpBoard(
     source,
     lock.corners as unknown as [Point, Point, Point, Point],
     size,
   );
+}
+
+export function rectifyWithContext(
+  source: HTMLCanvasElement,
+  lock: BoardLock,
+  size: number,
+): HTMLCanvasElement {
+  return rectifyWithLock(source, lock, size, {
+    marginFraction: BOARD_CONTEXT_MARGIN,
+  });
+}
+
+function alignCornersToCurrent(
+  detected: Corners,
+  current: Corners,
+  source: HTMLCanvasElement,
+): { corners: Corners; driftFraction: number } | null {
+  const diag = Math.hypot(source.width, source.height);
+  if (!diag) return null;
+  let best: Corners | null = null;
+  let bestAvg = Infinity;
+  for (const candidate of cornerOrderVariants(detected)) {
+    let total = 0;
+    for (let i = 0; i < 4; i++) {
+      total += Math.hypot(
+        candidate[i].x - current[i].x,
+        candidate[i].y - current[i].y,
+      );
+    }
+    const avg = total / 4;
+    if (avg < bestAvg) {
+      bestAvg = avg;
+      best = candidate;
+    }
+  }
+  return best ? { corners: best, driftFraction: bestAvg / diag } : null;
+}
+
+function cornerOrderVariants(corners: Corners): Corners[] {
+  const base = [...corners];
+  const reversed = [base[0], base[3], base[2], base[1]];
+  const variants: Corners[] = [];
+  for (const arr of [base, reversed]) {
+    for (let k = 0; k < 4; k++) {
+      variants.push([
+        arr[k],
+        arr[(k + 1) % 4],
+        arr[(k + 2) % 4],
+        arr[(k + 3) % 4],
+      ] as Corners);
+    }
+  }
+  return variants;
 }
 
 export function boardLockHealth(rectified: HTMLCanvasElement): number {
