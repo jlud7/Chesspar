@@ -3,29 +3,52 @@
  *
  * The user can tap their clock as fast as they want. Each tap captures
  * a frame, rectifies it, and pushes a PendingCapture onto the FIFO. A
- * background drainer effect runs identifyMove on items in order — the
- * model still has to classify serially because each call needs the
- * previous move's POST image as its PRE image. But snap-and-clock-tap
- * UX is instant: we don't block on the model.
+ * background drainer runs identifyMove on items in order — the model
+ * still has to classify serially because each call needs the previous
+ * move's POST image as its PRE image. But snap-and-clock-tap UX is
+ * instant: we don't block on the model.
+ *
+ * **Drainer design (the source of multiple past bugs).** Earlier
+ * implementations triggered the drainer from a useEffect with the
+ * queue state in the dep array. That coupled the drainer's
+ * cancellation lifecycle to React's effect scheduling, which is racy:
+ *   - useEffect cleanup ran when our own setState changed the deps,
+ *     setting a `cancelled` flag that discarded the result of an
+ *     in-flight identifyMove call.
+ *   - Even after fixing that, the effect sometimes failed to re-fire
+ *     after a commit because dep equality looked unchanged for one
+ *     frame.
+ *
+ * This implementation removes the useEffect entirely. The drainer is
+ * a plain function (`drainOne`) that:
+ *   - guards against re-entry with `isDrainingRef`,
+ *   - reads the latest state via `stateRef.current`,
+ *   - kicks off identifyMove,
+ *   - commits or fails via setState,
+ *   - **always self-schedules another drainOne via setTimeout(0)**.
+ *
+ * Every operation that could enable draining (`enqueue`, `initialize`,
+ * `resolveFailure`, `dropFailureAndAfter`, `updateAfterRelock`) ends
+ * with `setTimeout(drainOne, 0)`. The setTimeout gives React time to
+ * commit the preceding setState before drainOne reads stateRef.current.
  *
  * The committed FEN advances only when a queue item resolves. The
  * DISPLAY side-to-move advances on every tap — derived as
  *   sideAfter(committedFen, pendingCount)
  * with pendingCount = queue.length + (inflight ? 1 : 0). Since chess.js
  * only emits moves legal for the side to move at committedFen, the
- * model can't return a move for the wrong side, so the committed and
- * display sides stay consistent unless we hit a true classification
- * failure.
+ * model can't return a wrong-side move, so committed and display sides
+ * stay consistent unless we hit a true classification failure.
  *
- * Failure handling: if identifyMove returns abstain or error, we set
- * `failedAt` and halt the drainer. The UI surfaces a banner with the
- * model's reason. The user can apply a best guess (manual SAN entry)
- * or stop and re-snap. Pending captures stay buffered.
+ * Failure handling: identifyMove returns abstain/error → set `failedAt`
+ * and halt the drainer. UI surfaces a banner. The user can apply a
+ * best guess (manual SAN entry) or drop and re-snap.
  */
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { Chess } from "chess.js";
 import { identifyMove, type IdentifyResult } from "./identify-move.ts";
+import { pushApiLog } from "./api-log.ts";
 import type { BoardLock, MoveEntry, PendingCapture, Side } from "./types.ts";
 
 const STARTING_FEN_FULL =
@@ -37,55 +60,32 @@ export type QueueFailure = {
 };
 
 export type MoveQueueState = {
-  /** Captures awaiting classification. */
   queue: PendingCapture[];
-  /** Capture currently in the model. */
   inflight: PendingCapture | null;
-  /** Resolved moves, in order. */
   history: MoveEntry[];
-  /** Game FEN after the last RESOLVED move. */
   committedFen: string;
-  /** Pre-image for the next identifyMove call. Starts as the calibration's
-   *  rectified starting position, then advances to each resolved post-image. */
   lastResolvedRectified: HTMLCanvasElement | null;
-  /** Raw camera frame paired with `lastResolvedRectified`, sent as
-   *  rawPreImage to identifyMove. */
   lastResolvedRaw: HTMLCanvasElement | null;
-  /** Set when classification fails. Halts the drainer until cleared. */
   failedAt: QueueFailure | null;
 };
 
 export type MoveQueueApi = {
   state: MoveQueueState;
-  /** Optimistic side-to-move (derived from queue depth). */
   displaySideToMove: Side;
-  /** Side derived from committedFen alone. */
   committedSideToMove: Side;
-  /** Pending count = queue + inflight. */
   pendingCount: number;
-  /** Push a fresh capture onto the queue. */
   enqueue: (capture: Omit<PendingCapture, "id">) => void;
-  /** Initialize with the calibration's starting-position rectified canvas
-   *  + raw frame. Must be called once before any enqueue. CLEARS history. */
   initialize: (opts: {
     rectified: HTMLCanvasElement;
     raw: HTMLCanvasElement;
     fen?: string;
   }) => void;
-  /** After a mid-game re-lock: swap in the new rectified/raw pair (the new
-   *  geometry) WITHOUT clearing history or committedFen. The new pair
-   *  becomes the pre-image for the next classification. */
   updateAfterRelock: (opts: {
     rectified: HTMLCanvasElement;
     raw: HTMLCanvasElement;
   }) => void;
-  /** Clear the queue + history (e.g. after End Game). */
   reset: () => void;
-  /** Acknowledge a failure: caller has dealt with it, drain may resume.
-   *  If `applySan` is provided, commit it for the failed capture and pop. */
   resolveFailure: (applySan?: string) => void;
-  /** Drop the failed capture (and everything behind it) so the user can
-   *  re-snap manually from a clean state. */
   dropFailureAndAfter: () => void;
 };
 
@@ -102,21 +102,42 @@ const EMPTY_STATE: MoveQueueState = {
 export function useMoveQueue(opts: {
   lock: BoardLock | null;
   proxyUrl: string;
-  /** Notify caller when a queued move successfully commits — used by the
-   *  clock to call switchTo() with the next side and apply increment. */
   onMoveCommitted?: (entry: MoveEntry) => void;
 }): MoveQueueApi {
   const [state, setState] = useState<MoveQueueState>(EMPTY_STATE);
   const nextIdRef = useRef(1);
-  // Track the last-committed wall-clock for the next thinkDurationMs calc.
   const lastCapturedAtRef = useRef<number | null>(null);
+  const isDrainingRef = useRef(false);
 
-  const enqueue = useCallback((capture: Omit<PendingCapture, "id">) => {
-    setState((s) => {
-      const id = nextIdRef.current++;
-      return { ...s, queue: [...s.queue, { ...capture, id }] };
-    });
+  // Refs that the drainer reads without re-rendering.
+  const stateRef = useRef(state);
+  stateRef.current = state;
+  const lockRef = useRef(opts.lock);
+  lockRef.current = opts.lock;
+  const proxyRef = useRef(opts.proxyUrl);
+  proxyRef.current = opts.proxyUrl;
+  const onMoveCommittedRef = useRef(opts.onMoveCommitted);
+  onMoveCommittedRef.current = opts.onMoveCommitted;
+
+  // Forward-declare drainOne so the action callbacks can reference it.
+  const drainOneRef = useRef<() => void>(() => {});
+
+  const scheduleDrain = useCallback(() => {
+    // setTimeout(0) gives React a chance to commit any preceding
+    // setState before drainOne reads stateRef.current.
+    setTimeout(() => drainOneRef.current(), 0);
   }, []);
+
+  const enqueue = useCallback(
+    (capture: Omit<PendingCapture, "id">) => {
+      setState((s) => {
+        const id = nextIdRef.current++;
+        return { ...s, queue: [...s.queue, { ...capture, id }] };
+      });
+      scheduleDrain();
+    },
+    [scheduleDrain],
+  );
 
   const initialize = useCallback(
     (opts: { rectified: HTMLCanvasElement; raw: HTMLCanvasElement; fen?: string }) => {
@@ -127,8 +148,10 @@ export function useMoveQueue(opts: {
         lastResolvedRaw: opts.raw,
       });
       lastCapturedAtRef.current = Date.now();
+      isDrainingRef.current = false;
+      scheduleDrain();
     },
-    [],
+    [scheduleDrain],
   );
 
   const updateAfterRelock = useCallback(
@@ -138,65 +161,79 @@ export function useMoveQueue(opts: {
         lastResolvedRectified: opts.rectified,
         lastResolvedRaw: opts.raw,
       }));
+      scheduleDrain();
     },
-    [],
+    [scheduleDrain],
   );
 
   const reset = useCallback(() => {
     setState(EMPTY_STATE);
     nextIdRef.current = 1;
     lastCapturedAtRef.current = null;
+    isDrainingRef.current = false;
   }, []);
 
-  const resolveFailure = useCallback((applySan?: string) => {
-    setState((s) => {
-      if (!s.failedAt) return s;
-      if (!applySan) {
-        // Just clear the failure; drainer will retry the same capture.
-        return { ...s, failedAt: null };
-      }
-      // Commit `applySan` for the failed capture, pop it from queue/inflight.
-      try {
-        const g = new Chess(s.committedFen);
-        const mv = g.move(applySan);
-        if (!mv) return s;
-        const cap = s.failedAt.capture;
-        const resolvedAt = Date.now();
-        const entry: MoveEntry = {
-          san: mv.san,
-          side: cap.byClockSide,
-          capturedAt: cap.capturedAt,
-          resolvedAt,
-          thinkDurationMs:
-            lastCapturedAtRef.current != null
-              ? cap.capturedAt - lastCapturedAtRef.current
-              : 0,
-        };
-        lastCapturedAtRef.current = cap.capturedAt;
-        // Remove the failed capture from queue/inflight.
-        const isInflight = s.inflight?.id === cap.id;
-        return {
-          ...s,
-          queue: isInflight ? s.queue : s.queue.filter((c) => c.id !== cap.id),
-          inflight: isInflight ? null : s.inflight,
-          history: [...s.history, entry],
-          committedFen: g.fen(),
-          lastResolvedRectified: cap.rectified,
-          lastResolvedRaw: cap.rawFrame,
-          failedAt: null,
-        };
-      } catch {
-        return s;
-      }
-    });
-  }, []);
+  const resolveFailure = useCallback(
+    (applySan?: string) => {
+      setState((s) => {
+        if (!s.failedAt) return s;
+        if (!applySan) {
+          // Clear failure; next drain retries the same capture (which
+          // remains in `inflight` slot or as queue head — but the
+          // drainer treats inflight=null as "ready to dequeue", so
+          // re-attempting means we need to push the failed capture back
+          // to the head of the queue).
+          const failedCap = s.failedAt.capture;
+          const inflightIsFailed = s.inflight?.id === failedCap.id;
+          return {
+            ...s,
+            failedAt: null,
+            inflight: inflightIsFailed ? null : s.inflight,
+            queue: inflightIsFailed ? [failedCap, ...s.queue] : s.queue,
+          };
+        }
+        try {
+          const g = new Chess(s.committedFen);
+          const mv = g.move(applySan);
+          if (!mv) return s;
+          const cap = s.failedAt.capture;
+          const resolvedAt = Date.now();
+          const entry: MoveEntry = {
+            san: mv.san,
+            side: cap.byClockSide,
+            capturedAt: cap.capturedAt,
+            resolvedAt,
+            thinkDurationMs:
+              lastCapturedAtRef.current != null
+                ? cap.capturedAt - lastCapturedAtRef.current
+                : 0,
+          };
+          lastCapturedAtRef.current = cap.capturedAt;
+          onMoveCommittedRef.current?.(entry);
+          const isInflight = s.inflight?.id === cap.id;
+          return {
+            ...s,
+            queue: isInflight ? s.queue : s.queue.filter((c) => c.id !== cap.id),
+            inflight: isInflight ? null : s.inflight,
+            history: [...s.history, entry],
+            committedFen: g.fen(),
+            lastResolvedRectified: cap.rectified,
+            lastResolvedRaw: cap.rawFrame,
+            failedAt: null,
+          };
+        } catch {
+          return s;
+        }
+      });
+      scheduleDrain();
+    },
+    [scheduleDrain],
+  );
 
   const dropFailureAndAfter = useCallback(() => {
     setState((s) => {
       if (!s.failedAt) return s;
       const failedId = s.failedAt.capture.id;
-      // Find index of the failed capture; if it's inflight, drop ONLY it.
-      // If it's in the queue, drop it + everything after.
       const isInflight = s.inflight?.id === failedId;
       if (isInflight) {
         return { ...s, inflight: null, queue: [], failedAt: null };
@@ -209,29 +246,18 @@ export function useMoveQueue(opts: {
         failedAt: null,
       };
     });
-  }, []);
+    // No queued items left after drop, but call scheduleDrain anyway in
+    // case the user re-snaps from the camera tab and we want to be
+    // ready to drain on the next enqueue.
+    scheduleDrain();
+  }, [scheduleDrain]);
 
-  // ----- Drainer -----
-  // Keep the latest state in a ref so the drainer effect doesn't capture
-  // a stale closure when it re-runs.
-  const stateRef = useRef(state);
-  stateRef.current = state;
-  const lockRef = useRef(opts.lock);
-  lockRef.current = opts.lock;
-  const proxyRef = useRef(opts.proxyUrl);
-  proxyRef.current = opts.proxyUrl;
-  const onMoveCommittedRef = useRef(opts.onMoveCommitted);
-  onMoveCommittedRef.current = opts.onMoveCommitted;
-
-  // Drain guard: prevents re-entrant drains. NOT tied to effect cleanup
-  // (effect cleanup was racing against the inflight setState — clearing
-  // a cancellation flag before results could commit).
-  const isDrainingRef = useRef(false);
-
-  useEffect(() => {
+  // ----- The drainer -----
+  drainOneRef.current = () => {
     if (isDrainingRef.current) return;
     const s = stateRef.current;
     if (s.failedAt) return;
+    if (s.inflight) return; // a previous drain hasn't finished its setState round trip yet
     if (s.queue.length === 0) return;
     if (!s.lastResolvedRectified) return;
     const lock = lockRef.current;
@@ -239,7 +265,6 @@ export function useMoveQueue(opts: {
 
     isDrainingRef.current = true;
     const head = s.queue[0];
-    // Move head to inflight + remove from queue atomically.
     setState((cur) => ({
       ...cur,
       inflight: head,
@@ -265,12 +290,22 @@ export function useMoveQueue(opts: {
         };
       }
       if (result.kind === "matched") {
-        // Commit + advance.
         setState((cur) => {
           try {
             const g = new Chess(cur.committedFen);
             const mv = g.move(result.san);
             if (!mv) {
+              pushApiLog({
+                callName: "queue-drain",
+                model: "internal",
+                startedAt: Date.now(),
+                finishedAt: Date.now(),
+                durationMs: 0,
+                ok: false,
+                promptPreview: `Couldn't apply ${result.san} to ${cur.committedFen}`,
+                outputPreview: "",
+                errorMessage: `Illegal in current FEN`,
+              });
               return {
                 ...cur,
                 inflight: null,
@@ -292,7 +327,11 @@ export function useMoveQueue(opts: {
                   : 0,
             };
             lastCapturedAtRef.current = head.capturedAt;
-            onMoveCommittedRef.current?.(entry);
+            try {
+              onMoveCommittedRef.current?.(entry);
+            } catch {
+              /* don't let a callback error block the commit */
+            }
             return {
               ...cur,
               inflight: null,
@@ -322,18 +361,12 @@ export function useMoveQueue(opts: {
           },
         }));
       }
-      // Release the drain guard SYNCHRONOUSLY after setState — refs
-      // update immediately, so when React fires the effect again due to
-      // committedFen / lastResolvedRectified / failedAt change, this is
-      // already false and the next queue item can start.
       isDrainingRef.current = false;
+      // Always self-schedule: if there's another queued capture this
+      // will drain it; otherwise drainOne's early-return guards exit.
+      setTimeout(() => drainOneRef.current(), 0);
     })();
-  }, [
-    state.queue.length,
-    state.failedAt,
-    state.lastResolvedRectified,
-    state.committedFen,
-  ]);
+  };
 
   // Derived values
   const pendingCount = state.queue.length + (state.inflight ? 1 : 0);
