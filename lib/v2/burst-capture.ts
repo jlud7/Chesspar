@@ -209,22 +209,32 @@ async function openBestStream(deviceId?: string): Promise<MediaStream> {
   const selector = deviceId
     ? { deviceId: { exact: deviceId } }
     : { facingMode: { ideal: "environment" } };
+  // Match the native camera app's 0.5x FOV by asking for the sensor's
+  // full resolution and refusing scaler crops. iPhone ultra-wide is
+  // ~4032x3024; asking for a small `aspectRatio: exact 3/4` causes
+  // Safari to silently center-crop the sensor and you lose FOV. The
+  // first attempt asks big and unscaled; later attempts back off to
+  // smaller streams if the device can't satisfy.
   const attempts: MediaStreamConstraints[] = [
     {
       audio: false,
       video: {
         ...selector,
-        ...PORTRAIT_PHOTO_EXACT_CONSTRAINTS,
+        width: { ideal: 4096 },
+        height: { ideal: 3072 },
         frameRate: { ideal: 30 },
-      },
+        resizeMode: { ideal: "none" },
+      } as MediaTrackConstraints & { resizeMode: { ideal: "none" } },
     },
     {
       audio: false,
       video: {
         ...selector,
-        ...PORTRAIT_PHOTO_IDEAL_CONSTRAINTS,
+        width: { ideal: 1920 },
+        height: { ideal: 1440 },
         frameRate: { ideal: 30 },
-      },
+        resizeMode: { ideal: "none" },
+      } as MediaTrackConstraints & { resizeMode: { ideal: "none" } },
     },
     {
       audio: false,
@@ -247,20 +257,6 @@ async function openBestStream(deviceId?: string): Promise<MediaStream> {
   }
   throw lastError instanceof Error ? lastError : new Error("Camera unavailable");
 }
-
-const PORTRAIT_PHOTO_EXACT_CONSTRAINTS = {
-  width: { ideal: 1080 },
-  height: { ideal: 1440 },
-  aspectRatio: { exact: 3 / 4 },
-  resizeMode: { ideal: "none" },
-} as MediaTrackConstraints & { resizeMode: { ideal: "none" } };
-
-const PORTRAIT_PHOTO_IDEAL_CONSTRAINTS = {
-  width: { ideal: 1080 },
-  height: { ideal: 1440 },
-  aspectRatio: { ideal: 3 / 4 },
-  resizeMode: { ideal: "none" },
-} as MediaTrackConstraints & { resizeMode: { ideal: "none" } };
 
 /**
  * Heuristic mapping from device.label to a camera role. Apple's labels

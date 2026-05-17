@@ -117,11 +117,38 @@ export async function callVlm(input: VlmCallInput): Promise<VlmCallResult> {
     return { kind: "error", reason, durationMs };
   }
 
-  const j = json as {
-    status?: string;
-    output?: unknown;
-    error?: unknown;
-  };
+  let j = json as PredictionPayload;
+
+  // Replicate `Prefer: wait` caps at ~60s. If the prediction is still
+  // running after that window, the worker returns the in-flight payload
+  // with status "starting" or "processing" and a polling URL. Poll until
+  // the prediction reaches a terminal state or we hit a hard ceiling.
+  if (isInFlight(j.status) && j.id) {
+    const pollResult = await pollUntilDone(input.proxyUrl, j.id, input.origin);
+    if (pollResult.kind === "timeout") {
+      const finishedAt = Date.now();
+      pushApiLog({
+        callName: input.callName,
+        model,
+        startedAt,
+        finishedAt,
+        durationMs: finishedAt - startedAt,
+        ok: false,
+        promptPreview,
+        outputPreview: "",
+        errorMessage: pollResult.reason,
+      });
+      return {
+        kind: "error",
+        reason: pollResult.reason,
+        durationMs: finishedAt - startedAt,
+      };
+    }
+    j = pollResult.payload;
+  }
+
+  const finalDurationMs = Date.now() - startedAt;
+
   if (j.status && j.status !== "succeeded") {
     const reason = `Replicate status=${j.status}${j.error ? `: ${String(j.error)}` : ""}`;
     pushApiLog({
@@ -129,13 +156,13 @@ export async function callVlm(input: VlmCallInput): Promise<VlmCallResult> {
       model,
       startedAt,
       finishedAt: Date.now(),
-      durationMs,
+      durationMs: finalDurationMs,
       ok: false,
       promptPreview,
       outputPreview: "",
       errorMessage: reason,
     });
-    return { kind: "error", reason, durationMs };
+    return { kind: "error", reason, durationMs: finalDurationMs };
   }
 
   const text = stringifyOutput(j.output);
@@ -144,12 +171,66 @@ export async function callVlm(input: VlmCallInput): Promise<VlmCallResult> {
     model,
     startedAt,
     finishedAt: Date.now(),
-    durationMs,
+    durationMs: finalDurationMs,
     ok: true,
     promptPreview,
     outputPreview: shortify(text, 240),
   });
-  return { kind: "ok", text, raw: json, durationMs };
+  return { kind: "ok", text, raw: j, durationMs: finalDurationMs };
+}
+
+type PredictionPayload = {
+  id?: string;
+  status?: string;
+  output?: unknown;
+  error?: unknown;
+};
+
+const POLL_INTERVAL_MS = 2000;
+const POLL_TIMEOUT_MS = 180_000;
+
+function isInFlight(status: string | undefined): boolean {
+  return status === "starting" || status === "processing";
+}
+
+async function pollUntilDone(
+  proxyUrl: string,
+  id: string,
+  origin?: string,
+): Promise<
+  | { kind: "done"; payload: PredictionPayload }
+  | { kind: "timeout"; reason: string }
+> {
+  const deadline = Date.now() + POLL_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+    const headers: Record<string, string> = {};
+    if (origin) headers["Origin"] = origin;
+    let resp: Response;
+    try {
+      resp = await fetch(
+        `${proxyUrl.replace(/\/$/, "")}/replicate/prediction?id=${encodeURIComponent(id)}`,
+        { method: "GET", headers },
+      );
+    } catch (e) {
+      // Network blips: keep polling rather than fail immediately.
+      continue;
+    }
+    if (!resp.ok) continue;
+    let payload: PredictionPayload;
+    try {
+      payload = (await resp.json()) as PredictionPayload;
+    } catch {
+      continue;
+    }
+    if (!isInFlight(payload.status)) {
+      return { kind: "done", payload };
+    }
+  }
+  return {
+    kind: "timeout",
+    reason: `Prediction still running after ${Math.round(POLL_TIMEOUT_MS / 1000)}s — gave up.`,
+  };
 }
 
 /**

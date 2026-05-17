@@ -69,7 +69,7 @@ function corsHeaders(origin: string | null, allowed: string[]): HeadersInit {
       : allowed[0] ?? "";
   return {
     "Access-Control-Allow-Origin": allow,
-    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
     "Access-Control-Allow-Headers":
       "Content-Type, X-Chesspar-Token, anthropic-version",
     "Access-Control-Max-Age": "86400",
@@ -101,13 +101,20 @@ export default {
     // sonnet-4-6) so the entire path stays inside Replicate.
     const isReplicateVlm =
       url.pathname === "/replicate/vlm" && req.method === "POST";
+    // /replicate/prediction?id=xxx — GET-poll for an in-flight prediction.
+    // Replicate caps `Prefer: wait` at ~60s; longer predictions (gemini-3-flash
+    // with heavy prompts can hit 60–90s) come back with status="starting" and
+    // must be polled. This route is the polling target.
+    const isReplicatePoll =
+      url.pathname === "/replicate/prediction" && req.method === "GET";
     if (
       !isVerify &&
       !isOpenAi &&
       !isGemini &&
       !isSam2 &&
       !isFlorence2 &&
-      !isReplicateVlm
+      !isReplicateVlm &&
+      !isReplicatePoll
     ) {
       return new Response("Not found", { status: 404, headers: baseCors });
     }
@@ -124,7 +131,7 @@ export default {
       });
     }
     if (
-      (isSam2 || isFlorence2 || isReplicateVlm) &&
+      (isSam2 || isFlorence2 || isReplicateVlm || isReplicatePoll) &&
       !env.REPLICATE_API_TOKEN
     ) {
       return new Response("Replicate not configured on this worker", {
@@ -148,6 +155,36 @@ export default {
           headers: baseCors,
         });
       }
+    }
+
+    // Polling route is GET-shaped — no JSON body. Handle it before the
+    // body parser would otherwise reject the request.
+    if (isReplicatePoll) {
+      const id = url.searchParams.get("id");
+      if (!id || !/^[A-Za-z0-9]+$/.test(id)) {
+        return new Response('Missing or invalid "id" query param', {
+          status: 400,
+          headers: baseCors,
+        });
+      }
+      const upstream = await fetch(
+        `https://api.replicate.com/v1/predictions/${encodeURIComponent(id)}`,
+        {
+          method: "GET",
+          headers: {
+            Authorization: `Bearer ${env.REPLICATE_API_TOKEN}`,
+          },
+        },
+      );
+      const pollHeaders = new Headers(baseCors);
+      pollHeaders.set(
+        "Content-Type",
+        upstream.headers.get("Content-Type") ?? "application/json",
+      );
+      return new Response(upstream.body, {
+        status: upstream.status,
+        headers: pollHeaders,
+      });
     }
 
     let body: string;
