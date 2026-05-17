@@ -265,7 +265,10 @@ export function Capture() {
     }
   }, [config, queue]);
 
-  // The clock-side tap path: snap, rectify, enqueue, swap clock immediately.
+  // The clock-side tap path: swap the clock IMMEDIATELY (instant visual
+  // flip + opponent's time starts at the moment of tap), then run the
+  // ~200ms burst capture in the background and enqueue. On capture
+  // failure, revert the clock so the tapper isn't penalized.
   const onTapSide = useCallback(
     async (side: Side) => {
       const cam = cameraRef.current;
@@ -273,6 +276,9 @@ export function Capture() {
       if (!cam || !lock) return;
       if (side !== queue.displaySideToMove) return;
       if (queue.state.failedAt) return;
+
+      const otherSide: Side = side === "white" ? "black" : "white";
+      clock.switchTo(otherSide);
       setBusy(true);
       try {
         const burst = await cam.capture({
@@ -281,6 +287,7 @@ export function Capture() {
           maxDim: 1280,
         });
         if (!burst) {
+          clock.switchTo(side); // revert
           setStatusMsg("Missed the snap — hold steady and tap again.");
           return;
         }
@@ -296,10 +303,8 @@ export function Capture() {
           rectified,
           byClockSide: side,
         });
-        // Optimistically swap the clock immediately so the opponent
-        // starts ticking right away.
-        clock.switchTo(side === "white" ? "black" : "white");
       } catch (e) {
+        clock.switchTo(side); // revert
         setStatusMsg(e instanceof Error ? `Capture failed: ${e.message}` : "Capture failed.");
       } finally {
         setBusy(false);
