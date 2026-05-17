@@ -233,22 +233,35 @@ export function useMoveQueue(opts: {
   const dropFailureAndAfter = useCallback(() => {
     setState((s) => {
       if (!s.failedAt) return s;
-      const failedId = s.failedAt.capture.id;
-      const isInflight = s.inflight?.id === failedId;
+      const failed = s.failedAt.capture;
+      const isInflight = s.inflight?.id === failed.id;
+      // Advance the pre-image to the failed capture's view so subsequent
+      // classifications don't keep comparing against the stale baseline.
+      // Even though we couldn't identify the move, the rectified image
+      // shows the board AT THAT POINT — closest known approximation to
+      // what's on the board now.
+      const baselineUpdate = {
+        lastResolvedRectified: failed.rectified,
+        lastResolvedRaw: failed.rawFrame,
+      };
       if (isInflight) {
-        return { ...s, inflight: null, queue: [], failedAt: null };
+        return {
+          ...s,
+          ...baselineUpdate,
+          inflight: null,
+          queue: [],
+          failedAt: null,
+        };
       }
-      const idx = s.queue.findIndex((c) => c.id === failedId);
+      const idx = s.queue.findIndex((c) => c.id === failed.id);
       if (idx < 0) return { ...s, failedAt: null };
       return {
         ...s,
+        ...baselineUpdate,
         queue: s.queue.slice(0, idx),
         failedAt: null,
       };
     });
-    // No queued items left after drop, but call scheduleDrain anyway in
-    // case the user re-snaps from the camera tab and we want to be
-    // ready to drain on the next enqueue.
     scheduleDrain();
   }, [scheduleDrain]);
 

@@ -5,16 +5,20 @@
  *
  * Committed moves render normally; queued/inflight captures render as
  * italic "…" rows with a spinner so the user sees the queue depth even
- * here. A failure banner appears at the top if the queue is paused.
+ * here. A failure banner appears at the top if the queue is paused;
+ * tapping "Pick move manually" surfaces the ManualMovePicker overlay.
  */
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { MoveEntry, PendingCapture, Side } from "@/lib/v2/types";
 import { describeGameMode, formatDelta } from "@/lib/v2/clock";
 import type { GameMode } from "@/lib/v2/types";
+import { ManualMovePicker } from "./ManualMovePicker";
 
 export type ScoreFailure = {
   reason: string;
+  /** FEN BEFORE the failed move — feeds the legal-moves picker. */
+  previousFen: string;
 };
 
 export function ScoreView({
@@ -25,6 +29,7 @@ export function ScoreView({
   mode,
   onApplyFailureGuess,
   onDropFailure,
+  onRetryFailure,
 }: {
   history: MoveEntry[];
   pending: PendingCapture[];
@@ -33,7 +38,13 @@ export function ScoreView({
   mode: GameMode;
   onApplyFailureGuess?: (san: string) => void;
   onDropFailure?: () => void;
+  onRetryFailure?: () => void;
 }) {
+  const [pickerOpen, setPickerOpen] = useState(false);
+  useEffect(() => {
+    if (!failure) setPickerOpen(false);
+  }, [failure]);
+
   const rows = buildRows(history, inflight, pending);
   const scrollRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -53,8 +64,20 @@ export function ScoreView({
       {failure && (
         <FailureBanner
           reason={failure.reason}
-          onApply={onApplyFailureGuess}
+          onPickManually={() => setPickerOpen(true)}
+          onRetry={onRetryFailure}
           onDrop={onDropFailure}
+        />
+      )}
+
+      {failure && pickerOpen && onApplyFailureGuess && (
+        <ManualMovePicker
+          previousFen={failure.previousFen}
+          onPick={(san) => {
+            setPickerOpen(false);
+            onApplyFailureGuess(san);
+          }}
+          onCancel={() => setPickerOpen(false)}
         />
       )}
 
@@ -194,11 +217,13 @@ function DeltaCell({ entry }: { entry: RowEntry }) {
 
 function FailureBanner({
   reason,
-  onApply,
+  onPickManually,
+  onRetry,
   onDrop,
 }: {
   reason: string;
-  onApply?: (san: string) => void;
+  onPickManually: () => void;
+  onRetry?: () => void;
   onDrop?: () => void;
 }) {
   return (
@@ -211,21 +236,24 @@ function FailureBanner({
       <div className="text-amber-100/90">{reason}</div>
       <div className="mt-3 flex flex-wrap gap-2">
         <button
-          onClick={() => {
-            const san = window.prompt("Enter SAN (e.g. e4, Nf3, O-O):") ?? "";
-            const trimmed = san.trim();
-            if (!trimmed) return;
-            onApply?.(trimmed);
-          }}
-          className="rounded-full border border-amber-300/40 bg-amber-300/10 px-3 py-1.5 text-[11px] uppercase tracking-widest text-amber-100 transition hover:bg-amber-300/20"
+          onClick={onPickManually}
+          className="rounded-full border border-emerald-400/40 bg-emerald-400/10 px-3 py-1.5 text-[11px] uppercase tracking-widest text-emerald-100 transition hover:bg-emerald-400/20"
         >
-          Enter SAN manually
+          Pick the move
         </button>
+        {onRetry && (
+          <button
+            onClick={onRetry}
+            className="rounded-full border border-amber-300/40 bg-amber-300/10 px-3 py-1.5 text-[11px] uppercase tracking-widest text-amber-100 transition hover:bg-amber-300/20"
+          >
+            Retry classification
+          </button>
+        )}
         <button
           onClick={onDrop}
           className="rounded-full border border-white/15 bg-white/5 px-3 py-1.5 text-[11px] uppercase tracking-widest text-zinc-200 transition hover:bg-white/10"
         >
-          Drop & re-snap from Camera tab
+          Drop & re-snap
         </button>
       </div>
     </div>

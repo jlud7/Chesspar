@@ -12,11 +12,14 @@ export function TabBar({
   active,
   onPick,
   pendingCount,
+  failurePending,
 }: {
   active: Tab;
   onPick: (t: Tab) => void;
   /** Pending capture count — shown as a small badge on the Score tab. */
   pendingCount?: number;
+  /** When true, the Score badge turns amber and pulses to signal a stuck queue. */
+  failurePending?: boolean;
 }) {
   return (
     <nav
@@ -26,6 +29,12 @@ export function TabBar({
       {ITEMS.map((item) => {
         const isActive = item.id === active;
         const showBadge = item.id === "score" && (pendingCount ?? 0) > 0;
+        const badgeTone = failurePending
+          ? "bg-amber-300 text-amber-950"
+          : "bg-emerald-400 text-emerald-950";
+        const badgeAnim = failurePending
+          ? { animation: "chesspar-pulse 1.6s ease-in-out infinite" as const }
+          : undefined;
         return (
           <button
             key={item.id}
@@ -40,8 +49,11 @@ export function TabBar({
             <span className="relative text-[18px] leading-none">
               {item.icon}
               {showBadge && (
-                <span className="absolute -right-2.5 -top-1.5 inline-flex h-4 min-w-[1rem] items-center justify-center rounded-full bg-emerald-400 px-1 text-[9px] font-semibold text-emerald-950">
-                  {pendingCount}
+                <span
+                  className={`absolute -right-2.5 -top-1.5 inline-flex h-4 min-w-[1rem] items-center justify-center rounded-full px-1 text-[9px] font-semibold ${badgeTone}`}
+                  style={badgeAnim}
+                >
+                  {failurePending ? "!" : pendingCount}
                 </span>
               )}
             </span>

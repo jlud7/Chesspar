@@ -145,7 +145,7 @@ function SidePanel({
       type="button"
       onClick={onTap}
       disabled={!canTap || !active || flagged}
-      className="relative flex-1 cursor-pointer overflow-hidden text-left transition-[background] duration-300 disabled:cursor-default"
+      className="relative flex-1 cursor-pointer overflow-hidden text-left transition-[background,transform] duration-300 active:scale-[0.985] disabled:cursor-default"
       style={{ background: bg }}
     >
       <div

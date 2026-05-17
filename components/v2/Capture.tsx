@@ -98,6 +98,23 @@ export function Capture() {
     if (clock.state.flagged) setPhase("ended");
   }, [clock.state.flagged]);
 
+  // Pause the clock while there's an unresolved classification failure
+  // — no fair ticking time off either player while the user resolves a
+  // stuck queue item.
+  const failureRunningBeforeRef = useRef<Side | null>(null);
+  useEffect(() => {
+    if (queue.state.failedAt) {
+      if (clock.state.runningSide) {
+        failureRunningBeforeRef.current = clock.state.runningSide;
+        clock.pause();
+      }
+    } else if (failureRunningBeforeRef.current) {
+      const resume = failureRunningBeforeRef.current;
+      failureRunningBeforeRef.current = null;
+      clock.switchTo(resume);
+    }
+  }, [queue.state.failedAt]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // Load saved game mode on mount.
   useEffect(() => {
     const stored = loadStoredGameMode();
@@ -448,11 +465,17 @@ export function Capture() {
               pending={queue.state.queue}
               inflight={queue.state.inflight}
               failure={
-                queue.state.failedAt ? { reason: queue.state.failedAt.reason } : null
+                queue.state.failedAt
+                  ? {
+                      reason: queue.state.failedAt.reason,
+                      previousFen: queue.state.committedFen,
+                    }
+                  : null
               }
               mode={gameMode}
               onApplyFailureGuess={queue.resolveFailure}
               onDropFailure={queue.dropFailureAndAfter}
+              onRetryFailure={() => queue.resolveFailure(undefined)}
             />
           </div>
 
@@ -472,7 +495,23 @@ export function Capture() {
             active={activeTab}
             onPick={setActiveTab}
             pendingCount={queue.pendingCount}
+            failurePending={!!queue.state.failedAt}
           />
+
+          {queue.state.failedAt && activeTab !== "score" && (
+            <button
+              onClick={() => setActiveTab("score")}
+              className="pointer-events-auto absolute inset-x-3 bottom-[88px] z-40 flex items-center justify-between gap-3 rounded-2xl border border-amber-300/40 bg-amber-300/15 px-3 py-2 text-left text-[12px] text-amber-100 shadow-2xl backdrop-blur"
+            >
+              <span>
+                <span className="font-semibold uppercase tracking-[0.18em]">
+                  Queue paused
+                </span>
+                <span className="ml-2 text-amber-100/85">Tap to resolve</span>
+              </span>
+              <span className="text-amber-200">→</span>
+            </button>
+          )}
 
           {statusMsg && (
             <div className="pointer-events-none absolute inset-x-0 top-[44px] z-40 flex justify-center px-4">
