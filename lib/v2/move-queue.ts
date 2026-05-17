@@ -223,15 +223,21 @@ export function useMoveQueue(opts: {
   const onMoveCommittedRef = useRef(opts.onMoveCommitted);
   onMoveCommittedRef.current = opts.onMoveCommitted;
 
+  // Drain guard: prevents re-entrant drains. NOT tied to effect cleanup
+  // (effect cleanup was racing against the inflight setState — clearing
+  // a cancellation flag before results could commit).
+  const isDrainingRef = useRef(false);
+
   useEffect(() => {
+    if (isDrainingRef.current) return;
     const s = stateRef.current;
     if (s.failedAt) return;
-    if (s.inflight) return;
     if (s.queue.length === 0) return;
     if (!s.lastResolvedRectified) return;
     const lock = lockRef.current;
     if (!lock) return;
 
+    isDrainingRef.current = true;
     const head = s.queue[0];
     // Move head to inflight + remove from queue atomically.
     setState((cur) => ({
@@ -240,8 +246,7 @@ export function useMoveQueue(opts: {
       queue: cur.queue.slice(1),
     }));
 
-    let cancelled = false;
-    const run = async () => {
+    (async () => {
       let result: IdentifyResult;
       try {
         result = await identifyMove({
@@ -259,7 +264,6 @@ export function useMoveQueue(opts: {
           durationMs: 0,
         };
       }
-      if (cancelled) return;
       if (result.kind === "matched") {
         // Commit + advance.
         setState((cur) => {
@@ -318,12 +322,18 @@ export function useMoveQueue(opts: {
           },
         }));
       }
-    };
-    run();
-    return () => {
-      cancelled = true;
-    };
-  }, [state.queue.length, state.inflight, state.failedAt, state.lastResolvedRectified]);
+      // Release the drain guard SYNCHRONOUSLY after setState — refs
+      // update immediately, so when React fires the effect again due to
+      // committedFen / lastResolvedRectified / failedAt change, this is
+      // already false and the next queue item can start.
+      isDrainingRef.current = false;
+    })();
+  }, [
+    state.queue.length,
+    state.failedAt,
+    state.lastResolvedRectified,
+    state.committedFen,
+  ]);
 
   // Derived values
   const pendingCount = state.queue.length + (state.inflight ? 1 : 0);
